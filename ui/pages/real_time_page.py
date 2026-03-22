@@ -1,4 +1,3 @@
-from PySide6.QtWidgets import QLabel
 from .base_page import BasePage
 from ..widgets.real_time_widget import RealTimeMainWidget
 
