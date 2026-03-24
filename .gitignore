@@ -3,6 +3,7 @@ build/
 dist/
 .vscode
 .DS_Store
+.uv-cache
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

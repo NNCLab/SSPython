@@ -290,7 +290,7 @@ class PlayerWidget(QWidget):
         
         self.chunk_size_input = QSpinBox()
         self.chunk_size_input.setRange(1, 4096)
-        self.chunk_size_input.setValue(256)
+        self.chunk_size_input.setValue(128)
         self.chunk_size_input.setSuffix(" samples")
         layout.addRow("Chunk Size:", self.chunk_size_input)
 
@@ -1325,11 +1325,12 @@ class RealTimeERP(QMainWindow):
 
         if hasattr(self, "roi"):
             self.roi.setBrush(pg.mkBrush(accent_brush))
-            self.roi.setPen(accent_pen)
+            self.roi.setHoverBrush(pg.mkBrush(accent_brush))
             hover_pen = QColor(self.tokens["accent_soft"])
             hover_pen.setAlpha(210)
-            self.roi.setHoverBrush(pg.mkBrush(accent_brush))
-            self.roi.setHoverPen(pg.mkPen(hover_pen, width=1.6))
+            for line in self.roi.lines:
+                line.setPen(accent_pen)
+                line.setHoverPen(pg.mkPen(hover_pen, width=1.6))
 
         if self.ch_names:
             self.colors = build_trace_colors(len(self.ch_names))
@@ -1341,8 +1342,8 @@ class RealTimeERP(QMainWindow):
                 curve.setPen(pg.mkPen(self.colors[self.ch_names.index(channel_name)], width=1.2))
             for channel_name, label in self.topo_label_items.items():
                 label.setColor(self.colors[self.ch_names.index(channel_name)])
-            for plot_item in getattr(self, "topo_plot_items", {}).values():
-                plot_item.setBackground(self.tokens["plot_background"])
+            # for plot_item in getattr(self, "topo_plot_items", {}).values():
+            #     plot_item.setBackground(self.tokens["plot_background"])
 
         if self.topomap_dialog is not None:
             self.topomap_dialog.refresh_theme()
