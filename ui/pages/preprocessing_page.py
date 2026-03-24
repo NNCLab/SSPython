@@ -99,7 +99,7 @@ class ProcessingPage(BasePage):
             self.filter_continuous_button,
         ):
             first_actions.addWidget(button)
-        first_row.addLayout(first_actions)
+        first_row.addLayout(first_actions, 1)
         layout.addLayout(first_row)
 
         second_row = QHBoxLayout()
@@ -115,7 +115,7 @@ class ProcessingPage(BasePage):
             self.inspect_continuous_ica_button,
         ):
             second_actions.addWidget(button)
-        second_row.addLayout(second_actions)
+        second_row.addLayout(second_actions, 1)
         layout.addLayout(second_row)
 
         self.segment_button = QPushButton("Segment into Epochs")
@@ -139,7 +139,7 @@ class ProcessingPage(BasePage):
             self.rereference_epochs_button,
         ):
             first_actions.addWidget(button)
-        first_row.addLayout(first_actions)
+        first_row.addLayout(first_actions, 1)
         layout.addLayout(first_row)
 
         second_row = QHBoxLayout()
@@ -150,7 +150,7 @@ class ProcessingPage(BasePage):
         self.inspect_epochs_ica_button = QPushButton("Inspect Epoch ICA")
         second_actions.addWidget(self.run_epochs_ica_button)
         second_actions.addWidget(self.inspect_epochs_ica_button)
-        second_row.addLayout(second_actions)
+        second_row.addLayout(second_actions, 1)
         layout.addLayout(second_row)
         return group
 
