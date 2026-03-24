@@ -186,6 +186,10 @@ QLabel, QCheckBox, QRadioButton {
     background: transparent;
 }
 
+#workspaceList::item:hover {
+    background: #eef4f6;
+}
+
 #datasetListItem {
     background: transparent;
     border: none;
@@ -285,7 +289,7 @@ QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     background: #ffffff;
     border: 1px solid #cfd8dc;
     border-radius: 6px;
-    padding: 8px 10px;
+    padding: 4px 5px;
     selection-background-color: #dfeff3;
     selection-color: #132228;
 }
@@ -318,13 +322,13 @@ QSpinBox::down-button, QDoubleSpinBox::down-button {
 }
 
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
-    image: url(C:/Users/Bruno Couto/Documents/SSPython/assets/icons/up_arrow_light.svg);
+    image: url(assets/icons/up_arrow_light.svg);
     width: 10px;
     height: 10px;
 }
 
 QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
-    image: url(C:/Users/Bruno Couto/Documents/SSPython/assets/icons/down_arrow_light.svg);
+    image: url(assets/icons/down_arrow_light.svg);
     width: 10px;
     height: 10px;
 }
@@ -345,7 +349,7 @@ QComboBox::drop-down {
 }
 
 QComboBox::down-arrow {
-    image: url(C:/Users/Bruno Couto/Documents/SSPython/assets/icons/down_arrow_light.svg);
+    image: url(assets/icons/down_arrow_light.svg);
     width: 10px;
     height: 10px;
 }
