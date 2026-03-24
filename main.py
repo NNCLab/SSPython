@@ -40,7 +40,7 @@ ORGANIZATION_NAME = "SSPython"
 try:
     APP_VERSION = metadata.version("sspython")
 except metadata.PackageNotFoundError:
-    APP_VERSION = "0.1.0-dev"
+    APP_VERSION = "0.1.1"
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -177,7 +177,7 @@ class MainWindow(QMainWindow):
         self.theme_button.clicked.connect(self.toggle_theme)
         sidebar_layout.addWidget(self.theme_button)
 
-        self.sidebar_footer = QLabel("Pipeline-aware workspace\nand derivative tracking")
+        self.sidebar_footer = QLabel("Navigate, analyze, and visualize\nyour EEG data with ease. \nMade by: Couto, BAN.")
         self.sidebar_footer.setObjectName("sidebarFooter")
         self.sidebar_footer.setWordWrap(True)
         sidebar_layout.addWidget(self.sidebar_footer)
@@ -206,7 +206,6 @@ class MainWindow(QMainWindow):
             "F11",
         )
         view_menu.addSeparator()
-        self._add_action(view_menu, "Toggle QSS Editor (Test)", self._open_qss_dialog)
 
         pipeline_menu = menu_bar.addMenu("&Pipeline")
         self.pipeline_actions = {}
@@ -458,7 +457,7 @@ def main():
     splash = QSplashScreen(QPixmap(get_path("assets/icon.png")), Qt.WindowType.WindowStaysOnTopHint)
     splash.show()
     splash.showMessage(
-        "Loading application...",
+        "Initializing SSPython... Setting up your workspace.",
         Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter,
     )
     app.processEvents()

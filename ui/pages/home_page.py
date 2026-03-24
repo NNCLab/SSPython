@@ -49,7 +49,7 @@ class HomePage(BasePage):
         self.cards: dict[str, PipelineCard] = {}
 
         self.set_page_subtitle(
-            "Choose the active pipeline first. The workspace inspector and downstream pages will react to that choice."
+            "Get started by selecting a pipeline below. Your choice will tailor the workspace and available analyses."
         )
 
         hero = QFrame()
@@ -58,13 +58,12 @@ class HomePage(BasePage):
         hero_layout.setContentsMargins(24, 24, 24, 24)
         hero_layout.setSpacing(12)
 
-        hero_title = QLabel("Minimal workflow, pipeline-aware storage")
+        hero_title = QLabel("Welcome to SSPython!")
         hero_title.setObjectName("heroTitle")
         hero_layout.addWidget(hero_title)
 
         hero_text = QLabel(
-            "Derivatives are now organized under a pipeline-specific BIDS-style tree. "
-            "Select a workspace, select the active pipeline, and inspect each dataset's progress from raw to preprocessed."
+            "Your open-source EEG analysis toolkit. Streamline your workflow from raw data to insightful results with our powerful and intuitive pipelines."
         )
         hero_text.setWordWrap(True)
         hero_text.setObjectName("mutedLabel")
@@ -107,7 +106,9 @@ class HomePage(BasePage):
         self.add_content(cards_container)
 
         note = QLabel(
-            "This is still a pre-release build. Validate outputs before using them for publication or clinical interpretation."
+            "SSPython is currently in a pre-release stage. "
+            "Please validate all outputs before using them for publication or clinical interpretation. "
+            "We welcome your feedback to help us improve!"
         )
         note.setObjectName("mutedLabel")
         note.setWordWrap(True)

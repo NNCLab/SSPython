@@ -6,7 +6,6 @@ import mne
 import mne_lsl
 import pyqtgraph as pg
 from collections import deque
-from scipy.spatial.distance import pdist
 
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,7 +21,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QDialogButtonBox,
     QLabel,
-    QDoubleSpinBox,
     QSpinBox,
     QProgressDialog,
     QGroupBox,
@@ -329,7 +327,8 @@ class PlayerWidget(QWidget):
             self.player = mne_lsl.player.PlayerLSL(
                 file_path,
                 chunk_size=chunk_size,
-                name=stream_name
+                name=stream_name,
+                n_repeat=np.inf
             ).start()
             
             self.start_button.setEnabled(False)
@@ -690,7 +689,8 @@ class ConnectionManager:
 
     def __init__(self, params):
         self.params = params
-        self.stream = None
+        self.stream_raw = None
+        self.stream_for_epochs = None
         self.epochs = None
 
     def connect_to_stream(self):
@@ -703,8 +703,12 @@ class ConnectionManager:
             event_channels = self.params.get("event_channels")
             event_channel_list = normalize_event_channels(event_channels)
 
-            self.stream = mne_lsl.stream.StreamLSL(stream_duration, name=stream_name)
-            self.stream.connect(
+            self.stream_raw = mne_lsl.stream.StreamLSL(stream_duration, name=stream_name)
+            self.stream_raw.connect(
+                acquisition_delay=0.1, processing_flags="all", timeout=5
+            )
+            self.stream_for_epochs = mne_lsl.stream.StreamLSL(stream_duration, name=stream_name)
+            self.stream_for_epochs.connect(
                 acquisition_delay=0.1, processing_flags="all", timeout=5
             )
 
@@ -713,8 +717,8 @@ class ConnectionManager:
                 ch_rename_map = {}
                 ch_types = {}
                 for idx, ch in enumerate(self.params["channels"]):
-                    if idx < len(self.stream.ch_names):
-                        orig_name = self.stream.ch_names[idx]
+                    if idx < len(self.stream_for_epochs.ch_names):
+                        orig_name = self.stream_for_epochs.ch_names[idx]
                         new_name = ch["name"]
                         if orig_name != new_name:
                             ch_rename_map[orig_name] = new_name
@@ -724,48 +728,55 @@ class ConnectionManager:
 
                 if ch_rename_map:
                     try:
-                        self.stream.rename_channels(ch_rename_map)
+                        self.stream_for_epochs.rename_channels(ch_rename_map)
+                        self.stream_raw.rename_channels(ch_rename_map)
                         print(f"Renamed channels: {ch_rename_map}")
                     except Exception as e:
                         print(f"Warning: could not rename channels: {e}")
 
                 if ch_types:
                     try:
-                        self.stream.set_channel_types(ch_types)
+                        self.stream_for_epochs.set_channel_types(ch_types)
+                        self.stream_raw.set_channel_types(ch_types)
                         print(f"Set channel types: {ch_types}")
                     except Exception as e:
                         print(f"Warning: could not set channel types: {e}")
 
             bads = self.params.get('bads', [])
             if bads:
-                self.stream.info['bads'] = bads
+                self.stream_for_epochs.info['bads'] = bads
+                self.stream_raw.info['bads'] = bads
 
             default_montage = self.params.get("default_montage")
-            if default_montage and default_montage != "None" and self.stream.get_montage() is None:
+            if default_montage and default_montage != "None" and self.stream_for_epochs.get_montage() is None:
                 try:
-                    self.stream.set_montage(mne.channels.make_standard_montage(default_montage))
+                    self.stream_for_epochs.set_montage(mne.channels.make_standard_montage(default_montage))
+                    self.stream_raw.set_montage(mne.channels.make_standard_montage(default_montage))
                 except Exception as exc:
                     print(f"Warning: could not apply montage '{default_montage}': {exc}")
 
             if self.params.get("apply_bandpass", False):
                 low, high = self.params.get("bandpass_range", (None, None))
                 if low is not None or high is not None:
-                    self.stream.filter(low, high, picks="eeg", iir_params=None, verbose=False)
+                    self.stream_for_epochs.filter(low, high, picks="eeg", iir_params=None, verbose=False)
+                    self.stream_raw.filter(low, high, picks="eeg", iir_params=None, verbose=False)
 
             if self.params.get("apply_notch", False):
                 for freq in self.params.get("notch_freqs", []):
-                    self.stream.notch_filter(freq, picks="eeg", iir_params=None, verbose=False)
+                    self.stream_for_epochs.notch_filter(freq, picks="eeg", iir_params=None, verbose=False)
+                    self.stream_raw.notch_filter(freq, picks="eeg", iir_params=None, verbose=False)
 
-            event_id = resolve_regular_stream_event_id(
-                self.stream,
+            event_id = resolve_regular_stream_event_id( #TODO solve fetch
+                self.stream_for_epochs,
                 event_id,
                 event_channel_list,
                 timeout_s=min(max(float(stream_duration), 1.5), 4.0),
             )
             self.params["event_id"] = event_id
-
+            print(event_id)
+            print(event_channel_list[0] if len(event_channel_list) == 1 else event_channel_list)
             self.epochs = mne_lsl.stream.EpochsStream(
-                self.stream,
+                self.stream_for_epochs,
                 bufsize=10,
                 event_id=event_id,
                 event_channels=event_channel_list[0] if len(event_channel_list) == 1 else event_channel_list,
@@ -776,7 +787,7 @@ class ConnectionManager:
             )
             self.epochs.connect(acquisition_delay=0.1)
             print("Connection successful.")
-            return self.stream, self.epochs
+            return self.stream_raw, self.epochs
         except Exception as e:
             print(f"Failed to connect to stream: {e}")
             return None, None
@@ -981,6 +992,8 @@ class DataProcessingWorker(QObject):
         self.decimate = self.params.get("decimate", 5)
         self.times = self.original_times[:: self.decimate]
         self.raw_picks = mne.pick_types(self.stream.info, eeg=True, exclude=())
+        self.ch_names = self.params.get("ch_names", [])
+        self.bads = self.params.get("bads", [])
 
     def run(self):
         """Starts the data processing loop."""
@@ -1002,9 +1015,35 @@ class DataProcessingWorker(QObject):
         # Always try to get a raw chunk for continuous visualization
         emit_dict = {}
         try:
-            raw_chunk = self._peek_raw_data()
-            if raw_chunk is not None:
-                emit_dict["raw_data"] = raw_chunk
+            raw_chunk, _ = self.stream.get_data(picks=self.raw_picks)
+            if raw_chunk is not None and raw_chunk.shape[1] > 0:
+                n_samples = raw_chunk.shape[1]
+                time_axis = np.linspace(-n_samples / self.original_sfreq, 0, n_samples)
+                
+                means = np.nanmean(raw_chunk, axis=1, keepdims=True)
+                centered_chunk = raw_chunk - means
+                
+                scaled_chunk = np.zeros_like(centered_chunk)
+                scale_mode = self.params.get("scale_mode", "Global Auto-Scale")
+
+                if scale_mode == "Global Auto-Scale":
+                    global_std = np.nanstd(centered_chunk)
+                    scale = 1.0 / (global_std * 6) if (not np.isnan(global_std) and global_std > 0) else 1.0
+                    scaled_chunk = centered_chunk * scale
+                else:  # Local Auto-Scale
+                    for i in range(centered_chunk.shape[0]):
+                        y_data = centered_chunk[i, :]
+                        local_std = np.nanstd(y_data)
+                        if not np.isnan(local_std) and local_std > 0:
+                            scale = 1.0 / (local_std * 6)
+                            scaled_chunk[i, :] = y_data * scale
+                        else:
+                            scaled_chunk[i, :] = y_data
+
+                emit_dict["raw_data"] = {
+                    "time_axis": time_axis,
+                    "scaled_data": scaled_chunk,
+                }
         except Exception:
             pass
 
@@ -1028,16 +1067,34 @@ class DataProcessingWorker(QObject):
 
             # Calculate mean for plotting
             mean_data = np.nanmean(processed_data, axis=0)
+
+            valid_data = [
+                mean_data[i]
+                for i in range(len(self.ch_names))
+                if self.ch_names[i] not in self.bads
+            ]
+            global_min, global_max = -10.0, 10.0
+            if valid_data:
+                arr = np.array(valid_data)
+                if np.any(np.isfinite(arr)):
+                    global_min = np.nanmin(arr) * 1e6
+                    global_max = np.nanmax(arr) * 1e6
+            if global_min >= global_max:
+                global_min -= 1.0
+                global_max += 1.0
             
             # Add epoch data to the emit dictionary
             emit_dict["epoch_data"] = {
                 "processed_data": processed_data,
                 "mean_data": mean_data,
-                "n_epochs": processed_data.shape[0]
+                "n_epochs": processed_data.shape[0],
+                "global_min": global_min,
+                "global_max": global_max,
             }
         
         # Emit data for UI thread
-        self.data_ready.emit(emit_dict)
+        if emit_dict:
+            self.data_ready.emit(emit_dict)
 
     def _process_epoch_batch(self, epoch_batch: np.ndarray) -> np.ndarray:
         plot_data = epoch_batch.copy()
@@ -1065,22 +1122,13 @@ class DataProcessingWorker(QObject):
 
         return plot_data
 
-    def _peek_raw_data(self) -> np.ndarray | None:
-        buffer = getattr(self.stream, "_buffer", None)
-        timestamps = getattr(self.stream, "_timestamps", None)
-        if buffer is None or timestamps is None:
-            return None
-
-        n_samples = int(np.count_nonzero(timestamps))
-        if n_samples <= 0:
-            return None
-
-        recent_samples = buffer[-n_samples:, :]
-        return recent_samples[:, self.raw_picks].T
-
     def update_params(self, new_params):
         """Update processing parameters."""
         self.params.update(new_params)
+        if "ch_names" in new_params:
+            self.ch_names = new_params["ch_names"]
+        if "bads" in new_params:
+            self.bads = new_params["bads"]
         if hasattr(self, "timer"):
             self.timer.setInterval(max(1, int(round(1000 / self.params.get("refresh_rate", 24)))))
 
@@ -1361,6 +1409,7 @@ class RealTimeERP(QMainWindow):
         
         self.scale_mode_combo = QComboBox()
         self.scale_mode_combo.addItems(["Global Auto-Scale", "Local Auto-Scale"])
+        self.scale_mode_combo.currentTextChanged.connect(self._on_scale_mode_changed)
         toolbar.addWidget(QLabel(" Scale: "))
         toolbar.addWidget(self.scale_mode_combo)
         
@@ -1453,6 +1502,10 @@ class RealTimeERP(QMainWindow):
         self.colors = build_trace_colors(len(self.ch_names))
 
         self.n_chan_spinbox.setValue(len(self.ch_names))
+
+        self.params["ch_names"] = self.ch_names
+        self.params["bads"] = self.bads
+        self.params["scale_mode"] = self.scale_mode_combo.currentText()
 
         # Start data processing worker thread
         self.data_thread = QThread(self)
@@ -1553,6 +1606,10 @@ class RealTimeERP(QMainWindow):
         self.raw_plot_widget.setYRange(min_y - 0.5, max_y - 0.5, padding=0)
         self.raw_plot_widget.getViewBox().setMouseEnabled(y=False, x=True)
 
+    def _on_scale_mode_changed(self, text: str):
+        if hasattr(self, "data_worker"):
+            self.data_worker.update_params({"scale_mode": text})
+
     @staticmethod
     def to_rgb(positions_3d):
         xyz = positions_3d.copy()
@@ -1574,6 +1631,9 @@ class RealTimeERP(QMainWindow):
         self._processed_data = epoch_data["processed_data"]
         mean_data = epoch_data["mean_data"]
         n_epochs = epoch_data["n_epochs"]
+        global_min = epoch_data["global_min"]
+        global_max = epoch_data["global_max"]
+
         self.setWindowTitle(f"Real-Time TEP - Epochs: {n_epochs}")
         self.evoked_widget.setWindowTitle(f"Evoked Potentials (Epochs: {n_epochs})")
 
@@ -1583,20 +1643,6 @@ class RealTimeERP(QMainWindow):
                 line.setData(self.times * 1e3, np.full_like(self.times, np.nan))
             else:
                 line.setData(self.times * 1e3, mean_data[i] * 1e6)
-
-        # Get global min and max for consistent scaling of topo sparklines
-        valid_data = [mean_data[i] for i in range(len(self.ch_names)) if self.ch_names[i] not in self.bads]
-        
-        global_min, global_max = -10.0, 10.0
-        if valid_data:
-            arr = np.array(valid_data)
-            if np.any(np.isfinite(arr)):
-                global_min = np.nanmin(arr) * 1e6
-                global_max = np.nanmax(arr) * 1e6
-
-        if global_min >= global_max:
-            global_min -= 1.0
-            global_max += 1.0
 
         # Update Topo Plot
         for name, plot_item in self.topo_plots.items():
@@ -1616,37 +1662,19 @@ class RealTimeERP(QMainWindow):
             if self._processed_data is not None:
                 plot_dialog.update_plot(self._processed_data)
 
-    def _update_raw_plot(self, raw_chunk):
-        if raw_chunk is None or raw_chunk.shape[1] == 0:
+    def _update_raw_plot(self, raw_data_dict):
+        time_axis = raw_data_dict["time_axis"]
+        scaled_data = raw_data_dict["scaled_data"]
+        
+        if time_axis is None or scaled_data is None or scaled_data.shape[1] == 0:
             return
         
-        n_samples = raw_chunk.shape[1]
         n_chans = len(self.raw_curves)
-        
-        if n_chans != raw_chunk.shape[0]:
-             return # Mismatch between buffer and incoming data
+        if n_chans != scaled_data.shape[0]:
+             return  # Mismatch between buffer and incoming data
 
-        time_axis = np.linspace(-n_samples / self.sfreq, 0, n_samples)
-        scale_mode = self.scale_mode_combo.currentText()
-        
-        # Mean center the chunk to prevent massive DC offsets from breaking the scale
-        means = np.nanmean(raw_chunk, axis=1, keepdims=True)
-        centered_chunk = raw_chunk - means
-        
-        if scale_mode == "Global Auto-Scale":
-            global_std = np.nanstd(centered_chunk)
-            scale = 1.0 / (global_std * 6) if (not np.isnan(global_std) and global_std > 0) else 1.0
-            for i, curve in enumerate(self.raw_curves):
-                curve.setData(time_axis, (centered_chunk[i, :] * scale) + self.raw_offsets[i])
-        else:
-            for i, curve in enumerate(self.raw_curves):
-                y_data = centered_chunk[i, :]
-                local_std = np.nanstd(y_data)
-                if not np.isnan(local_std) and local_std > 0:
-                    scale = 1.0 / (local_std * 6)
-                    curve.setData(time_axis, (y_data * scale) + self.raw_offsets[i])
-                else:
-                    curve.setData(time_axis, y_data + self.raw_offsets[i])
+        for i, curve in enumerate(self.raw_curves):
+            curve.setData(time_axis, scaled_data[i, :] + self.raw_offsets[i])
 
     def update_settings(self):
         """Opens the settings dialog and applies changes."""

@@ -293,14 +293,18 @@ class WorkspacePanel(QFrame):
         self.filter_edit.setPlaceholderText("Filter datasets, subject IDs, or runs")
         layout.addWidget(self.filter_edit)
 
-        self.folder_label = QLabel("No workspace selected.")
-        self.folder_label.setObjectName("mutedLabel")
-        self.folder_label.setWordWrap(True)
-        layout.addWidget(self.folder_label)
+        hbox = QHBoxLayout()
+        hbox.setContentsMargins(0, 0, 0, 0)
 
-        self.count_label = QLabel("0 datasets")
+        self.folder_label = QLabel("No workspace selected.")
+        self.folder_label.setObjectName("panelSubtitle")
+        self.folder_label.setWordWrap(True)
+        hbox.addWidget(self.folder_label)
+
+        self.count_label = QLabel("(waiting...)")
         self.count_label.setObjectName("mutedLabel")
-        layout.addWidget(self.count_label)
+        hbox.addWidget(self.count_label)
+        layout.addLayout(hbox)
 
         self.list_widget = QListWidget()
         self.list_widget.setObjectName("workspaceList")
@@ -374,7 +378,7 @@ class WorkspacePanel(QFrame):
             self.list_widget.setItemWidget(item, DatasetListItemWidget(dataset))
             visible_count += 1
 
-        self.count_label.setText(f"{visible_count} dataset{'s' if visible_count != 1 else ''}")
+        self.count_label.setText(f"({visible_count} file{'s' if visible_count != 1 else ''})")
         self.list_widget.blockSignals(False)
 
         if visible_count == 0:
@@ -455,6 +459,7 @@ class DatasetInspectorPanel(QFrame):
     def refresh_icons(self):
         self.toggle_button.setIcon(themed_svg_icon("assets/icons/menu.svg", size=14))
         self.toggle_button.setIconSize(QSize(14, 14))
+        self.toggle_button.setObjectName('#iconButton')
 
     def toggle_collapsed(self):
         self.collapsed = not self.collapsed

@@ -1841,6 +1841,7 @@ dependencies = [
     { name = "pyqtgraph" },
     { name = "pyside6" },
     { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "statsmodels" },
 ]
 
@@ -1856,6 +1857,7 @@ requires-dist = [
     { name = "pyqtgraph", specifier = ">=0.14.0" },
     { name = "pyside6", specifier = ">=6.10.2" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
+    { name = "scipy", specifier = ">=1.17.1" },
     { name = "statsmodels", specifier = ">=0.14.6" },
 ]
 
