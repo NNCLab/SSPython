@@ -1,6 +1,6 @@
 import logging
 import sys
-from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QRadioButton,
     QLabel,
+    QScrollArea,
 )
 from .evoked_plot import EvokedPlotDialog
 import mne
@@ -28,6 +29,8 @@ from core.processing import Preprocessor
 from utils import parse_numeric, to_display_string, Worker
 from .tools.optional_range_widget import OptionalRangeWidget
 from pathlib import Path
+
+from core.app_settings import get_settings_store
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +47,13 @@ class ChannelSelectionDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Select Custom Reference Channels")
+        self.resize(420, 520)
+        self.setObjectName("appDialog")
         layout = QVBoxLayout(self)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Filter channels")
+        layout.addWidget(self.search_input)
 
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(
@@ -52,6 +61,7 @@ class ChannelSelectionDialog(QDialog):
         )
         self.list_widget.addItems(all_channels)
         layout.addWidget(self.list_widget)
+        self.search_input.textChanged.connect(self.filter_channels)
 
         # Pre-select channels if they were already chosen
         if selected_channels:
@@ -71,6 +81,12 @@ class ChannelSelectionDialog(QDialog):
         """Returns the text of the selected items."""
         return [item.text() for item in self.list_widget.selectedItems()]
 
+    def filter_channels(self, text: str):
+        needle = text.strip().lower()
+        for index in range(self.list_widget.count()):
+            item = self.list_widget.item(index)
+            item.setHidden(bool(needle) and needle not in item.text().lower())
+
 
 class BaseProcessingDialog(QDialog):
     """A base dialog class to reduce boilerplate for processing dialogues."""
@@ -88,10 +104,26 @@ class BaseProcessingDialog(QDialog):
         self.preprocessor = preprocessor
         self.setWindowTitle(title)
         self.setModal(True)
+        self.resize(720, 620)
+        self.setMinimumSize(620, 480)
+        self.setObjectName("appDialog")
         self.settings_widget = settings_widget
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self.settings_widget)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.scroll_area.viewport().setAutoFillBackground(False)
+
+        scroll_contents = QWidget()
+        scroll_layout = QVBoxLayout(scroll_contents)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(0)
+        scroll_layout.addWidget(self.settings_widget)
+        scroll_layout.addStretch()
+        self.scroll_area.setWidget(scroll_contents)
+
+        layout.addWidget(self.scroll_area, 1)
 
         hbox = QHBoxLayout()
         self.apply_button = QPushButton("Apply")
@@ -120,23 +152,32 @@ class BaseProcessingDialog(QDialog):
 class BaseSettingsWidget(QWidget):
     """A base widget for managing QSettings load/save logic."""
 
-    GROUP_NAME = ""
-    SETTINGS_KEY = ""
+    SETTINGS_PATH = ""
+    LEGACY_KEYS: tuple[str, ...] = ()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, pipeline_id: str | None = None):
         super().__init__(parent)
-        self.settings = QSettings()
+        self.settings_store = get_settings_store()
+        self.pipeline_id = pipeline_id or self.settings_store.current_pipeline_id()
+
+    def get_settings_path(self) -> str:
+        return self.SETTINGS_PATH.format(pipeline_id=self.pipeline_id)
+
+    def set_pipeline(self, pipeline_id: str):
+        self.pipeline_id = pipeline_id
+        self.load_settings()
 
     def save_settings(self):
         params = self.get_params()
-        self.settings.beginGroup(self.GROUP_NAME)
-        self.settings.setValue(self.SETTINGS_KEY, params)
-        self.settings.endGroup()
+        self.settings_store.set(self.get_settings_path(), params)
+        self.settings_store.sync()
 
     def load_settings(self):
-        self.settings.beginGroup(self.GROUP_NAME)
-        saved_params = self.settings.value(self.SETTINGS_KEY, {}) or {}
-        self.settings.endGroup()
+        saved_params = self.settings_store.get(
+            self.get_settings_path(),
+            {},
+            legacy_keys=self.LEGACY_KEYS,
+        ) or {}
 
         params = self.get_defaults().copy()
         if isinstance(saved_params, dict):
@@ -163,8 +204,8 @@ class ArtifactRemovalSettingsWidget(BaseSettingsWidget):
     A widget for configuring artifact removal settings.
     """
 
-    GROUP_NAME = "erp_preprocessing"
-    SETTINGS_KEY = "artifact_removal"
+    SETTINGS_PATH = "pipelines/{pipeline_id}/preprocessing/artifact_removal"
+    LEGACY_KEYS = ("erp_preprocessing/artifact_removal",)
 
     def __init__(self, show_events_list=False, parent=None):
         super().__init__(parent)
@@ -282,6 +323,7 @@ class ArtifactRemovalDialog(BaseProcessingDialog):
     def run_process(self):
         try:
             params = self.settings_widget.get_params()
+            self.settings_widget.save_settings()
             logger.info(f"Running artifact removal with parameters: {params}")
         except ValueError as e:
             QMessageBox.critical(self, "Invalid Input", str(e))
@@ -309,8 +351,8 @@ class ArtifactRemovalDialog(BaseProcessingDialog):
 
 # Continuous Filter
 class FilterContinuousWidget(BaseSettingsWidget):
-    GROUP_NAME = "erp_preprocessing"
-    SETTINGS_KEY = "continuous_filter"
+    SETTINGS_PATH = "pipelines/{pipeline_id}/preprocessing/continuous_filter"
+    LEGACY_KEYS = ("erp_preprocessing/continuous_filter",)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -360,6 +402,7 @@ class FilterContinuousDialog(BaseProcessingDialog):
     def run_process(self):
         try:
             params = self.settings_widget.get_params()
+            self.settings_widget.save_settings()
             logger.info(f"Running epoching with parameters: {params}")
         except ValueError as e:
             QMessageBox.critical(self, "Invalid Input", str(e))
@@ -386,8 +429,8 @@ class FilterContinuousDialog(BaseProcessingDialog):
 class EpochingSettingsWidget(BaseSettingsWidget):
     """A widget for configuring epoch segmentation settings."""
 
-    GROUP_NAME = "erp_preprocessing"
-    SETTINGS_KEY = "epoching"
+    SETTINGS_PATH = "pipelines/{pipeline_id}/preprocessing/epoching"
+    LEGACY_KEYS = ("erp_preprocessing/epoching",)
 
     def __init__(self, show_events_list=False, parent=None):
         super().__init__(parent)
@@ -632,14 +675,13 @@ class EpochingDialog(BaseProcessingDialog):
 class ReReferenceSettingsWidget(BaseSettingsWidget):
     """A widget for configuring re-referencing settings."""
 
-    GROUP_NAME = "erp_preprocessing"
-    SETTINGS_KEY = "re_reference"
+    SETTINGS_PATH = "pipelines/{pipeline_id}/preprocessing/re_reference"
+    LEGACY_KEYS = ("erp_preprocessing/re_reference",)
 
     def __init__(self, ch_names: list[str], parent=None):
         super().__init__(parent)
         self._selected_ref_channels = []
         self.ch_names = ch_names
-        self.settings = QSettings()
 
         layout = QVBoxLayout(self)
         self.setLayout(layout)
@@ -692,7 +734,7 @@ class ReReferenceSettingsWidget(BaseSettingsWidget):
         elif isinstance(reference, list):
             self.custom_ref_radio.setChecked(True)
             self._selected_ref_channels = reference
-            self.show_channel_selection_dialog()  # Re-call to update button text
+            self.show_ref_channel_selection_dialog()
         else:
             self.no_ref_radio.setChecked(True)
 
@@ -750,8 +792,8 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
     A reusable widget for configuring preprocessing steps with an improved UI.
     """
 
-    GROUP_NAME = "erp_preprocessing"
-    SETTINGS_KEY = "apply_params"
+    SETTINGS_PATH = "pipelines/{pipeline_id}/preprocessing/apply"
+    LEGACY_KEYS = ("erp_preprocessing/apply_params",)
 
     def __init__(self, preprocessor: Preprocessor | None = None, parent=None):
         super().__init__(parent)
@@ -949,6 +991,7 @@ class ApplyPreprocessingDialog(BaseProcessingDialog):
     def run_process(self):
         """Validates input and starts the background worker."""
         params = self.settings_widget.get_params()
+        self.settings_widget.save_settings()
 
         if self.preprocessor.has("preprocessed"):
             reply = QMessageBox.question(

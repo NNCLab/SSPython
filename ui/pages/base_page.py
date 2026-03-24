@@ -4,8 +4,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QScrollArea,
     QLayout,
-)  # Add QLayout
-from PySide6.QtGui import QFont
+    QFrame,
+)
 from PySide6.QtCore import Qt
 
 
@@ -17,6 +17,7 @@ class BasePage(QWidget):
 
     def __init__(self, title, parent=None):
         super().__init__(parent)
+        self.setObjectName("pageRoot")
 
         base_layout = QVBoxLayout(self)
         base_layout.setContentsMargins(0, 0, 0, 0)
@@ -30,15 +31,31 @@ class BasePage(QWidget):
         base_layout.addWidget(self.scroll_area)
 
         content_container = QWidget()
+        content_container.setObjectName("pageContent")
         self.scroll_area.setWidget(content_container)
 
         self.content_layout = QVBoxLayout(content_container)
-        self.content_layout.setContentsMargins(20, 20, 20, 20)
-        self.content_layout.setSpacing(15)
+        self.content_layout.setContentsMargins(24, 24, 24, 24)
+        self.content_layout.setSpacing(16)
 
-        title_label = QLabel(title)
-        title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self.content_layout.addWidget(title_label)
+        self.header_frame = QFrame()
+        self.header_frame.setObjectName("pageHeader")
+        header_layout = QVBoxLayout(self.header_frame)
+        header_layout.setContentsMargins(18, 16, 18, 16)
+        header_layout.setSpacing(4)
+
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("pageTitle")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        header_layout.addWidget(self.title_label)
+
+        self.subtitle_label = QLabel("")
+        self.subtitle_label.setObjectName("pageSubtitle")
+        self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.hide()
+        header_layout.addWidget(self.subtitle_label)
+
+        self.content_layout.addWidget(self.header_frame)
 
         self.content_layout.addStretch()
 
@@ -55,6 +72,17 @@ class BasePage(QWidget):
             raise TypeError(
                 f"add_content can only accept a QWidget or QLayout, not {type(item).__name__}"
             )
+
+    def set_page_title(self, title: str):
+        self.title_label.setText(title)
+
+    def set_page_subtitle(self, subtitle: str | None):
+        if subtitle:
+            self.subtitle_label.setText(subtitle)
+            self.subtitle_label.show()
+        else:
+            self.subtitle_label.clear()
+            self.subtitle_label.hide()
 
     def update_ui_state(self):
         """Updates the UI state. Can be overridden by subclasses."""

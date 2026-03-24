@@ -15,13 +15,15 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QApplication,
 )
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import Qt
 from core.processing import Preprocessor
 from utils import Worker, to_display_string, parse_numeric
 from typing import Literal
 import sys
 from pathlib import Path
 import logging
+
+from core.app_settings import get_settings_store
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +35,20 @@ class ICASettingsWidget(QWidget):
     to a QSettings object.
     """
 
-    GROUP_NAME = "ica"
-
     def __init__(
         self,
         mode: Literal["continuous", "epochs"],
         max_components: int | None = None,
         ch_names: list[str] | None = None,
         parent=None,
+        pipeline_id: str | None = None,
     ):
         super().__init__(parent)
-        self.settings = QSettings()
+        self.settings_store = get_settings_store()
+        self.mode = mode
         self.SETTINGS_KEY = mode
+        self.pipeline_id = pipeline_id or self.settings_store.current_pipeline_id()
+        self.settings_path = f"pipelines/{self.pipeline_id}/ica/{mode}"
 
         self.max_components = max_components
         self.ica_method = [
@@ -99,17 +103,19 @@ class ICASettingsWidget(QWidget):
 
     def load_settings(self):
         """Loads ICA parameters from a QSettings object into the UI."""
-        self.settings.beginGroup(self.GROUP_NAME)
         defaults = {
             "auto_n_components": True,
             "random_state": None,
             "max_iter": 1000,
             "method": "fastica",
         }
-        saved_params = self.settings.value(self.SETTINGS_KEY, {}) or {}
+        saved_params = self.settings_store.get(
+            self.settings_path,
+            {},
+            legacy_keys=(f"ica/{self.mode}",),
+        ) or {}
         params = defaults.copy()
         params.update(saved_params)
-        self.settings.endGroup()
 
         self.auto_n_components_checkbox.setChecked(params.get("auto_n_components"))
         if self.max_components is not None:
@@ -120,11 +126,15 @@ class ICASettingsWidget(QWidget):
 
     def save_settings(self):
         """Saves the current UI state to a QSettings object."""
-        self.settings.beginGroup(self.GROUP_NAME)
         params = self.get_params()
-        self.settings.setValue(self.SETTINGS_KEY, params)
-        self.settings.endGroup()
-        self.settings.sync()
+        self.settings_store.set(self.settings_path, params)
+        self.settings_store.set(f"ica/{self.SETTINGS_KEY}", params)
+        self.settings_store.sync()
+
+    def set_pipeline(self, pipeline_id: str):
+        self.pipeline_id = pipeline_id
+        self.settings_path = f"pipelines/{self.pipeline_id}/ica/{self.mode}"
+        self.load_settings()
 
     def get_params(self) -> dict:
         """Parses UI controls to get ICA parameters."""
@@ -145,13 +155,9 @@ class ICASettingsWidget(QWidget):
 
     def clear_settings(self):
         """Removes all settings associated with this widget group."""
-        self.settings.beginGroup(self.GROUP_NAME)
-        self.settings.remove(self.SETTINGS_KEY)
-        self.settings.endGroup()
-        self.settings.sync()
-        print(
-            f"Settings for group '{self.GROUP_NAME}/{self.SETTINGS_KEY}' have been cleared."
-        )
+        self.settings_store.remove(self.settings_path)
+        self.settings_store.remove(f"ica/{self.SETTINGS_KEY}")
+        self.settings_store.sync()
 
 
 class RunICADialog(QDialog):
@@ -172,6 +178,8 @@ class RunICADialog(QDialog):
 
         self.setWindowTitle("Independent Component Analysis")
         self.setModal(True)
+        self.resize(560, 360)
+        self.setObjectName("appDialog")
 
         layout = QVBoxLayout(self)
         self.setLayout(layout)
@@ -194,7 +202,11 @@ class RunICADialog(QDialog):
             raise ValueError("'mode' needs to be 'continuous' or 'epochs'.")
 
         self.settings_widget = ICASettingsWidget(
-            mode, self.max_components, ch_names, parent=self
+            mode,
+            self.max_components,
+            ch_names,
+            parent=self,
+            pipeline_id=get_settings_store().current_pipeline_id(),
         )
         self.settings_widget.load_settings()
         layout.addWidget(self.settings_widget)
@@ -216,11 +228,12 @@ class RunICADialog(QDialog):
         self.apply_button.clicked.connect(self.run_ica)
         self.cancel_button.clicked.connect(self.reject)
         self.reset_button.clicked.connect(
-            lambda: self.settings_widget.load_settings(self.settings)
+            self.settings_widget.load_settings
         )
 
     def run_ica(self):
         ica_params = self.settings_widget.get_params()
+        self.settings_widget.save_settings()
 
         if self.preprocessor.has(self.mode + "-ica"):
             reply = QMessageBox.question(

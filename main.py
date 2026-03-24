@@ -1,160 +1,226 @@
-import sys
 import logging
-from pathlib import Path
+import sys
 from importlib import metadata
+from pathlib import Path
 
+from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt, QSettings, Signal, QSize, Slot
+from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QMainWindow,
-    QWidget,
-    QHBoxLayout,
-    QListWidget,
-    QStackedWidget,
-    QListWidgetItem,
     QFrame,
-    QSplashScreen,
-    QVBoxLayout,
+    QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QPushButton,
+    QSplashScreen,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtCore import Qt, QSize, QSettings, Slot, Signal
-from PySide6.QtGui import QIcon, QPixmap, QAction
 
-from ui.pages.preprocessing_page import ProcessingPage
-from ui.pages.erp_analysis_page import ErpAnalysisPage
+from core.app_settings import get_settings_store
+from core.pipelines import all_pipelines, get_pipeline
 from ui.pages.continuous_analysis_page import ContinuousAnalysisPage
-from ui.pages.real_time_page import RealTimePage
-from ui.pages.preferences_page import PreferencesPage
+from ui.pages.erp_analysis_page import ErpAnalysisPage
 from ui.pages.home_page import HomePage
-from utils import get_path, apply_theme, toggle_theme
+from ui.pages.preferences_page import PreferencesPage
+from ui.pages.preprocessing_page import ProcessingPage
+from ui.pages.real_time_page import RealTimePage
 from ui.widgets.tools.convert_brainamp import BrainampConverter
 from ui.widgets.tools.convert_gtec import GtecConverter
 from ui.widgets.tools.qss_helper import QSSEditorDialog
+from ui.widgets.workspace_panel import DatasetInspectorPanel, WorkspacePanel
+from utils import apply_theme, get_path, themed_svg_icon, toggle_theme as toggle_app_theme
 
-# --- Constants ---
 APP_NAME = "SSPython"
+ORGANIZATION_NAME = "SSPython"
+
 try:
     APP_VERSION = metadata.version("sspython")
 except metadata.PackageNotFoundError:
-    # This is a fallback for when the package is not installed, e.g., when running from source
     APP_VERSION = "0.1.0-dev"
-ORGANIZATION_NAME = "SSPython"
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    """
-    The main application window, featuring a navigation list and a stacked widget
-    to display different pages.
-    """
+    current_folder_changed = Signal(object)
+    current_pipeline_changed = Signal(object)
+    current_dataset_changed = Signal(object)
 
-    current_folder_changed = Signal(Path)
+    GEOMETRY_SETTING = "ui/main_window/geometry"
+    SIDEBAR_COLLAPSED_SETTING = "ui/main_window/sidebar_collapsed"
+    INSPECTOR_COLLAPSED_SETTING = "ui/main_window/inspector_collapsed"
 
-    # --- Constants for settings and object names ---
-    GEOMETRY_SETTING = "geometry"
-    CURRENT_FOLDER_SETTING = "current_folder"
-    OUTPUT_DIR_SETTING = "global_settings/output_dir"
-    THEME_SETTING = "theme"
     NAV_LIST_OBJECT_NAME = "navList"
     SIDEBAR_OBJECT_NAME = "sidebar"
 
-    # --- Page Definitions ---
     PAGE_DEFINITIONS = [
-        ("assets/icon.png", "SSPython", HomePage),
-        None,  # Separator
+        ("assets/icon.png", "Home", HomePage),
+        None,
         ("assets/icons/realtime.svg", "Real-Time", RealTimePage),
-        None,  # Separator
+        None,
         ("assets/icons/erp_preprocess.svg", "Preprocessing", ProcessingPage),
-        None,  # Separator
-        (
-            "assets/icons/cont_analysis.svg",
-            "Continuous Analysis",
-            ContinuousAnalysisPage,
-        ),
+        None,
+        ("assets/icons/cont_analysis.svg", "Continuous Analysis", ContinuousAnalysisPage),
         ("assets/icons/erp_analysis.svg", "ERP Analysis", ErpAnalysisPage),
-        None,  # Separator
+        None,
         ("assets/icons/settings.svg", "Preferences", PreferencesPage),
     ]
 
-    # Custom role to store the widget reference in a QListWidgetItem
     PageWidgetRole = Qt.ItemDataRole.UserRole + 1
+    PageIconRole = Qt.ItemDataRole.UserRole + 2
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
-        self.settings = QSettings()
-        self.current_folder = None
-        self.output_dir = "derivatives"
 
-        self._read_settings()
+        self.settings = QSettings()
+        self.settings_store = get_settings_store(self.settings)
+
+        self.current_folder = self.settings_store.current_folder()
+        if self.current_folder and not self.current_folder.exists():
+            self.current_folder = None
+
+        self.output_root = self.settings_store.output_root()
+        self.current_pipeline = get_pipeline(self.settings_store.current_pipeline_id())
+        self.current_dataset = None
+        self.sidebar_expanded_width = 236
+        self.sidebar_collapsed_width = 84
+        self.sidebar_collapsed = self.settings_store.get(
+            self.SIDEBAR_COLLAPSED_SETTING,
+            False,
+            value_type=bool,
+        )
+        self.inspector_collapsed = self.settings_store.get(
+            self.INSPECTOR_COLLAPSED_SETTING,
+            False,
+            value_type=bool,
+        )
+
+        self.page_lookup: dict[str, QWidget] = {}
+
         self._setup_ui()
         self._setup_menu()
         self._populate_navigation()
+        self._read_window_state()
+        self.refresh_workspace()
 
     def _setup_ui(self):
-        """Initializes the main UI layout and widgets."""
         central_widget = QWidget()
+        central_widget.setObjectName("appShell")
         self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setSpacing(0)
-        main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Sidebar
-        sidebar_widget = self._create_sidebar()
-        main_layout.addWidget(sidebar_widget)
+        layout = QHBoxLayout(central_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Main content area
+        self.sidebar_widget = self._create_sidebar()
+        layout.addWidget(self.sidebar_widget)
+
+        self.workspace_panel = WorkspacePanel(self)
+        self.workspace_panel.folder_selected.connect(self.set_current_folder)
+        self.workspace_panel.dataset_selected.connect(self.set_current_dataset)
+        layout.addWidget(self.workspace_panel)
+
+        content_frame = QFrame()
+        content_frame.setObjectName("contentFrame")
+        content_layout = QVBoxLayout(content_frame)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+
         self.stacked_widget = QStackedWidget()
-        main_layout.addWidget(self.stacked_widget)
+        content_layout.addWidget(self.stacked_widget)
+        layout.addWidget(content_frame, 1)
+
+        self.dataset_inspector_panel = DatasetInspectorPanel(self)
+        self.dataset_inspector_panel.collapsed = self.inspector_collapsed
+        self.dataset_inspector_panel._apply_collapsed_state(animated=False)
+        layout.addWidget(self.dataset_inspector_panel)
 
         self.nav_list.currentItemChanged.connect(self._change_page)
+        self._apply_sidebar_state(animated=False)
 
     def _create_sidebar(self) -> QWidget:
-        """Creates the sidebar widget containing navigation and a watermark."""
-        sidebar_widget = QWidget()
+        sidebar_widget = QFrame()
         sidebar_widget.setObjectName(self.SIDEBAR_OBJECT_NAME)
-        sidebar_widget.setFixedWidth(240)
 
         sidebar_layout = QVBoxLayout(sidebar_widget)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.setSpacing(0)
+        sidebar_layout.setContentsMargins(14, 18, 14, 18)
+        sidebar_layout.setSpacing(12)
 
-        # Navigation List
+        chrome_row = QHBoxLayout()
+        chrome_row.setContentsMargins(0, 0, 0, 0)
+        chrome_row.setSpacing(8)
+
+        self.sidebar_brand = QLabel("SSPython")
+        self.sidebar_brand.setObjectName("sidebarBrand")
+        chrome_row.addWidget(self.sidebar_brand, 1)
+
+        self.toggle_sidebar_button = QPushButton("")
+        self.toggle_sidebar_button.setObjectName("sidebarToggle")
+        self.toggle_sidebar_button.clicked.connect(self.toggle_sidebar)
+        chrome_row.addWidget(self.toggle_sidebar_button)
+        sidebar_layout.addLayout(chrome_row)
+
         self.nav_list = QListWidget()
         self.nav_list.setObjectName(self.NAV_LIST_OBJECT_NAME)
-        self.nav_list.setIconSize(QSize(24, 24))
-        sidebar_layout.addWidget(self.nav_list)
+        self.nav_list.setIconSize(QSize(20, 20))
+        self.nav_list.setSpacing(0)
+        sidebar_layout.addWidget(self.nav_list, 1)
 
-        # Watermark
-        watermark = QLabel("Under Development.\nCouto, B.A.N (2025)")
-        watermark.setStyleSheet("color: rgba(126, 126, 126, 50)")
-        watermark.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
-        watermark.setMinimumHeight(20)
-        sidebar_layout.addWidget(watermark)
+        self.theme_button = QPushButton("Theme")
+        self.theme_button.setObjectName("sidebarActionButton")
+        self.theme_button.clicked.connect(self.toggle_theme)
+        sidebar_layout.addWidget(self.theme_button)
+
+        self.sidebar_footer = QLabel("Pipeline-aware workspace\nand derivative tracking")
+        self.sidebar_footer.setObjectName("sidebarFooter")
+        self.sidebar_footer.setWordWrap(True)
+        sidebar_layout.addWidget(self.sidebar_footer)
 
         return sidebar_widget
 
     def _setup_menu(self):
-        """Creates the main menu bar with its actions."""
         menu_bar = self.menuBar()
 
-        # File Menu
         file_menu = menu_bar.addMenu("&File")
+        self._add_action(file_menu, "Open Workspace", self.workspace_panel.select_folder, "Ctrl+O")
+        file_menu.addSeparator()
         self._add_action(file_menu, "Convert Brainamp data", self._convert_brainamp_data)
         self._add_action(file_menu, "Convert gTEC data", self._convert_gtec_data)
         file_menu.addSeparator()
         self._add_action(file_menu, "Exit", self.close)
 
-        # View Menu
         view_menu = menu_bar.addMenu("&View")
-        self._add_action(view_menu, "Toggle Light/Dark Theme", toggle_theme)
-        self._add_action(view_menu, "Toggle Fullscreen", lambda: self.showFullScreen() if not self.isFullScreen() else self.showNormal(), "F11")
+        self._add_action(view_menu, "Toggle Sidebar", self.toggle_sidebar, "Ctrl+B")
+        self._add_action(view_menu, "Toggle Derivative Inspector", self.toggle_derivative_inspector, "Ctrl+I")
+        self._add_action(view_menu, "Toggle Light/Dark Theme", self.toggle_theme)
+        self._add_action(
+            view_menu,
+            "Toggle Fullscreen",
+            lambda: self.showFullScreen() if not self.isFullScreen() else self.showNormal(),
+            "F11",
+        )
         view_menu.addSeparator()
         self._add_action(view_menu, "Toggle QSS Editor (Test)", self._open_qss_dialog)
 
+        pipeline_menu = menu_bar.addMenu("&Pipeline")
+        self.pipeline_actions = {}
+        for pipeline in all_pipelines():
+            action = self._add_action(
+                pipeline_menu,
+                pipeline.name,
+                lambda checked=False, pipeline_id=pipeline.id: self.set_current_pipeline(pipeline_id),
+            )
+            action.setCheckable(True)
+            action.setChecked(pipeline.id == self.current_pipeline.id)
+            self.pipeline_actions[pipeline.id] = action
+
     def _add_action(self, menu, text, slot, shortcut=None):
-        """Helper to create and add an action to a menu."""
         action = QAction(text, self)
         action.triggered.connect(slot)
         menu.addAction(action)
@@ -163,143 +229,233 @@ class MainWindow(QMainWindow):
         return action
 
     def _populate_navigation(self):
-        """Creates and adds pages to the navigation list and stacked widget."""
         for page_def in self.PAGE_DEFINITIONS:
             if page_def is None:
-                self._add_separator()
+                separator = QListWidgetItem("")
+                separator.setFlags(Qt.ItemFlag.NoItemFlags)
+                separator.setSizeHint(QSize(0, 12))
+                self.nav_list.addItem(separator)
                 continue
 
-            icon_path, name, PageClass = page_def
-            page_widget = (
-                PreferencesPage(self.settings, self)
-                if PageClass == PreferencesPage
-                else PageClass(self)
-            )
+            icon_path, name, page_class = page_def
 
-            if isinstance(page_widget, PreferencesPage):
+            if page_class == PreferencesPage:
+                page_widget = PreferencesPage(self.settings_store, self)
                 page_widget.settings_saved.connect(self._on_settings_saved)
+            else:
+                page_widget = page_class(self)
 
+            self.page_lookup[name] = page_widget
             self.stacked_widget.addWidget(page_widget)
 
-            item = QListWidgetItem(QIcon(get_path(icon_path)), name)
-            item.setSizeHint(QSize(0, 50))
+            item = QListWidgetItem(name)
+            item.setSizeHint(QSize(0, 44))
             item.setData(self.PageWidgetRole, page_widget)
+            item.setData(self.PageIconRole, icon_path)
             self.nav_list.addItem(item)
 
+        self._refresh_icons()
         self.nav_list.setCurrentRow(0)
 
-    def _add_separator(self):
-        """Adds a visual separator to the navigation list."""
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setFrameShadow(QFrame.Shadow.Sunken)
+    def _read_window_state(self):
+        geometry = self.settings_store.get(self.GEOMETRY_SETTING, None)
+        if geometry:
+            self.restoreGeometry(geometry)
+        else:
+            self.setGeometry(120, 80, 1600, 920)
 
-        item = QListWidgetItem(self.nav_list)
-        item.setSizeHint(separator.sizeHint())
-        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable & ~Qt.ItemFlag.ItemIsEnabled)
-        self.nav_list.setItemWidget(item, separator)
+    def _write_window_state(self):
+        self.settings_store.set(self.GEOMETRY_SETTING, self.saveGeometry())
+        self.settings_store.set(self.SIDEBAR_COLLAPSED_SETTING, self.sidebar_collapsed)
+        self.settings_store.set(self.INSPECTOR_COLLAPSED_SETTING, self.dataset_inspector_panel.collapsed)
+        self.settings_store.set_current_folder(self.current_folder)
+        self.settings_store.set("workspace/output_root", self.output_root)
+        self.settings_store.set_current_pipeline_id(self.current_pipeline.id)
+        self.settings_store.sync()
 
     @Slot(QListWidgetItem)
     def _change_page(self, current_item: QListWidgetItem):
-        """Changes the visible page based on navigation list selection."""
-        if current_item and (page_widget := current_item.data(self.PageWidgetRole)):
+        if current_item is None:
+            return
+
+        page_widget = current_item.data(self.PageWidgetRole)
+        if page_widget:
             self.stacked_widget.setCurrentWidget(page_widget)
-            page_widget.update_ui_state()
+            self._apply_page_chrome_visibility(current_item.text())
+            if hasattr(page_widget, "update_ui_state"):
+                page_widget.update_ui_state()
 
-    def _read_settings(self):
-        """Reads and applies saved application settings."""
-        if geometry := self.settings.value(self.GEOMETRY_SETTING):
-            self.restoreGeometry(geometry)
-        else:
-            self.setGeometry(100, 100, 1280, 800)  # Default size
-
-        if folder_str := self.settings.value(self.CURRENT_FOLDER_SETTING):
-            folder_path = Path(folder_str)
-            if folder_path.exists():
-                self.current_folder = folder_path
-
-        self.output_dir = self.settings.value(self.OUTPUT_DIR_SETTING, "derivatives")
-
-    def _write_settings(self):
-        """Saves application settings like geometry and paths."""
-        self.settings.setValue(self.GEOMETRY_SETTING, self.saveGeometry())
-        if self.current_folder:
-            self.settings.setValue(self.CURRENT_FOLDER_SETTING, str(self.current_folder))
-        self.settings.setValue(self.OUTPUT_DIR_SETTING, self.output_dir)
+    def _apply_page_chrome_visibility(self, page_name: str):
+        show_workspace_shell = page_name != "Real-Time"
+        self.workspace_panel.setVisible(show_workspace_shell)
+        self.dataset_inspector_panel.setVisible(show_workspace_shell)
 
     @Slot(str)
     def set_current_folder(self, folder_path: str | None):
-        """Sets the current working folder and notifies other widgets."""
-        if folder_path is None:
+        if not folder_path:
             self.current_folder = None
+            self.current_folder_changed.emit(None)
+            self.refresh_workspace()
             return
 
         path = Path(folder_path)
         if not (path.exists() and path.is_dir()):
-            logger.warning(f"Attempted to set invalid folder: {folder_path}")
+            logger.warning("Attempted to set invalid workspace: %s", folder_path)
             return
 
-        if self.current_folder != path:
-            self.current_folder = path
-            logger.info(f"Current folder changed to: {self.current_folder}")
-            self.current_folder_changed.emit(self.current_folder)
-            self._write_settings()
+        self.current_folder = path
+        self.settings_store.set_current_folder(path)
+        self.settings_store.sync()
+        self.current_folder_changed.emit(path)
+        self.refresh_workspace()
+
+    @Slot(object)
+    def set_current_dataset(self, dataset):
+        self.current_dataset = dataset
+        self.dataset_inspector_panel.set_dataset(dataset)
+        self.current_dataset_changed.emit(dataset)
+
+    def set_current_pipeline(self, pipeline_id: str):
+        pipeline = get_pipeline(pipeline_id)
+        if pipeline.id == self.current_pipeline.id and self.workspace_panel.pipeline is not None:
+            return
+
+        self.current_pipeline = pipeline
+        self.settings_store.set_current_pipeline_id(pipeline.id)
+        self.settings_store.sync()
+        for action_pipeline_id, action in self.pipeline_actions.items():
+            action.setChecked(action_pipeline_id == pipeline.id)
+        self.current_pipeline_changed.emit(pipeline)
+        self.refresh_workspace()
+
+        current_page = self.stacked_widget.currentWidget()
+        if current_page and hasattr(current_page, "update_ui_state"):
+            current_page.update_ui_state()
+
+    def refresh_workspace(self):
+        self.output_root = self.settings_store.output_root()
+        self.workspace_panel.set_context(
+            workspace_root=self.current_folder,
+            pipeline=self.current_pipeline,
+            output_root=self.output_root,
+        )
+
+    def toggle_sidebar(self):
+        self.sidebar_collapsed = not self.sidebar_collapsed
+        self._apply_sidebar_state(animated=True)
+
+    def toggle_derivative_inspector(self):
+        self.dataset_inspector_panel.toggle_collapsed()
+
+    def toggle_theme(self):
+        toggle_app_theme()
+        self._refresh_icons()
+        for page_name, page_widget in self.page_lookup.items():
+            target = getattr(page_widget, "widget", page_widget)
+            if hasattr(target, "refresh_theme"):
+                target.refresh_theme()
+
+    def _icon_for_path(self, icon_path: str, *, size: int = 20) -> QIcon:
+        if icon_path.lower().endswith(".svg"):
+            return themed_svg_icon(icon_path, size=size)
+        return QIcon(get_path(icon_path))
+
+    def _refresh_icons(self):
+        self.toggle_sidebar_button.setIcon(themed_svg_icon("assets/icons/menu.svg", size=14))
+        self.toggle_sidebar_button.setIconSize(QSize(14, 14))
+        self.theme_button.setIcon(themed_svg_icon("assets/icons/theme.svg", size=18))
+        self.theme_button.setIconSize(QSize(18, 18))
+
+        for row in range(self.nav_list.count()):
+            item = self.nav_list.item(row)
+            if item is None:
+                continue
+            icon_path = item.data(self.PageIconRole)
+            if icon_path:
+                item.setIcon(self._icon_for_path(icon_path, size=20))
+
+        if hasattr(self.dataset_inspector_panel, "refresh_icons"):
+            self.dataset_inspector_panel.refresh_icons()
+
+    def _apply_sidebar_state(self, *, animated: bool):
+        target_width = self.sidebar_collapsed_width if self.sidebar_collapsed else self.sidebar_expanded_width
+        self.sidebar_brand.setVisible(not self.sidebar_collapsed)
+        self.sidebar_footer.setVisible(not self.sidebar_collapsed)
+        self.theme_button.setText("" if self.sidebar_collapsed else "Theme")
+        self.toggle_sidebar_button.setToolTip("Expand sidebar" if self.sidebar_collapsed else "Collapse sidebar")
+
+        if not animated:
+            self.sidebar_widget.setMinimumWidth(target_width)
+            self.sidebar_widget.setMaximumWidth(target_width)
+            return
+
+        group = QParallelAnimationGroup(self)
+        for prop in (b"minimumWidth", b"maximumWidth"):
+            animation = QPropertyAnimation(self.sidebar_widget, prop)
+            animation.setDuration(180)
+            animation.setStartValue(self.sidebar_widget.width())
+            animation.setEndValue(target_width)
+            animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            group.addAnimation(animation)
+        group.start()
+        self._sidebar_animation = group
+
+    def navigate_to_page(self, page_name: str):
+        for row in range(self.nav_list.count()):
+            item = self.nav_list.item(row)
+            if item and item.text() == page_name:
+                self.nav_list.setCurrentRow(row)
+                return
 
     @Slot()
     def _on_settings_saved(self):
-        """Notifies all pages that settings have been updated."""
-        logger.info("MainWindow received settings_saved Signal. Notifying all pages.")
-        self.output_dir = self.settings.value(self.OUTPUT_DIR_SETTING, "derivatives")
+        updated_output_root = self.settings_store.output_root()
+        updated_pipeline = get_pipeline(self.settings_store.current_pipeline_id())
 
-        for i in range(self.stacked_widget.count()):
-            widget = self.stacked_widget.widget(i)
-            widget.on_settings_updated()
+        self.output_root = updated_output_root
+        if updated_pipeline.id != self.current_pipeline.id:
+            self.current_pipeline = updated_pipeline
+            for action_pipeline_id, action in self.pipeline_actions.items():
+                action.setChecked(action_pipeline_id == updated_pipeline.id)
+            self.current_pipeline_changed.emit(updated_pipeline)
+
+        self.refresh_workspace()
+
+        for index in range(self.stacked_widget.count()):
+            widget = self.stacked_widget.widget(index)
+            if hasattr(widget, "on_settings_updated"):
+                widget.on_settings_updated()
 
     def closeEvent(self, event):
-        """Saves settings before exiting the application."""
-        self._write_settings()
+        self._write_window_state()
         super().closeEvent(event)
 
-    # --- Data Conversion Dialogs ---
     @Slot()
     def _convert_brainamp_data(self):
-        """Shows the Brainamp data conversion dialog."""
-        logger.info("Triggered 'Convert Brainamp data' action.")
         dialog = BrainampConverter(self)
-        if dialog.exec():
-            logger.info("Brainamp conversion completed successfully.")
+        dialog.exec()
 
     @Slot()
     def _convert_gtec_data(self):
-        """Shows the gTEC data conversion dialog."""
-        logger.info("Triggered 'Convert gTEC data' action.")
         dialog = GtecConverter(self)
-        if dialog.exec():
-            logger.info("gTEC conversion completed successfully.")
+        dialog.exec()
 
-    # --- Dialogs ---
     def _open_qss_dialog(self):
-        """Opens the QSS editor dialog."""
         dialog = QSSEditorDialog(self)
         dialog.exec()
 
+
 def main():
-    """Main function to set up and run the application."""
     app = QApplication(sys.argv)
     QApplication.setOrganizationName(ORGANIZATION_NAME)
     QApplication.setApplicationName(APP_NAME)
     QApplication.setApplicationVersion(APP_VERSION)
 
-    # --- Theme & Icon ---
     apply_theme()
     app.setWindowIcon(QIcon(get_path("assets/icon.png")))
     app.setStyle("Fusion")
 
-    # --- Splash Screen ---
-    splash = QSplashScreen(
-        QPixmap(get_path("assets/icon.png")),
-        Qt.WindowType.WindowStaysOnTopHint
-    )
+    splash = QSplashScreen(QPixmap(get_path("assets/icon.png")), Qt.WindowType.WindowStaysOnTopHint)
     splash.show()
     splash.showMessage(
         "Loading application...",

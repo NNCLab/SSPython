@@ -1,6 +1,6 @@
 import sys
 from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget, QLabel
-from PySide6.QtCore import Qt, QTimer, QSettings, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 import time
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -10,6 +10,8 @@ import numpy as np
 import mne
 from utils import update_toolbar_color  # Assuming utils.py is in the same directory
 import logging
+
+from core.app_settings import get_settings_store
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +82,10 @@ class PSDPlotWidget(QWidget):
         # --- Clear and Style ---
         self.reapply_style()
         self.canvas.axes.cla()
-        self.params = QSettings().value(
-            "plot_settings/psd_plot_params", self.default_params
+        self.params = get_settings_store().get(
+            "appearance/plots/psd",
+            self.default_params,
+            legacy_keys=("plot_settings/psd_plot_params",),
         )
         logger.info(self.params)
         update_toolbar_color(self.toolbar)

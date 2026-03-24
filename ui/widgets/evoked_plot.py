@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
 )
-from PySide6.QtCore import Qt, QTimer, QSettings, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 import time
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -20,6 +20,8 @@ import numpy as np
 import mne
 from utils import update_toolbar_color
 import logging
+
+from core.app_settings import get_settings_store
 
 logger = logging.getLogger(__name__)
 
@@ -173,8 +175,10 @@ class EvokedPlotWidget(QWidget):
         self.canvas.axes.cla()
         for ax in self.canvas.figure.axes[1:]:
             self.canvas.figure.delaxes(ax)
-        self.params = QSettings().value(
-            "plot_settings/plot_params", self.default_params
+        self.params = get_settings_store().get(
+            "appearance/plots/global",
+            self.default_params,
+            legacy_keys=("plot_settings/plot_params",),
         )
         logger.info("Evoked plot: ", self.params)
         update_toolbar_color(self.toolbar)

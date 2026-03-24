@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QDialogButtonBox,
 )
-from PySide6.QtCore import Qt, Signal, QSettings
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -39,6 +39,8 @@ import scipy
 import logging
 from dataclasses import dataclass, asdict
 
+from core.app_settings import get_settings_store
+
 logger = logging.getLogger(__file__)
 
 
@@ -47,12 +49,11 @@ class ICAPlottingSettingsWidget(QWidget):
     A reusable widget for configuring plotting and auto-rejection settings.
     """
 
-    GROUP_NAME = "ica"
-    SETTINGS_KEY = "plotting"
-
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.settings = QSettings()
+        self.settings_store = get_settings_store()
+        pipeline_id = self.settings_store.current_pipeline_id()
+        self.settings_path = f"pipelines/{pipeline_id}/ica/plotting"
         self.init_form()
         self.load_settings()
 
@@ -107,8 +108,6 @@ class ICAPlottingSettingsWidget(QWidget):
 
     def load_settings(self):
         """Loads parameters from QSettings and populates the UI widgets."""
-        self.settings.beginGroup(self.GROUP_NAME)
-
         default_params = {
             "number_of_columns": 5,
             "decimate": 1,
@@ -117,10 +116,13 @@ class ICAPlottingSettingsWidget(QWidget):
             "plot_type": "Overlay",
         }
 
-        save_settings = self.settings.value(self.SETTINGS_KEY, {}) or {}
+        save_settings = self.settings_store.get(
+            self.settings_path,
+            {},
+            legacy_keys=("ica/plotting",),
+        ) or {}
         params = default_params.copy()
         params.update(save_settings)
-        self.settings.endGroup()
         self.number_of_columns_input.setValue(params.get("number_of_columns", 5))
         self.decimate_input.setValue(params.get("decimate", 5))
         self.cmap_input.setCurrentText(params.get("cmap", "turbo"))
@@ -130,9 +132,13 @@ class ICAPlottingSettingsWidget(QWidget):
     def save_settings(self):
         """Retrieves current settings from UI and saves them to QSettings."""
         params = self.get_settings()
-        self.settings.beginGroup(self.GROUP_NAME)
-        self.settings.setValue(self.SETTINGS_KEY, params)
-        self.settings.endGroup()
+        self.settings_store.set(self.settings_path, params)
+        self.settings_store.set("ica/plotting", params)
+        self.settings_store.sync()
+
+    def set_pipeline(self, pipeline_id: str):
+        self.settings_path = f"pipelines/{pipeline_id}/ica/plotting"
+        self.load_settings()
 
 
 class ICAPlottingDialog(QDialog):

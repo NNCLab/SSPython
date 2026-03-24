@@ -2,17 +2,64 @@ import re
 import sys
 import os
 import inspect
-from PySide6.QtCore import Signal, Qt, QThread, QObject, QSettings
+from functools import lru_cache, wraps
+from pathlib import Path
+
+from PySide6.QtCore import QByteArray, QRectF, Signal, Qt, QThread, QObject, QSize
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication, QProgressDialog, QMessageBox, QWidget
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 import logging
 import traceback
 from typing import Any, Optional, Tuple, Type, Callable
 import matplotlib.pyplot as plt
-from functools import wraps
+
+try:
+    import pyqtgraph as pg
+except ImportError:  # pragma: no cover - optional at import time
+    pg = None
+
+from core.app_settings import get_settings_store
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+THEME_TOKENS = {
+    "dark": {
+        "background": "#0c1114",
+        "panel": "#151d21",
+        "border": "#223038",
+        "text": "#e7ecef",
+        "muted": "#84939a",
+        "accent": "#3a8a9b",
+        "accent_soft": "#6db3c0",
+        "accent_fill": "#235f6c",
+        "selection": "#1a3037",
+        "icon": "#e7ecef",
+        "plot_background": "#11181c",
+        "plot_foreground": "#e7ecef",
+        "grid": "#2a3941",
+        "roi": "#3a8a9b",
+    },
+    "light": {
+        "background": "#edf1f2",
+        "panel": "#ffffff",
+        "border": "#d7e0e3",
+        "text": "#16242a",
+        "muted": "#64747c",
+        "accent": "#2f7e8d",
+        "accent_soft": "#5f97a3",
+        "accent_fill": "#d8eaee",
+        "selection": "#dfeff3",
+        "icon": "#16242a",
+        "plot_background": "#ffffff",
+        "plot_foreground": "#16242a",
+        "grid": "#c7d5da",
+        "roi": "#2f7e8d",
+    },
+}
 
 
 def get_path(relative_path):
@@ -29,6 +76,53 @@ def get_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
+def current_theme_name() -> str:
+    settings_store = get_settings_store()
+    return settings_store.get("appearance/theme", "dark", legacy_keys=("theme",))
+
+
+def theme_tokens(theme: str | None = None) -> dict[str, str]:
+    theme_name = theme or current_theme_name()
+    return dict(THEME_TOKENS.get(theme_name, THEME_TOKENS["dark"]))
+
+
+def apply_pyqtgraph_theme(theme: str | None = None):
+    if pg is None:
+        return
+
+    tokens = theme_tokens(theme)
+    pg.setConfigOption("background", tokens["plot_background"])
+    pg.setConfigOption("foreground", tokens["plot_foreground"])
+
+
+@lru_cache(maxsize=64)
+def _render_svg_pixmap(svg_path: str, color_hex: str, width: int, height: int) -> QPixmap:
+    svg_text = Path(svg_path).read_text(encoding="utf-8")
+    if "fill=" in svg_text:
+        svg_text = re.sub(r'fill="[^"]*"', f'fill="{color_hex}"', svg_text)
+    else:
+        svg_text = svg_text.replace("<svg ", f'<svg fill="{color_hex}" ', 1)
+
+    renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
+    pixmap = QPixmap(width, height)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    renderer.render(painter, QRectF(0, 0, width, height))
+    painter.end()
+    return pixmap
+
+
+def themed_svg_icon(relative_path: str, *, color: str | QColor | None = None, size: int | QSize = 20) -> QIcon:
+    if isinstance(size, QSize):
+        width, height = size.width(), size.height()
+    else:
+        width = height = int(size)
+
+    svg_path = get_path(relative_path)
+    tint = QColor(color or theme_tokens()["icon"]).name()
+    return QIcon(_render_svg_pixmap(svg_path, tint, width, height))
+
+
 # === Style ===
 def apply_theme(theme: str | None = None):
     """
@@ -39,9 +133,9 @@ def apply_theme(theme: str | None = None):
     if not app:
         return
 
-    settings = QSettings()
+    settings_store = get_settings_store()
     if theme is None:
-        theme = settings.value("theme", "dark")  # Default to dark theme
+        theme = settings_store.get("appearance/theme", "dark", legacy_keys=("theme",))
 
     # Handle Qt.ColorScheme enum
     if isinstance(theme, Qt.ColorScheme):
@@ -55,20 +149,26 @@ def apply_theme(theme: str | None = None):
         with open(qss_path, "r") as f:
             stylesheet = f.read()
         app.setStyleSheet(stylesheet)
-        settings.setValue("theme", theme)
+        app.setProperty("currentTheme", theme)
+        settings_store.set("appearance/theme", theme)
+        settings_store.set("theme", theme)
     except FileNotFoundError:
         logger.warning(f"Stylesheet not found at: {qss_path}")
+
+    apply_pyqtgraph_theme(theme)
 
     # Apply a corresponding matplotlib style
     mpl_style = "dark_background" if theme == "dark" else "default"
     plt.style.use(mpl_style)
-    settings.setValue("plot_style", mpl_style)
+    settings_store.set("appearance/plot_style", mpl_style)
+    settings_store.set("plot_style", mpl_style)
+    settings_store.sync()
 
 
 def toggle_theme():
     """Toggles between light and dark themes."""
-    settings = QSettings()
-    current_theme = settings.value("theme", "dark")
+    settings_store = get_settings_store()
+    current_theme = settings_store.get("appearance/theme", "dark", legacy_keys=("theme",))
     new_theme = "light" if current_theme == "dark" else "dark"
     apply_theme(new_theme)
 
@@ -79,8 +179,12 @@ def use_plot_style(plot_func):
     @wraps(plot_func)
     def wrapper(*args, **kwargs):
         # This is where the magic happens
-        settings = QSettings()
-        style_to_use = settings.value("plot_style", "default")
+        settings_store = get_settings_store()
+        style_to_use = settings_store.get(
+            "appearance/plot_style",
+            "default",
+            legacy_keys=("plot_style",),
+        )
         plt.style.use(style_to_use)
         # Now, run the original plotting function
         return plot_func(*args, **kwargs)

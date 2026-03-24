@@ -13,6 +13,13 @@ import logging
 from datetime import datetime
 import json
 
+from core.pipelines import (
+    build_analysis_paths,
+    build_processing_paths,
+    source_stem_from_derivative,
+    source_stem_from_raw,
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -36,9 +43,9 @@ class Preprocessor:
         if not os.path.exists(raw_filepath):
             raise FileNotFoundError(f"Raw file not found at: {raw_filepath}")
 
-        self.raw_filepath = raw_filepath
-        self.label = "_".join(raw_filepath.stem.split("_")[:-1])
-        self.output_dir = output_dir
+        self.raw_filepath = Path(raw_filepath)
+        self.label = source_stem_from_raw(self.raw_filepath)
+        self.output_dir = Path(output_dir)
         self.paths = self._get_paths()
         self.has = lambda x: self.paths.get(x, False) and self.paths[x].exists()
         self.processing_order = [
@@ -144,23 +151,7 @@ class Preprocessor:
 
     def _get_paths(self):
         """Helper method to define file paths for all stages."""
-        all_paths = {
-            "raw": self.raw_filepath,
-            "filtered_raw": self.output_dir
-            / "filtered"
-            / f"{self.label}_filtered-raw.fif",
-            "epochs": self.output_dir / "epochs" / f"{self.label}_epo.fif",
-            "continuous_ica": self.output_dir
-            / "ica"
-            / f"{self.label}_continuous-ica.fif",
-            "epochs_ica": self.output_dir / "ica" / f"{self.label}_epochs-ica.fif",
-            "preprocessed": self.output_dir
-            / "preprocessed"
-            / f"{self.label}_preprocessed-epo.fif",
-        }
-        for path in all_paths.values():
-            path.parent.mkdir(parents=True, exist_ok=True)
-        return all_paths
+        return build_processing_paths(self.raw_filepath, self.output_dir)
 
     def _get_last_continuous(self):
         if self.has("filtered_raw"):
@@ -219,10 +210,21 @@ class Preprocessor:
 
     @staticmethod
     def add_description(obj, description: dict):
-        current_info = obj.info["description"]
-        if current_info is None:
-            current_info = "[]"
-        log_list = json.loads(current_info)
+        current_info = obj.info.get("description")
+        if not current_info:
+            log_list = []
+        else:
+            try:
+                parsed = json.loads(current_info)
+            except (json.JSONDecodeError, TypeError):
+                parsed = [{"description": str(current_info)}]
+
+            if isinstance(parsed, list):
+                log_list = parsed
+            elif isinstance(parsed, dict):
+                log_list = [parsed]
+            else:
+                log_list = [{"description": str(parsed)}]
         log_list.append(description)
         obj.info["description"] = json.dumps(log_list, indent=4)
 
@@ -457,6 +459,20 @@ class Preprocessor:
         )
 
         ica.fit(raw, verbose=verbose)
+        self.add_description(
+            ica,
+            {
+                "continuous_ica": {
+                    "n_components": n_components,
+                    "max_iter": max_iter,
+                    "random_state": random_state,
+                    "method": method,
+                    "extended": bool(fit_params and fit_params.get("extended")),
+                    "input_stage": "filtered_raw" if self.has("filtered_raw") else "raw",
+                    "date": datetime.now().isoformat(),
+                }
+            },
+        )
         ica.save(self.paths["continuous_ica"], overwrite=True, verbose=False)
         self._continuous_ica = ica
 
@@ -620,6 +636,17 @@ class Preprocessor:
 
     def update_epochs(self, epochs: mne.Epochs):
         self._clear_downstream_files("epochs")
+        self.add_description(
+            epochs,
+            {
+                "epoch_review": {
+                    "remaining_epochs": len(epochs),
+                    "total_epochs": len(epochs.drop_log),
+                    "bad_channels": epochs.info.get("bads", []),
+                    "date": datetime.now().isoformat(),
+                }
+            },
+        )
         epochs.save(self.paths["epochs"], overwrite=True, verbose=False)
         self._epochs = epochs
 
@@ -632,6 +659,16 @@ class Preprocessor:
             logger.info(f"Setting reference {reference}...")
             self.epochs.set_eeg_reference(reference, projection=True)
             self.epochs.apply_proj()
+            self.add_description(
+                self.epochs,
+                {
+                    "rereference": {
+                        "reference": reference,
+                        "projection_applied": True,
+                        "date": datetime.now().isoformat(),
+                    }
+                },
+            )
             logger.info("Saving changes...")
             self.epochs.save(self.paths["epochs"], overwrite=True)
 
@@ -691,6 +728,21 @@ class Preprocessor:
                 epochs_for_ica.apply_baseline(baseline)
 
         ica.fit(epochs_for_ica, verbose=verbose)
+        self.add_description(
+            ica,
+            {
+                "epochs_ica": {
+                    "n_components": n_components,
+                    "max_iter": max_iter,
+                    "random_state": random_state,
+                    "reference": reference,
+                    "method": method,
+                    "extended": bool(fit_params and fit_params.get("extended")),
+                    "projection_present": bool(self.epochs.proj),
+                    "date": datetime.now().isoformat(),
+                }
+            },
+        )
         ica.save(self.paths["epochs_ica"], overwrite=True, verbose=False)
 
     def filter_epochs(
@@ -806,8 +858,10 @@ class TMSEEGAnalysis:
         self.evoked = self.epochs.average()
         self.times = self.epochs.times
         self.info = self.epochs.info
-        self.label = "_".join(data_input.stem.split("_")[:-1])
-        self.paths = self._get_paths(output_dir)
+        self.data_input = Path(data_input)
+        self.label = source_stem_from_derivative(self.data_input)
+        self.output_dir = Path(output_dir)
+        self.paths = self._get_paths(self.output_dir)
         self.has = lambda x: self.paths.get(x, False) and self.paths[x].exists()
         self.preload = preload
         if self.preload:
@@ -824,16 +878,7 @@ class TMSEEGAnalysis:
 
     def _get_paths(self, output_dir: Path | str = None):
         """Helper method to define file paths for all needed files."""
-        all_paths = {
-            "tfr": output_dir / "time_freq" / f"{self.label}_tfr.h5",
-            "tfr_mask": output_dir / "stats" / f"{self.label}_tfr-mask.npy",
-            "itc": output_dir / "time_freq" / f"{self.label}_itc.h5",
-            "itc_mask": output_dir / "stats" / f"{self.label}_itc-mask.npy",
-            "masked_ave": output_dir / "stats" / f"{self.label}_masked-ave.fif",
-        }
-        for val in all_paths.values():
-            val.parent.mkdir(parents=True, exist_ok=True)
-        return all_paths
+        return build_analysis_paths(self.data_input, Path(output_dir))
 
     def _get_derivatives(self):
         """Helper method to define file paths for all needed derivative files."""

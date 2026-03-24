@@ -32,15 +32,237 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QComboBox,
-    QTabWidget,
     QMainWindow,
+    QFrame,
+    QScrollArea,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QSettings
+from PySide6.QtGui import QColor
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from .tools.optional_range_widget import OptionalRangeWidget
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 import json
+
+from core.app_settings import get_settings_store
+from utils import apply_pyqtgraph_theme, current_theme_name, theme_tokens
+
+
+DEFAULT_REAL_TIME_MONTAGE = "easycap-M1"
+CHANNEL_TYPE_OPTIONS = ["eeg", "eog", "stim", "reference", "times", "bad"]
+
+
+def builtin_montage_names() -> list[str]:
+    return ["None"] + sorted(mne.channels.get_builtin_montages())
+
+
+def suggest_channel_type(channel_name: str) -> str:
+    name = channel_name.strip().lower()
+    if any(token in name for token in ("stim", "sti", "trigger", "trig", "marker", "status", "event")):
+        return "stim"
+    if any(token in name for token in ("eog", "veog", "heog")):
+        return "eog"
+    if "time" in name:
+        return "times"
+    if any(token in name for token in ("ref", "masto", "ear")):
+        return "reference"
+    return "eeg"
+
+
+def build_epoch_stream_configuration(
+    channel_settings: list[dict],
+) -> tuple[int | dict[str, int] | None, str | list[str] | None, list[str]]:
+    event_channels: list[str] = []
+    event_name_map: dict[str, int] = {}
+    bads: list[str] = []
+
+    for channel in channel_settings:
+        channel_name = channel.get("name", "")
+        enabled = bool(channel.get("enabled", True))
+        channel_type = str(channel.get("type", "eeg"))
+        event_id = int(channel.get("event_id", 0) or 0)
+        event_name = str(channel.get("event_name", "") or "").strip()
+
+        if not enabled:
+            bads.append(channel_name)
+            continue
+
+        if channel_type == "bad":
+            bads.append(channel_name)
+            continue
+
+        if channel_type == "stim":
+            event_channels.append(channel_name)
+            if event_id > 0:
+                label = event_name or f"Event {event_id}"
+                suffix = 2
+                original_label = label
+                while label in event_name_map and event_name_map[label] != event_id:
+                    label = f"{original_label} ({suffix})"
+                    suffix += 1
+                event_name_map[label] = event_id
+
+    if event_name_map:
+        if len(event_name_map) == 1:
+            only_label, only_value = next(iter(event_name_map.items()))
+            event_id_config = only_value if only_label == f"Event {only_value}" else {only_label: only_value}
+        else:
+            event_id_config = event_name_map
+    else:
+        event_id_config = None
+
+    if len(event_channels) == 1:
+        event_channel_config: str | list[str] | None = event_channels[0]
+    else:
+        event_channel_config = event_channels or None
+
+    return event_id_config, event_channel_config, bads
+
+
+def normalize_event_channels(event_channels: str | list[str] | None) -> list[str]:
+    if event_channels is None:
+        return []
+    if isinstance(event_channels, str):
+        return [event_channels]
+    return [channel for channel in event_channels if channel]
+
+
+def detect_regular_stream_event_ids(
+    stim_data: np.ndarray,
+    event_channels: str | list[str] | None,
+    sfreq: float,
+) -> list[int]:
+    channels = normalize_event_channels(event_channels)
+    if not channels or stim_data.size == 0:
+        return []
+
+    info = mne.create_info(channels, sfreq, ch_types=["stim"] * len(channels))
+    raw = mne.io.RawArray(stim_data, info, verbose=False)
+
+    detected_ids: set[int] = set()
+    try:
+        events = mne.find_events(
+            raw,
+            stim_channel=channels if len(channels) > 1 else channels[0],
+            shortest_event=1,
+            min_duration=0,
+            verbose=False,
+        )
+        detected_ids.update(int(event_id) for event_id in np.unique(events[:, 2]) if int(event_id) > 0)
+    except Exception:
+        pass
+
+    if not detected_ids:
+        detected_ids.update(int(value) for value in np.unique(stim_data.astype(int)) if int(value) > 0)
+
+    return sorted(detected_ids)
+
+
+def resolve_regular_stream_event_id(
+    stream,
+    event_id: int | dict[str, int] | None,
+    event_channels: str | list[str] | None,
+    *,
+    timeout_s: float = 2.5,
+) -> int | dict[str, int]:
+    if event_id is not None:
+        return event_id
+
+    channels = normalize_event_channels(event_channels)
+    if not channels:
+        raise ValueError("No stim channel was selected for epoching.")
+
+    deadline = time.monotonic() + max(timeout_s, 0.5)
+    detected_ids: list[int] = []
+    while time.monotonic() < deadline and not detected_ids:
+        stim_data, _ = stream.get_data(picks=channels)
+        detected_ids = detect_regular_stream_event_ids(stim_data, channels, stream.info["sfreq"])
+        if not detected_ids:
+            time.sleep(0.15)
+
+    if not detected_ids:
+        raise ValueError(
+            "No events were detected on the selected stim channel(s). "
+            "Check the trigger channel selection or set a specific Event ID."
+        )
+
+    if len(detected_ids) == 1:
+        return detected_ids[0]
+
+    return {f"Event {event_id_value}": event_id_value for event_id_value in detected_ids}
+
+
+def build_trace_colors(count: int) -> list:
+    theme_name = current_theme_name()
+    if count <= 0:
+        return []
+
+    if theme_name == "dark":
+        return [
+            pg.intColor(
+                index,
+                hues=max(count, 8),
+                minHue=165,
+                maxHue=245,
+                sat=170,
+                minValue=160,
+                maxValue=255,
+            )
+            for index in range(count)
+        ]
+
+    return [
+        pg.intColor(
+            index,
+            hues=max(count, 8),
+            minHue=165,
+            maxHue=245,
+            sat=145,
+            minValue=90,
+            maxValue=180,
+        )
+        for index in range(count)
+    ]
+
+
+def channel_grid_positions(coords_2d: np.ndarray) -> list[tuple[int, int]]:
+    if coords_2d.size == 0:
+        return []
+
+    n_channels = coords_2d.shape[0]
+    grid_size = max(5, int(np.ceil(np.sqrt(n_channels))) + 2)
+    x_values = coords_2d[:, 0]
+    y_values = coords_2d[:, 1]
+
+    if np.ptp(x_values) == 0:
+        x_scaled = np.full(n_channels, 0.5)
+    else:
+        x_scaled = (x_values - np.min(x_values)) / np.ptp(x_values)
+
+    if np.ptp(y_values) == 0:
+        y_scaled = np.full(n_channels, 0.5)
+    else:
+        y_scaled = (y_values - np.min(y_values)) / np.ptp(y_values)
+
+    occupied: set[tuple[int, int]] = set()
+    positions: list[tuple[int, int]] = []
+    for x_norm, y_norm in zip(x_scaled, y_scaled):
+        preferred_row = int(round((1.0 - y_norm) * (grid_size - 1)))
+        preferred_col = int(round(x_norm * (grid_size - 1)))
+        candidates = [
+            (preferred_row + row_offset, preferred_col + col_offset)
+            for radius in range(grid_size)
+            for row_offset in range(-radius, radius + 1)
+            for col_offset in range(-radius, radius + 1)
+        ]
+        for row, col in candidates:
+            if 0 <= row < grid_size and 0 <= col < grid_size and (row, col) not in occupied:
+                occupied.add((row, col))
+                positions.append((row, col))
+                break
+        else:
+            positions.append((preferred_row, preferred_col))
+    return positions
 
 class PlayerWidget(QWidget):
     """A widget to play a file as an LSL stream."""
@@ -157,12 +379,11 @@ class StreamInfoWorker(QObject):
 class ConnectionWidget(QWidget):
     """A widget to get stream connection parameters from the user."""
 
-    GROUP_NAME = "real_time"
-    SETTINGS_KEY = "connection"
+    SETTINGS_PATH = "real_time/connection"
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.settings = QSettings()
+        self.settings_store = get_settings_store()
         self.ch_names = []
         self.setup_ui()
         self.load_settings()
@@ -171,6 +392,7 @@ class ConnectionWidget(QWidget):
         """Initializes the user interface for the connection settings."""
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(12)
 
         # --- Connection Group ---
         conn_group_box = QGroupBox("Connection Settings")
@@ -186,21 +408,33 @@ class ConnectionWidget(QWidget):
             scale=1e-3,
             parent=self,
         )
+        self.default_montage_combo = QComboBox()
+        self.default_montage_combo.addItems(builtin_montage_names())
         self.find_channels_button = QPushButton("Find Channels")
         form_layout.addRow("Stream Name:", self.stream_name_input)
         form_layout.addRow("Stream Duration (s):", self.stream_duration_input)
         form_layout.addRow("Epoching (t_start, t_end):", self.tlim_input)
+        form_layout.addRow("Fallback Montage:", self.default_montage_combo)
         form_layout.addRow(self.find_channels_button)
         main_layout.addWidget(conn_group_box)
         
         # --- Channel Config Group ---
         chan_group_box = QGroupBox("Channel Configuration")
         chan_layout = QVBoxLayout(chan_group_box)
+        helper_label = QLabel(
+            "Find channels first. Stim channels are auto-detected by name. Leave Event ID as Auto unless you want to restrict epoching to a specific trigger code."
+        )
+        helper_label.setObjectName("mutedLabel")
+        helper_label.setWordWrap(True)
+        chan_layout.addWidget(helper_label)
         self.channel_table = QTableWidget()
         self.channel_table.setColumnCount(5)
         self.channel_table.setHorizontalHeaderLabels(["Enabled", "Name", "Type", "Event ID", "Event Name"])
         self.channel_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.channel_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.channel_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.channel_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.channel_table.verticalHeader().setVisible(False)
         chan_layout.addWidget(self.channel_table)
         
         save_load_layout = QHBoxLayout()
@@ -255,17 +489,22 @@ class ConnectionWidget(QWidget):
 
             # Type combo
             type_combo = QComboBox()
-            type_combo.addItems(['eeg', 'eog', 'stim', 'reference', 'times', 'bad'])
+            type_combo.addItems(CHANNEL_TYPE_OPTIONS)
             self.channel_table.setCellWidget(i, 2, type_combo)
             type_combo.currentTextChanged.connect(lambda text, row=i: self._on_type_changed(text, row))
+            type_combo.setCurrentText(suggest_channel_type(name))
 
             # Event ID & Name
             spin_box = QSpinBox()
-            spin_box.setRange(1, 999999)
+            spin_box.setRange(0, 999999)
+            spin_box.setSpecialValueText("Auto")
+            spin_box.setValue(0)
             self.channel_table.setCellWidget(i, 3, spin_box)
             self.channel_table.setItem(i, 4, QTableWidgetItem())
 
             self._on_type_changed(type_combo.currentText(), i)
+
+        self.channel_table.resizeRowsToContents()
 
         self.find_channels_button.setEnabled(True)
         self.find_channels_button.setText("Find Channels")
@@ -291,7 +530,7 @@ class ConnectionWidget(QWidget):
         if id_widget:
             id_widget.setEnabled(is_stim)
             if not is_stim:
-                id_widget.setValue(1)
+                id_widget.setValue(0)
 
         # Event Name Item
         name_item = self.channel_table.item(row, 4)
@@ -375,7 +614,7 @@ class ConnectionWidget(QWidget):
                 type_widget.setCurrentText(ch_config.get('type', 'eeg'))
 
                 id_widget = self.channel_table.cellWidget(i, 3)
-                id_widget.setValue(ch_config.get('event_id', 1))
+                id_widget.setValue(ch_config.get('event_id', 0))
                 
                 self.channel_table.item(i, 4).setText(ch_config.get('event_name', ''))
         else:
@@ -392,7 +631,7 @@ class ConnectionWidget(QWidget):
                     type_widget.setCurrentText(ch_config.get('type', 'eeg'))
 
                     id_widget = self.channel_table.cellWidget(i, 3)
-                    id_widget.setValue(ch_config.get('event_id', 1))
+                    id_widget.setValue(ch_config.get('event_id', 0))
                     
                     self.channel_table.item(i, 4).setText(ch_config.get('event_name', ''))
 
@@ -401,23 +640,13 @@ class ConnectionWidget(QWidget):
             "stream_name": self.stream_name_input.text(),
             "stream_duration": self.stream_duration_input.value(),
             "tlim": self.tlim_input.value(),
+            "default_montage": self.default_montage_combo.currentText(),
         }
         channel_settings = self.get_channel_settings()
-        
-        # Reconstruct event_id, event_channels for MNE-LSL
-        event_id = {}
-        event_channels = []
-        bads = []
-        for ch in channel_settings:
-            if not ch['enabled']:
-                bads.append(ch['name'])
-            if ch['type'] == 'stim':
-                event_channels.append(ch['name'])
-                if ch['event_id'] and ch['event_name']:
-                    event_id[ch['event_name']] = ch['event_id']
+        event_id, event_channels, bads = build_epoch_stream_configuration(channel_settings)
 
-        base_settings['event_id'] = event_id or None # MNE-LSL expects None for all events
-        base_settings['event_channels'] = event_channels or None
+        base_settings['event_id'] = event_id
+        base_settings['event_channels'] = event_channels
         base_settings['bads'] = bads
         base_settings['channels'] = channel_settings
 
@@ -429,26 +658,31 @@ class ConnectionWidget(QWidget):
             "stream_name": self.stream_name_input.text(),
             "stream_duration": self.stream_duration_input.value(),
             "tlim": self.tlim_input.value(),
+            "default_montage": self.default_montage_combo.currentText(),
         }
-        self.settings.beginGroup(self.GROUP_NAME)
-        self.settings.setValue(self.SETTINGS_KEY, params)
-        self.settings.endGroup()
+        self.settings_store.set(self.SETTINGS_PATH, params)
+        self.settings_store.set("real_time/connection", params)
+        self.settings_store.sync()
 
     def load_settings(self):
         """Loads settings from QSettings, applying defaults for missing values."""
-        self.settings.beginGroup(self.GROUP_NAME)
         default_params = {
             "stream_name": "EEGStream",
             "stream_duration": 5,
             "tlim": (-0.1, 0.3),
+            "default_montage": DEFAULT_REAL_TIME_MONTAGE,
         }
-        saved_params = self.settings.value(self.SETTINGS_KEY, {}) or {}
-        self.settings.endGroup()
+        saved_params = self.settings_store.get(
+            self.SETTINGS_PATH,
+            {},
+            legacy_keys=("real_time/connection",),
+        ) or {}
         params = default_params.copy()
         params.update(saved_params)
         self.stream_name_input.setText(params.get("stream_name"))
         self.stream_duration_input.setValue(int(params.get("stream_duration")))
         self.tlim_input.setValue(params.get("tlim"))
+        self.default_montage_combo.setCurrentText(params.get("default_montage", DEFAULT_REAL_TIME_MONTAGE))
 
 class ConnectionManager:
 
@@ -465,20 +699,9 @@ class ConnectionManager:
             stream_duration = self.params.get("stream_duration")
             stream_name = self.params.get("stream_name")
             tmin, tmax = self.params.get("tlim")
-            
-            event_id_param = self.params.get("event_id")
-            event_id = None
-            if isinstance(event_id_param, dict):
-                event_id = event_id_param
-                print(f"Using Event ID dictionary: {event_id}")
-            elif event_id_param:
-                try:
-                    event_id = int(event_id_param)
-                    print(f"Using Event ID: {event_id}")
-                except (ValueError, TypeError):
-                     raise ValueError(f"Invalid Event ID '{event_id_param}'. Must be an integer or a dictionary.")
-            else:
-                print("No Event ID provided. Capturing all events.")
+            event_id = self.params.get("event_id")
+            event_channels = self.params.get("event_channels")
+            event_channel_list = normalize_event_channels(event_channels)
 
             self.stream = mne_lsl.stream.StreamLSL(stream_duration, name=stream_name)
             self.stream.connect(
@@ -517,12 +740,35 @@ class ConnectionManager:
             if bads:
                 self.stream.info['bads'] = bads
 
-            # get stim channels
+            default_montage = self.params.get("default_montage")
+            if default_montage and default_montage != "None" and self.stream.get_montage() is None:
+                try:
+                    self.stream.set_montage(mne.channels.make_standard_montage(default_montage))
+                except Exception as exc:
+                    print(f"Warning: could not apply montage '{default_montage}': {exc}")
+
+            if self.params.get("apply_bandpass", False):
+                low, high = self.params.get("bandpass_range", (None, None))
+                if low is not None or high is not None:
+                    self.stream.filter(low, high, picks="eeg", iir_params=None, verbose=False)
+
+            if self.params.get("apply_notch", False):
+                for freq in self.params.get("notch_freqs", []):
+                    self.stream.notch_filter(freq, picks="eeg", iir_params=None, verbose=False)
+
+            event_id = resolve_regular_stream_event_id(
+                self.stream,
+                event_id,
+                event_channel_list,
+                timeout_s=min(max(float(stream_duration), 1.5), 4.0),
+            )
+            self.params["event_id"] = event_id
+
             self.epochs = mne_lsl.stream.EpochsStream(
                 self.stream,
                 bufsize=10,
                 event_id=event_id,
-                event_channels=self.params.get("event_channels"),
+                event_channels=event_channel_list[0] if len(event_channel_list) == 1 else event_channel_list,
                 tmin=tmin,
                 tmax=tmax,
                 baseline=(None, 0),
@@ -562,12 +808,11 @@ class ConnectionWorker(QObject):
 class RealTimeSettingsWidget(QWidget):
     """A widget to configure real-time plotting parameters."""
 
-    GROUP_NAME = "real_time"
-    SETTINGS_KEY = "plot_settings"
+    SETTINGS_PATH = "real_time/plotting"
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.settings = QSettings()
+        self.settings_store = get_settings_store()
         self.setup_ui()
         self.load_settings()
 
@@ -655,14 +900,12 @@ class RealTimeSettingsWidget(QWidget):
     def save_settings(self):
         """Saves the current parameters to QSettings under the group."""
         params = self.get_settings()
-        self.settings.beginGroup(self.GROUP_NAME)
-        self.settings.setValue(self.SETTINGS_KEY, params)
-        self.settings.endGroup()
+        self.settings_store.set(self.SETTINGS_PATH, params)
+        self.settings_store.set("real_time/plot_settings", params)
+        self.settings_store.sync()
 
     def load_settings(self):
         """Loads parameters from QSettings, applying defaults, and updates the UI."""
-        self.settings.beginGroup(self.GROUP_NAME)
-
         default_params = {
             "refresh_rate": 24,
             "art_rem": (-0.005, 0.005),
@@ -672,8 +915,11 @@ class RealTimeSettingsWidget(QWidget):
             "notch_freqs": [50.0],
         }
 
-        saved_params = self.settings.value(self.SETTINGS_KEY, {}) or {}
-        self.settings.endGroup()
+        saved_params = self.settings_store.get(
+            self.SETTINGS_PATH,
+            {},
+            legacy_keys=("real_time/plot_settings",),
+        ) or {}
 
         params = default_params.copy()
         params.update(saved_params)
@@ -686,12 +932,20 @@ class RealTimeSettings(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Real-Time Plot Settings")
+        self.resize(640, 560)
+        self.setMinimumSize(560, 420)
+        self.setObjectName("appDialog")
 
         # Main layout
         layout = QVBoxLayout(self)
 
         # The widget with all the controls
         self.settings_widget = RealTimeSettingsWidget(self)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.scroll_area.viewport().setAutoFillBackground(False)
+        self.scroll_area.setWidget(self.settings_widget)
 
         # Standard OK and Cancel buttons
         button_box = QDialogButtonBox(
@@ -701,7 +955,7 @@ class RealTimeSettings(QDialog):
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
 
-        layout.addWidget(self.settings_widget)
+        layout.addWidget(self.scroll_area, 1)
         layout.addWidget(button_box)
 
     def get_settings(self) -> dict:
@@ -721,17 +975,18 @@ class DataProcessingWorker(QObject):
         self.params = params
         self.is_running = True
         self.max_epochs = params.get("max_epochs", 200)
-        self._raw_data = deque(maxlen=self.max_epochs)
+        self._processed_epochs = deque(maxlen=self.max_epochs)
         self.original_times = self.epochs.times.copy()
         self.original_sfreq = self.epochs.info["sfreq"]
         self.decimate = self.params.get("decimate", 5)
         self.times = self.original_times[:: self.decimate]
+        self.raw_picks = mne.pick_types(self.stream.info, eeg=True, exclude=())
 
     def run(self):
         """Starts the data processing loop."""
         self.timer = QTimer()
         self.timer.timeout.connect(self._process_and_update)
-        self.timer.start(1000 / self.params.get("refresh_rate", 24))
+        self.timer.start(max(1, int(round(1000 / self.params.get("refresh_rate", 24)))))
 
     def stop(self):
         """Stops the data processing loop."""
@@ -747,84 +1002,87 @@ class DataProcessingWorker(QObject):
         # Always try to get a raw chunk for continuous visualization
         emit_dict = {}
         try:
-            raw_chunk, _ = self.stream.get_data(picks="eeg")
-            emit_dict["raw_data"] = raw_chunk
+            raw_chunk = self._peek_raw_data()
+            if raw_chunk is not None:
+                emit_dict["raw_data"] = raw_chunk
         except Exception:
             pass
 
-        print(self.epochs)
-        print(self.epochs.n_new_epochs)
-        if self.epochs.n_new_epochs > 0:
+        new_epoch_count = getattr(self.epochs, "n_new_epochs", 0)
+        if new_epoch_count > 0:
             try:
-                new_data, _ = self.epochs.get_data(n_epochs=self.epochs.n_new_epochs)
+                new_data = self.epochs.get_data(n_epochs=new_epoch_count)
                 if new_data is not None and new_data.shape[0] > 0:
-                    for i in range(new_data.shape[0]):
-                        self._raw_data.append(new_data[i, :, :])
+                    processed_batch = self._process_epoch_batch(new_data)
+                    for epoch_index in range(processed_batch.shape[0]):
+                        self._processed_epochs.append(processed_batch[epoch_index])
             except Exception as e:
                 print(f"Error fetching epoch data: {e}")
 
-        if self._raw_data:
+        if self._processed_epochs:
             # Create a consistent snapshot for this processing iteration
-            plot_data = np.stack(self._raw_data, axis=0)
+            plot_data = np.stack(self._processed_epochs, axis=0)
 
-            # 1. Artifact Interpolation (Safer Version)
-            art_rem_start, art_rem_end = self.params.get("art_rem", (0, 0))
-            if art_rem_end > art_rem_start:
-                start_idx = np.searchsorted(self.original_times, art_rem_start, side="left")
-                end_idx = np.searchsorted(self.original_times, art_rem_end, side="right")
-                if end_idx > start_idx and start_idx > 0 and end_idx < len(self.original_times) -1:
-                    interp_x = [start_idx - 1, end_idx]
-                    for i in range(plot_data.shape[0]):
-                        for j in range(plot_data.shape[1]):
-                            interp_y = [plot_data[i, j, start_idx - 1], plot_data[i, j, end_idx]]
-                            interp_values = np.interp(np.arange(start_idx, end_idx), interp_x, interp_y)
-                            plot_data[i, j, start_idx:end_idx] = interp_values
-
-            # 2. Bandpass Filter
-            if self.params.get("apply_bandpass", False):
-                low, high = self.params.get("bandpass_range", (0, 0))
-                if high > low:
-                    plot_data = mne.filter.filter_data(
-                        plot_data, self.original_sfreq, l_freq=low, h_freq=high,
-                        method="iir", iir_params=dict(order=3, ftype="butter", phase="zero-double"),
-                        verbose=False
-                    )
-
-            # 3. Notch Filter
-            if self.params.get("apply_notch", False):
-                freqs = self.params.get("notch_freqs", [])
-                if freqs:
-                    plot_data = mne.filter.notch_filter(
-                        plot_data, self.original_sfreq, freqs=freqs,
-                        method="iir", iir_params=dict(order=3, ftype="butter", phase="zero-double"),
-                        verbose=False
-                    )
-
-            # 4. Rereferencing
-            if self.params.get("reference", "average") == "average" and plot_data.shape[1] > 1:
-                plot_data -= np.nanmean(plot_data, axis=1, keepdims=True)
-
-            # 5. Decimate
+            # Decimate after processing so the on-screen data stays light.
             processed_data = plot_data[:, :, :: self.decimate]
 
-            # 6. Calculate mean for plotting
+            # Calculate mean for plotting
             mean_data = np.nanmean(processed_data, axis=0)
             
-            # 7. Add epoch data to the emit dictionary
+            # Add epoch data to the emit dictionary
             emit_dict["epoch_data"] = {
                 "processed_data": processed_data,
                 "mean_data": mean_data,
                 "n_epochs": processed_data.shape[0]
             }
         
-        # 8. Emit data for UI thread
+        # Emit data for UI thread
         self.data_ready.emit(emit_dict)
+
+    def _process_epoch_batch(self, epoch_batch: np.ndarray) -> np.ndarray:
+        plot_data = epoch_batch.copy()
+
+        art_rem_start, art_rem_end = self.params.get("art_rem", (0, 0))
+        if art_rem_end > art_rem_start:
+            start_idx = np.searchsorted(self.original_times, art_rem_start, side="left")
+            end_idx = np.searchsorted(self.original_times, art_rem_end, side="right")
+            if end_idx > start_idx and start_idx > 0 and end_idx < len(self.original_times) - 1:
+                interp_x = [start_idx - 1, end_idx]
+                for epoch_index in range(plot_data.shape[0]):
+                    for channel_index in range(plot_data.shape[1]):
+                        interp_y = [
+                            plot_data[epoch_index, channel_index, start_idx - 1],
+                            plot_data[epoch_index, channel_index, end_idx],
+                        ]
+                        plot_data[epoch_index, channel_index, start_idx:end_idx] = np.interp(
+                            np.arange(start_idx, end_idx),
+                            interp_x,
+                            interp_y,
+                        )
+
+        if self.params.get("reference", "average") == "average" and plot_data.shape[1] > 1:
+            plot_data -= np.nanmean(plot_data, axis=1, keepdims=True)
+
+        return plot_data
+
+    def _peek_raw_data(self) -> np.ndarray | None:
+        buffer = getattr(self.stream, "_buffer", None)
+        timestamps = getattr(self.stream, "_timestamps", None)
+        if buffer is None or timestamps is None:
+            return None
+
+        n_samples = int(np.count_nonzero(timestamps))
+        if n_samples <= 0:
+            return None
+
+        recent_samples = buffer[-n_samples:, :]
+        return recent_samples[:, self.raw_picks].T
 
     def update_params(self, new_params):
         """Update processing parameters."""
         self.params.update(new_params)
         if hasattr(self, "timer"):
-            self.timer.setInterval(1000 / self.params.get("refresh_rate", 24))
+            self.timer.setInterval(max(1, int(round(1000 / self.params.get("refresh_rate", 24)))))
 
 class SingleChannelPlot(QDialog):
     """A dialog for plotting data from a single EEG channel using pyqtgraph."""
@@ -847,25 +1105,43 @@ class SingleChannelPlot(QDialog):
             | Qt.WindowCloseButtonHint
         )
         layout = QVBoxLayout(self)
+        self.position_label = QLabel(self.parent.channel_position_text(self.ch_name))
+        self.position_label.setObjectName("mutedLabel")
+        self.position_label.setWordWrap(True)
+        layout.addWidget(self.position_label)
         self.plot_widget = pg.PlotWidget()
         layout.addWidget(self.plot_widget)
 
-        self.plot_widget.setLabel('left', 'Potential (µV)')
+        self.plot_widget.setLabel('left', 'Potential (uV)')
         self.plot_widget.setLabel('bottom', 'Time (ms)')
         self.plot_widget.showGrid(x=True, y=True)
         self.plot_widget.addLegend()
+        self.plot_widget.setMouseEnabled(x=True, y=False)
+        self.plot_widget.getViewBox().setMouseMode(pg.ViewBox.PanMode)
 
-        self.mean_curve = self.plot_widget.plot(pen=pg.mkPen('w', width=2), name='Mean')
-        self.std_fill = pg.FillBetweenItem(pg.PlotDataItem(), pg.PlotDataItem(), brush=(100, 100, 255, 50))
+        self.mean_curve = self.plot_widget.plot(name='Mean')
+        self.std_fill = pg.FillBetweenItem(pg.PlotDataItem(), pg.PlotDataItem())
         self.plot_widget.addItem(self.std_fill)
-        self.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('g', style=Qt.DashLine))
+        self.v_line = pg.InfiniteLine(angle=90, movable=False)
         self.plot_widget.addItem(self.v_line)
         self.v_line.setPos(0)
+        self.refresh_theme()
+
+    def refresh_theme(self):
+        tokens = theme_tokens()
+        accent_color = QColor(tokens["accent_soft"])
+        self.plot_widget.setBackground(tokens["plot_background"])
+        self.plot_widget.getAxis("left").setTextPen(pg.mkPen(tokens["text"]))
+        self.plot_widget.getAxis("bottom").setTextPen(pg.mkPen(tokens["text"]))
+        self.plot_widget.getAxis("left").setPen(pg.mkPen(tokens["border"]))
+        self.plot_widget.getAxis("bottom").setPen(pg.mkPen(tokens["border"]))
+        self.mean_curve.setPen(pg.mkPen(accent_color, width=2))
+        self.v_line.setPen(pg.mkPen(tokens["accent"], style=Qt.DashLine))
 
     def update_plot(self, data):
         """Updates the plot with new data."""
         ch_idx = self.parent.ch_names.index(self.ch_name)
-        channel_data = data[:, ch_idx, :] * 1e6  # Convert to µV
+        channel_data = data[:, ch_idx, :] * 1e6  # Convert to uV
 
         evoked = np.nanmean(channel_data, axis=0)
         ch_std = np.nanstd(channel_data, axis=0)
@@ -878,12 +1154,14 @@ class SingleChannelPlot(QDialog):
             self.plot_widget.removeItem(self.std_fill)
         upper_bound = pg.PlotDataItem(self.times, evoked + ch_std)
         lower_bound = pg.PlotDataItem(self.times, evoked - ch_std)
-        self.std_fill = pg.FillBetweenItem(upper_bound, lower_bound, brush=(100, 100, 255, 50))
+        fill_color = QColor(theme_tokens()["accent_fill"])
+        fill_color.setAlpha(92)
+        self.std_fill = pg.FillBetweenItem(upper_bound, lower_bound, brush=pg.mkBrush(fill_color))
         self.plot_widget.addItem(self.std_fill)
 
         self.plot_widget.setTitle(
             f"{self.ch_name} (n={data.shape[0]} | "
-            f"R_std={np.nanmean(ch_std[t0_idx:]):.1f} µV)"
+            f"R_std={np.nanmean(ch_std[t0_idx:]):.1f} uV)"
         )
 
     def closeEvent(self, event):
@@ -911,6 +1189,7 @@ class TopomapPlot(QDialog):
         layout.addWidget(toolbar)
         layout.addWidget(self.canvas)
         self.cbar = None
+        self.refresh_theme()
         self.show()
 
     def update_plot(self, data, position, title="", names=None, cmap="turbo"):
@@ -923,7 +1202,18 @@ class TopomapPlot(QDialog):
         else:
             self.cbar.update_normal(im)
         self.ax.set_title(title)
+        self.refresh_theme()
         self.canvas.draw()
+
+    def refresh_theme(self):
+        tokens = theme_tokens()
+        self.fig.patch.set_facecolor(tokens["panel"])
+        self.ax.set_facecolor(tokens["plot_background"])
+        self.ax.title.set_color(tokens["text"])
+        if self.cbar is not None:
+            self.cbar.ax.yaxis.set_tick_params(color=tokens["text"])
+            for tick_label in self.cbar.ax.get_yticklabels():
+                tick_label.set_color(tokens["text"])
 
     def closeEvent(self, event):
         self.closed.emit()
@@ -956,18 +1246,24 @@ class RealTimeERP(QMainWindow):
         self._processed_data = None
         self.ch_names = []
         self.coords_2d = []
+        self.channel_coords = {}
         self.colors = []
         self.times = []
         self.opened_single_channels = {}
         self.bads = self.params.get('bads', [])
         self.topomap_dialog = None
         self.raw_plot_buffer = None
+        self.active_montage_name = None
+        self.topo_label_items = {}
+        self.theme_name = current_theme_name()
+        self.tokens = theme_tokens(self.theme_name)
 
         self.setup_ui()
         self.setWindowTitle("Real-Time TEP Visualization")
         self._read_settings()
 
     def setup_ui(self):
+        apply_pyqtgraph_theme(self.theme_name)
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint
         )
@@ -986,6 +1282,7 @@ class RealTimeERP(QMainWindow):
         dummy = QWidget()
         dummy.hide()
         self.setCentralWidget(dummy)
+        self.refresh_theme()
 
     def _read_settings(self):
         geometry = QSettings().value(self.GEOMETRY_SETTING)
@@ -1002,12 +1299,62 @@ class RealTimeERP(QMainWindow):
         QSettings().setValue(self.GEOMETRY_SETTING + "_state", self.saveState())
         super().closeEvent(event)
 
+    def refresh_theme(self):
+        self.theme_name = current_theme_name()
+        self.tokens = theme_tokens(self.theme_name)
+        apply_pyqtgraph_theme(self.theme_name)
+
+        accent_brush = QColor(self.tokens["roi"])
+        accent_brush.setAlpha(82)
+        accent_pen = pg.mkPen(self.tokens["accent"], width=1.4)
+
+        for plot_widget in [getattr(self, "raw_plot_widget", None), getattr(self, "evoked_plot", None)]:
+            if plot_widget is None:
+                continue
+            plot_widget.setBackground(self.tokens["plot_background"])
+            plot_widget.showGrid(x=True, y=plot_widget is self.evoked_plot, alpha=0.16)
+            plot_widget.setMouseEnabled(x=True, y=False)
+            plot_widget.getViewBox().setMouseMode(pg.ViewBox.PanMode)
+            for axis_name in ("left", "bottom"):
+                axis = plot_widget.getAxis(axis_name)
+                axis.setTextPen(pg.mkPen(self.tokens["text"]))
+                axis.setPen(pg.mkPen(self.tokens["border"]))
+
+        if hasattr(self, "topo_plot_widget"):
+            self.topo_plot_widget.setBackground(self.tokens["plot_background"])
+
+        if hasattr(self, "roi"):
+            self.roi.setBrush(pg.mkBrush(accent_brush))
+            self.roi.setPen(accent_pen)
+            hover_pen = QColor(self.tokens["accent_soft"])
+            hover_pen.setAlpha(210)
+            self.roi.setHoverBrush(pg.mkBrush(accent_brush))
+            self.roi.setHoverPen(pg.mkPen(hover_pen, width=1.6))
+
+        if self.ch_names:
+            self.colors = build_trace_colors(len(self.ch_names))
+            for index, curve in enumerate(getattr(self, "raw_curves", [])):
+                curve.setPen(pg.mkPen(self.colors[index]))
+            for index, line in enumerate(getattr(self, "evoked_lines", [])):
+                line.setPen(pg.mkPen(self.colors[index], width=1.3))
+            for channel_name, curve in getattr(self, "topo_plots", {}).items():
+                curve.setPen(pg.mkPen(self.colors[self.ch_names.index(channel_name)], width=1.2))
+            for channel_name, label in self.topo_label_items.items():
+                label.setColor(self.colors[self.ch_names.index(channel_name)])
+            for plot_item in getattr(self, "topo_plot_items", {}).values():
+                plot_item.setBackground(self.tokens["plot_background"])
+
+        if self.topomap_dialog is not None:
+            self.topomap_dialog.refresh_theme()
+        for dialog in self.opened_single_channels.values():
+            dialog.refresh_theme()
+
     def _create_toolbar(self):
         toolbar = QToolBar()
         toolbar.setMovable(False)
-        toolbar.addAction("📡 Toggle Raw Monitor").triggered.connect(lambda: self.raw_widget.setVisible(not self.raw_widget.isVisible()))
-        toolbar.addAction("🧠 Toggle Topoview").triggered.connect(lambda: self.topo_widget.setVisible(not self.topo_widget.isVisible()))
-        toolbar.addAction("🦋 Toggle Butterfly").triggered.connect(lambda: self.evoked_widget.setVisible(not self.evoked_widget.isVisible()))
+        toolbar.addAction("Raw").triggered.connect(lambda: self.raw_widget.setVisible(not self.raw_widget.isVisible()))
+        toolbar.addAction("Channel Layout").triggered.connect(lambda: self.topo_widget.setVisible(not self.topo_widget.isVisible()))
+        toolbar.addAction("Butterfly").triggered.connect(lambda: self.evoked_widget.setVisible(not self.evoked_widget.isVisible()))
         
         toolbar.addSeparator()
         
@@ -1024,13 +1371,14 @@ class RealTimeERP(QMainWindow):
         toolbar.addWidget(self.n_chan_spinbox)
         
         toolbar.addSeparator()
-        toolbar.addAction("⚙️ Settings").triggered.connect(self.update_settings)
+        toolbar.addAction("Settings").triggered.connect(self.update_settings)
         return toolbar
 
     def _create_raw_widget(self):
         dock = RealTimeDockWidget("Raw Data Monitor", self)
         dock.setObjectName("RawDockWidget")
         self.raw_plot_widget = pg.PlotWidget()
+        self.raw_plot_widget.setMenuEnabled(False)
         dock.setWidget(self.raw_plot_widget)
         return dock
 
@@ -1045,12 +1393,12 @@ class RealTimeERP(QMainWindow):
         dock = RealTimeDockWidget("Evoked Potentials", self)
         dock.setObjectName("EvokedDockWidget")
         self.evoked_plot = pg.PlotWidget()
-        self.evoked_plot.setLabel('left', 'Potential (µV)')
+        self.evoked_plot.setMenuEnabled(False)
+        self.evoked_plot.setLabel('left', 'Potential (uV)')
         self.evoked_plot.setLabel('bottom', 'Time (ms)')
         self.evoked_plot.showGrid(x=True, y=True)
         # Add ROI for topomap selection
         self.roi = pg.LinearRegionItem()
-        self.roi.setBrush(pg.mkBrush(100, 100, 255, 50))
         self.roi.sigRegionChanged.connect(self.on_roi_changed)
         self.evoked_plot.addItem(self.roi)
         dock.setWidget(self.evoked_plot)
@@ -1082,10 +1430,7 @@ class RealTimeERP(QMainWindow):
         self.stream = stream
         self.epochs = epochs
 
-        if self.stream.get_montage() is None:
-            montage = mne.channels.make_standard_montage("easycap-M1")
-            self.stream.set_montage(montage)
-            self.epochs.info = self.stream.info
+        self._apply_visual_montage()
 
         eeg_picks = mne.pick_types(self.epochs.info, eeg=True, exclude=())
         self.info = mne.pick_info(self.epochs.info, eeg_picks)
@@ -1100,7 +1445,11 @@ class RealTimeERP(QMainWindow):
                 coords_3d.append([0.0, 0.0, 0.0])
         coords_3d = np.array(coords_3d)
         self.coords_2d = self.project_electrodes_to_2d(coords_3d)
-        self.colors = [pg.mkColor(tuple(int(x) for x in c)) for c in self.to_rgb(coords_3d)]
+        self.channel_coords = {
+            channel_name: tuple(float(value) for value in self.coords_2d[index])
+            for index, channel_name in enumerate(self.ch_names)
+        }
+        self.colors = build_trace_colors(len(self.ch_names))
 
         self.n_chan_spinbox.setValue(len(self.ch_names))
 
@@ -1141,23 +1490,33 @@ class RealTimeERP(QMainWindow):
         # Topo Plot Setup
         self.topo_plots = {}
         self.topo_plot_items = {}
+        self.topo_label_items = {}
         self.topo_plot_widget.clear()
+        plot_positions = channel_grid_positions(self.coords_2d)
         for i, name in enumerate(self.ch_names):
-            p = self.topo_plot_widget.addPlot(row=i // 8, col=i % 8)
+            row, col = plot_positions[i] if i < len(plot_positions) else (i // 8, i % 8)
+            p = self.topo_plot_widget.addPlot(row=row, col=col)
             p.setMouseEnabled(x=False, y=False)
+            p.setMenuEnabled(False)
             p.hideAxis('left')
             p.hideAxis('bottom')
+            p.getViewBox().setMouseEnabled(x=False, y=False)
+            p.setXRange(self.times[0] * 1e3, self.times[-1] * 1e3, padding=0)
             p.setLimits(xMin=self.times[0] * 1e3, xMax=self.times[-1] * 1e3)
             curve = p.plot(self.times * 1e3, np.zeros_like(self.times), pen=self.colors[i])
             p.setYRange(-10, 10, padding=0.1)
             text = pg.TextItem(name, color=self.colors[i], anchor=(0.5, 1))
             p.addItem(text)
             text.setPos(self.times[len(self.times)//2]*1e3, 10)
-            p.scene().sigMouseClicked.connect(lambda ev, ch=name: self.on_topo_pick(ev, ch))
+            p.scene().sigMouseClicked.connect(
+                lambda ev, plot_item=p, ch=name: self._handle_topo_scene_click(ev, plot_item, ch)
+            )
             self.topo_plots[name] = curve
             self.topo_plot_items[name] = p
+            self.topo_label_items[name] = text
         self.topo_plot_widget.ci.layout.setSpacing(0)
         self.topo_plot_widget.ci.layout.setContentsMargins(0,0,0,0)
+        self.refresh_theme()
 
     def _setup_raw_plot(self):
         self.raw_plot_widget.clear()
@@ -1174,7 +1533,10 @@ class RealTimeERP(QMainWindow):
         
         stream_duration = self.params.get("stream_duration", 5)
         self.raw_plot_widget.setLimits(xMin=-stream_duration, xMax=0, yMin=-0.5, yMax=n_chans - 0.5)
-        
+        self.raw_plot_widget.setXRange(-stream_duration, 0, padding=0)
+        self.raw_plot_widget.setMouseEnabled(x=True, y=False)
+        self.raw_plot_widget.getViewBox().setMouseMode(pg.ViewBox.PanMode)
+
         for i in range(n_chans):
             curve = self.raw_plot_widget.plot(pen=self.colors[i])
             self.raw_curves.append(curve)
@@ -1188,7 +1550,7 @@ class RealTimeERP(QMainWindow):
         max_y = len(self.ch_names)
         min_y = max_y - n_show
         self.raw_plot_widget.setYRange(min_y - 0.5, max_y - 0.5, padding=0)
-        self.raw_plot_widget.getViewBox().setMouseEnabled(y=True, x=True)
+        self.raw_plot_widget.getViewBox().setMouseEnabled(y=False, x=True)
 
     @staticmethod
     def to_rgb(positions_3d):
@@ -1244,9 +1606,9 @@ class RealTimeERP(QMainWindow):
             
             p = self.topo_plot_items[name]
             p.setYRange(global_min, global_max, padding=0.1)
-            for item in p.items:
-                if isinstance(item, pg.TextItem):
-                    item.setPos(self.times[len(self.times)//2]*1e3, global_max)
+            label_item = self.topo_label_items.get(name)
+            if label_item is not None:
+                label_item.setPos(self.times[len(self.times)//2]*1e3, global_max)
 
         # Update any open single channel plots
         for ch_name, plot_dialog in self.opened_single_channels.items():
@@ -1290,9 +1652,20 @@ class RealTimeERP(QMainWindow):
         dialog = RealTimeSettings(self)
         if dialog.exec():
             new_params = dialog.get_settings()
+            dialog.settings_widget.save_settings()
+            filter_restart_needed = any(
+                self.params.get(key) != new_params.get(key)
+                for key in ("apply_bandpass", "bandpass_range", "apply_notch", "notch_freqs")
+            )
             self.params.update(new_params)
             if hasattr(self, "data_worker"):
                 self.data_worker.update_params(self.params)
+            if filter_restart_needed:
+                QMessageBox.information(
+                    self,
+                    "Restart Required for Filters",
+                    "Filter changes are applied when the live stream connects. Relaunch the visualizer to use the new filter settings.",
+                )
 
     def on_roi_changed(self):
         """Handles changes in the ROI selection to update the topomap."""
@@ -1326,7 +1699,14 @@ class RealTimeERP(QMainWindow):
     def _on_topomap_closed(self):
         self.topomap_dialog = None
 
-    def on_topo_pick(self, event, ch_name):
+    def _handle_topo_scene_click(self, event, plot_item, ch_name):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if not plot_item.sceneBoundingRect().contains(event.scenePos()):
+            return
+        self.on_topo_pick(ch_name)
+
+    def on_topo_pick(self, ch_name):
         """Opens a single channel plot when a topoplot trace is clicked."""
         if ch_name in self.opened_single_channels:
             self.opened_single_channels[ch_name].raise_()
@@ -1348,6 +1728,29 @@ class RealTimeERP(QMainWindow):
         phi = np.arctan2(y, x)
         return np.column_stack((theta * np.cos(phi), theta * np.sin(phi)))
 
+    def _apply_visual_montage(self):
+        if self.stream is None or self.epochs is None:
+            return
+
+        selected_montage = self.params.get("default_montage")
+        if self.stream.get_montage() is not None:
+            self.active_montage_name = (
+                selected_montage if selected_montage and selected_montage != "None" else "Stream montage"
+            )
+            return
+
+        self.active_montage_name = None
+
+    def channel_position_text(self, ch_name: str) -> str:
+        coords = self.channel_coords.get(ch_name)
+        if coords is None:
+            return "No channel position available."
+        if all(abs(value) < 1e-9 for value in coords) and not self.active_montage_name:
+            return "No channel position available."
+
+        montage_text = self.active_montage_name or "No montage"
+        return f"Montage: {montage_text} | projected x={coords[0]:.3f}, y={coords[1]:.3f}"
+
 class RealTimeMainWidget(QWidget):
     """The main entry point widget for the application."""
 
@@ -1360,26 +1763,74 @@ class RealTimeMainWidget(QWidget):
     def setup_ui(self):
         """Sets up the UI for the main widget."""
         layout = QVBoxLayout(self)
-        self.setMinimumWidth(500)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+        self.setMinimumWidth(640)
 
-        tab_widget = QTabWidget()
         self.connection_widget = ConnectionWidget()
+        self.plot_settings_widget = RealTimeSettingsWidget()
         self.player_widget = PlayerWidget()
-        
-        tab_widget.addTab(self.connection_widget, "Connect to Live Stream")
-        tab_widget.addTab(self.player_widget, "Play from File")
-        
-        layout.addWidget(tab_widget)
 
-        self.launch_button = QPushButton("🚀 Launch Visualizer")
+        live_card = self._build_card("Connect to Live Stream")
+        live_layout = live_card.layout()
+        live_help = QLabel(
+            "Find channels, confirm which inputs are EEG or stim, then launch the live visualizer."
+        )
+        live_help.setObjectName("mutedLabel")
+        live_help.setWordWrap(True)
+        live_layout.addWidget(live_help)
+
+        config_row = QHBoxLayout()
+        config_row.setContentsMargins(0, 0, 0, 0)
+        config_row.setSpacing(16)
+        config_row.addWidget(self.connection_widget, 2)
+        config_row.addWidget(self.plot_settings_widget, 1)
+        live_layout.addLayout(config_row)
+
+        self.launch_button = QPushButton("Launch Live Visualizer")
+        self.launch_button.setDefault(True)
         self.launch_button.clicked.connect(self.launch_visualizer)
+        live_layout.addWidget(self.launch_button)
+        layout.addWidget(live_card)
 
-        layout.addWidget(self.launch_button)
+        file_card = self._build_card("Play from File")
+        file_card.layout().addWidget(self.player_widget)
+        layout.addWidget(file_card)
+        layout.addStretch()
+
+    def _build_card(self, title: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("pipelineCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(18, 18, 18, 18)
+        card_layout.setSpacing(12)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("panelTitle")
+        card_layout.addWidget(title_label)
+        return card
+
+    def refresh_theme(self):
+        if self.rt_erp_widget is not None:
+            self.rt_erp_widget.refresh_theme()
 
     def launch_visualizer(self):
         """Launches the real-time ERP visualizer."""
         params = self.connection_widget.get_settings()
-        params.update(RealTimeSettingsWidget().get_settings())
+        if not params.get("channels"):
+            QMessageBox.warning(self, "No Channel Configuration", "Find channels before launching the live visualizer.")
+            return
+        if not params.get("event_channels"):
+            QMessageBox.warning(
+                self,
+                "No Event Channel",
+                "Mark at least one enabled channel as 'stim' so epochs can be built from incoming events.",
+            )
+            return
+
+        self.connection_widget.save_settings()
+        self.plot_settings_widget.save_settings()
+        params.update(self.plot_settings_widget.get_settings())
         if self.rt_erp_widget:
             self.rt_erp_widget.close()
 
@@ -1395,8 +1846,7 @@ class RealTimeMainWidget(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    pg.setConfigOption('background', 'k')
-    pg.setConfigOption('foreground', 'w')
+    apply_pyqtgraph_theme(current_theme_name())
     app.setStyle("Fusion")
     main_window = RealTimeMainWidget()
     main_window.show()
