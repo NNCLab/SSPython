@@ -457,9 +457,9 @@ class DatasetInspectorPanel(QFrame):
         self.refresh_icons()
 
     def refresh_icons(self):
-        self.toggle_button.setIcon(themed_svg_icon("assets/icons/menu.svg", size=14))
-        self.toggle_button.setIconSize(QSize(14, 14))
-        self.toggle_button.setObjectName('#iconButton')
+        self.toggle_button.setIcon(themed_svg_icon("assets/icons/menu.svg", size=20))
+        self.toggle_button.setIconSize(QSize(20, 20))
+        self.toggle_button.setObjectName('sidebarToggle')
 
     def toggle_collapsed(self):
         self.collapsed = not self.collapsed

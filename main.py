@@ -360,10 +360,10 @@ class MainWindow(QMainWindow):
         return QIcon(get_path(icon_path))
 
     def _refresh_icons(self):
-        self.toggle_sidebar_button.setIcon(themed_svg_icon("assets/icons/menu.svg", size=14))
-        self.toggle_sidebar_button.setIconSize(QSize(14, 14))
-        self.theme_button.setIcon(themed_svg_icon("assets/icons/theme.svg", size=18))
-        self.theme_button.setIconSize(QSize(18, 18))
+        self.toggle_sidebar_button.setIcon(themed_svg_icon("assets/icons/menu.svg", size=20))
+        self.toggle_sidebar_button.setIconSize(QSize(20, 20))
+        self.theme_button.setIcon(themed_svg_icon("assets/icons/theme.svg", size=20))
+        self.theme_button.setIconSize(QSize(20, 20))
 
         for row in range(self.nav_list.count()):
             item = self.nav_list.item(row)
