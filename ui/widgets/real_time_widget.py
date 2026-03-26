@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QPushButton,
     QDialog,
-    QDockWidget,
     QToolBar,
     QLineEdit,
     QFormLayout,
@@ -30,7 +29,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QComboBox,
-    QMainWindow,
+    QGridLayout,
     QFrame,
     QScrollArea,
 )
@@ -1326,23 +1325,7 @@ class TopomapPlot(QDialog):
         self.closed.emit()
         super().closeEvent(event)
 
-class RealTimeDockWidget(QDockWidget):
-    def __init__(self, title, parent=None):
-        super().__init__(title, parent)
-
-    def event(self, event):
-        from PySide6.QtCore import QEvent
-        if event.type() == QEvent.Type.NonClientAreaMouseButtonDblClick:
-            if self.isFullScreen():
-                self.showNormal()
-            else:
-                self.setFloating(True)
-                self.showFullScreen()
-            return True
-        return super().event(event)
-
-class RealTimeERP(QMainWindow):
-    GEOMETRY_SETTING = "real_time/geometry"
+class RealTimeERP(QDialog):
     params_changed = Signal(dict)
     """Main widget for real-time ERP visualization."""
 
@@ -1370,44 +1353,28 @@ class RealTimeERP(QMainWindow):
 
         self.setup_ui()
         self.setWindowTitle("Real-Time TEP Visualization")
-        self._read_settings()
 
     def setup_ui(self):
         apply_pyqtgraph_theme(self.theme_name)
-        self.setWindowFlags(
-            Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint
-        )
-        self.setDockOptions(QMainWindow.AllowNestedDocks | QMainWindow.AllowTabbedDocks | QMainWindow.AnimatedDocks)
+        layout = QGridLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         self.raw_widget = self._create_raw_widget()
         self.topo_widget = self._create_topo_widget()
         self.evoked_widget = self._create_evoked_widget()
         self.toolbar = self._create_toolbar()
 
-        self.addToolBar(self.toolbar)
-        self.addDockWidget(Qt.LeftDockWidgetArea, self.raw_widget)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.topo_widget)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.evoked_widget)
+        layout.addWidget(self.toolbar, 0, 0, 1, 2)
+        layout.addWidget(self.raw_widget, 1, 0)
+        layout.addWidget(self.topo_widget, 1, 1)
+        layout.addWidget(self.evoked_widget, 2, 0, 1, 2)
 
-        dummy = QWidget()
-        dummy.hide()
-        self.setCentralWidget(dummy)
+        layout.setRowStretch(1, 2)
+        layout.setRowStretch(2, 1)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+
         self.refresh_theme()
-
-    def _read_settings(self):
-        geometry = QSettings().value(self.GEOMETRY_SETTING)
-        if geometry:
-            self.restoreGeometry(geometry)
-        else:
-            self.setGeometry(100, 100, 1280, 960)
-        state = QSettings().value(self.GEOMETRY_SETTING + "_state")
-        if state:
-            self.restoreState(state)
-
-    def closeEvent(self, event):
-        QSettings().setValue(self.GEOMETRY_SETTING, self.saveGeometry())
-        QSettings().setValue(self.GEOMETRY_SETTING + "_state", self.saveState())
-        super().closeEvent(event)
 
     def refresh_theme(self):
         self.theme_name = current_theme_name()
@@ -1486,26 +1453,30 @@ class RealTimeERP(QMainWindow):
         return toolbar
 
     def _create_raw_widget(self):
-        dock = RealTimeDockWidget("Raw Data Monitor", self)
-        dock.setObjectName("RawDockWidget")
+        group = QGroupBox("Raw Data Monitor")
+        group.setObjectName("RawDockWidget")
         self.raw_plot_widget = pg.PlotWidget()
         self.raw_plot_widget.setMenuEnabled(False)
-        dock.setWidget(self.raw_plot_widget)
-        return dock
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(2, 8, 2, 2)
+        layout.addWidget(self.raw_plot_widget)
+        return group
 
     def _create_topo_widget(self):
-        dock = RealTimeDockWidget("Channel Layout", self)
-        dock.setObjectName("TopoDockWidget")
+        group = QGroupBox("Channel Layout")
+        group.setObjectName("TopoDockWidget")
         self.topo_plot_widget = pg.PlotWidget()
         self.topo_plot_widget.setMenuEnabled(False)
         self.topo_plot_widget.hideAxis('left')
         self.topo_plot_widget.hideAxis('bottom')
-        dock.setWidget(self.topo_plot_widget)
-        return dock
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(2, 8, 2, 2)
+        layout.addWidget(self.topo_plot_widget)
+        return group
 
     def _create_evoked_widget(self):
-        dock = RealTimeDockWidget("Evoked Potentials", self)
-        dock.setObjectName("EvokedDockWidget")
+        group = QGroupBox("Evoked Potentials")
+        group.setObjectName("EvokedDockWidget")
         self.evoked_plot = pg.PlotWidget()
         self.evoked_plot.setMenuEnabled(False)
         self.evoked_plot.setLabel('left', 'Potential (uV)')
@@ -1515,8 +1486,10 @@ class RealTimeERP(QMainWindow):
         # self.roi = pg.LinearRegionItem()
         # self.roi.sigRegionChanged.connect(self.on_roi_changed)
         # self.evoked_plot.addItem(self.roi)
-        dock.setWidget(self.evoked_plot)
-        return dock
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(2, 8, 2, 2)
+        layout.addWidget(self.evoked_plot)
+        return group
 
     def start_visualization(self):
         self.conn_thread = QThread(self)
@@ -1690,7 +1663,7 @@ class RealTimeERP(QMainWindow):
         global_max = epoch_data["global_max"]
 
         self.setWindowTitle(f"Real-Time TEP - Epochs: {self.n_epochs}")
-        self.evoked_widget.setWindowTitle(f"Evoked Potentials (Epochs: {self.n_epochs})")
+        self.evoked_widget.setTitle(f"Evoked Potentials (Epochs: {self.n_epochs})")
 
         # Update Evoked Butterfly Plot
         for i, line in enumerate(self.evoked_lines):
@@ -1863,10 +1836,14 @@ class RealTimeMainWidget(QWidget):
 
     def setup_ui(self):
         """Sets up the UI for the main widget."""
-        layout = QVBoxLayout(self)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        self.setMinimumWidth(640)
+
+        self.main_container = QWidget()
+        layout = QVBoxLayout(self.main_container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(16)
-        self.setMinimumWidth(640)
 
         self.connection_widget = ConnectionWidget()
         self.plot_settings_widget = RealTimeSettingsWidget()
@@ -1898,6 +1875,7 @@ class RealTimeMainWidget(QWidget):
         file_card.layout().addWidget(self.player_widget)
         layout.addWidget(file_card)
         layout.addStretch()
+        main_layout.addWidget(self.main_container)
 
     def _build_card(self, title: str) -> QFrame:
         card = QFrame()
@@ -1934,6 +1912,7 @@ class RealTimeMainWidget(QWidget):
         params.update(self.plot_settings_widget.get_settings())
         if self.rt_erp_widget:
             self.rt_erp_widget.close()
+            self.rt_erp_widget.deleteLater()
 
         self.rt_erp_widget = RealTimeERP(params, self)
         self.rt_erp_widget.show()
