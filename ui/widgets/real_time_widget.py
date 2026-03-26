@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QFrame,
     QScrollArea,
+    QSplitter,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QSettings, Slot
 from PySide6.QtGui import QColor
@@ -1356,23 +1357,29 @@ class RealTimeERP(QDialog):
 
     def setup_ui(self):
         apply_pyqtgraph_theme(self.theme_name)
-        layout = QGridLayout(self)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.toolbar = self._create_toolbar()
+        layout.addWidget(self.toolbar)
+
+        v_splitter = QSplitter(Qt.Orientation.Vertical)
+        h_splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self.raw_widget = self._create_raw_widget()
         self.topo_widget = self._create_topo_widget()
         self.evoked_widget = self._create_evoked_widget()
-        self.toolbar = self._create_toolbar()
 
-        layout.addWidget(self.toolbar, 0, 0, 1, 2)
-        layout.addWidget(self.raw_widget, 1, 0)
-        layout.addWidget(self.topo_widget, 1, 1)
-        layout.addWidget(self.evoked_widget, 2, 0, 1, 2)
+        h_splitter.addWidget(self.raw_widget)
+        h_splitter.addWidget(self.topo_widget)
 
-        layout.setRowStretch(1, 2)
-        layout.setRowStretch(2, 1)
-        layout.setColumnStretch(0, 1)
-        layout.setColumnStretch(1, 1)
+        v_splitter.addWidget(h_splitter)
+        v_splitter.addWidget(self.evoked_widget)
+        
+        v_splitter.setStretchFactor(0, 2)
+        v_splitter.setStretchFactor(1, 1)
+
+        layout.addWidget(v_splitter)
 
         self.refresh_theme()
 
@@ -1482,10 +1489,9 @@ class RealTimeERP(QDialog):
         self.evoked_plot.setLabel('left', 'Potential (uV)')
         self.evoked_plot.setLabel('bottom', 'Time (ms)')
         self.evoked_plot.showGrid(x=True, y=True)
-        # # Add ROI for topomap selection (Temporarily disabled)
-        # self.roi = pg.LinearRegionItem()
-        # self.roi.sigRegionChanged.connect(self.on_roi_changed)
-        # self.evoked_plot.addItem(self.roi)
+        self.roi = pg.LinearRegionItem(orientation=pg.LinearRegionItem.Vertical)
+        self.roi.sigRegionChanged.connect(self.on_roi_changed)
+        self.evoked_plot.addItem(self.roi)
         layout = QVBoxLayout(group)
         layout.setContentsMargins(2, 8, 2, 2)
         layout.addWidget(self.evoked_plot)
@@ -1584,7 +1590,7 @@ class RealTimeERP(QDialog):
         self.topo_plot_curves = []
         self.topo_channel_labels = []
         for i in range(len(self.ch_names)):
-            curve = pg.PlotDataItem(pen=pg.mkPen(self.colors[i], width=1.2))
+            curve = pg.PlotDataItem(pen=pg.mkPen(self.colors[i], width=2))
             self.topo_plot_widget.addItem(curve)
             self.topo_plot_curves.append(curve)
 
@@ -1595,6 +1601,7 @@ class RealTimeERP(QDialog):
         self.topo_plot_widget.getViewBox().setAspectLocked(True)
         self.topo_plot_widget.setXRange(0, 1, padding=0.02)
         self.topo_plot_widget.setYRange(0, 1, padding=0.02)
+        self.topo_plot_widget.getViewBox().setLimits(xMin=-0.05, xMax=1.05, yMin=-0.05, yMax=1.05)
         self.topo_plot_widget.scene().sigMouseClicked.connect(self._handle_topo_scene_click)
 
         self.refresh_theme()
@@ -1699,7 +1706,7 @@ class RealTimeERP(QDialog):
                 curve.setPen(pg.mkPen(self.colors[i], style=Qt.DashLine))
                 curve.setOpacity(0.4)
             else:
-                curve.setPen(pg.mkPen(self.colors[i]))
+                curve.setPen(pg.mkPen(self.colors[i], width=2))
                 curve.setOpacity(1.0)
             
             curve.setData(x_data, y_data)
@@ -1750,14 +1757,39 @@ class RealTimeERP(QDialog):
                 )
 
     def on_roi_changed(self):
-        """(Temporarily disabled) Handles changes in the ROI selection to update the topomap."""
-        pass
+        """Handles changes in the ROI selection to update the topomap."""
+        if self.mean_data is None:
+            return
+
+        rgn = self.roi.getRegion()
+        start_ms, end_ms = rgn
+
+        start_idx = np.searchsorted(self.times * 1e3, start_ms, side="left")
+        end_idx = np.searchsorted(self.times * 1e3, end_ms, side="right")
+
+        if start_idx >= end_idx:
+            return
+
+        good_indices = mne.pick_types(self.info, eeg=True, exclude='bads')
+        if len(good_indices) == 0:
+            return
+        
+        topo_data = np.nanmean(self.mean_data[good_indices, start_idx:end_idx], axis=1)
+
+        if self.topomap_dialog is None:
+            self.topomap_dialog = TopomapPlot(self)
+            self.topomap_dialog.closed.connect(self._on_topomap_closed)
+
+        info_good = mne.pick_info(self.info, good_indices)
+            
+        title = f"Topomap from {start_ms:.1f} to {end_ms:.1f} ms"
+        self.topomap_dialog.update_plot(topo_data, info_good, title, names=info_good['ch_names'], cmap="RdBu_r")
 
     def _on_topomap_closed(self):
         self.topomap_dialog = None
 
     def _handle_topo_scene_click(self, event):
-        if event.button() != Qt.MouseButton.LeftButton:
+        if event.button() != Qt.MouseButton.LeftButton and event.button() != Qt.MouseButton.RightButton:
             return
         
         # Get click position in the plot's coordinate system ([0,1] approx)
@@ -1773,8 +1805,14 @@ class RealTimeERP(QDialog):
                 break
             left, bottom, width, height = positions[i]
             if left <= pos.x() <= left + width and bottom <= pos.y() <= bottom + height:
-                self.on_topo_pick(name)
-                return  # Found a match
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.on_topo_pick(name)
+                elif event.button() == Qt.MouseButton.RightButton:
+                    if name in self.bads:
+                        self.bads.remove(name)
+                    else:
+                        self.bads = list(set(self.bads + [name])
+                return
 
     def on_topo_pick(self, ch_name):
         """Opens a single channel plot when a topoplot trace is clicked."""
