@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QScrollArea,
     QSplitter,
+    QSizePolicy,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QSettings, Slot
 from PySide6.QtGui import QColor
@@ -41,6 +42,7 @@ from matplotlib.figure import Figure
 from .tools.optional_range_widget import OptionalRangeWidget
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 import json
+from scipy import signal
 from scipy.spatial import distance
 
 from core.app_settings import get_settings_store
@@ -48,7 +50,14 @@ from utils import apply_pyqtgraph_theme, current_theme_name, theme_tokens
 
 
 DEFAULT_REAL_TIME_MONTAGE = "easycap-M1"
-CHANNEL_TYPE_OPTIONS = ["eeg", "eog", "stim", "reference", "times", "bad"]
+CHANNEL_TYPE_OPTIONS = ["eeg", "stim", "bad"]
+
+
+def normalize_live_channel_type(channel_type: str | None) -> str:
+    normalized = str(channel_type or "eeg").strip().lower()
+    if normalized in {"eeg", "stim", "bad"}:
+        return normalized
+    return "bad"
 
 
 def builtin_montage_names() -> list[str]:
@@ -59,12 +68,8 @@ def suggest_channel_type(channel_name: str) -> str:
     name = channel_name.strip().lower()
     if any(token in name for token in ("stim", "sti", "trigger", "trig", "marker", "status", "event")):
         return "stim"
-    if any(token in name for token in ("eog", "veog", "heog")):
-        return "eog"
-    if "time" in name:
-        return "times"
-    if any(token in name for token in ("ref", "masto", "ear")):
-        return "reference"
+    if any(token in name for token in ("eog", "veog", "heog", "time", "ref", "masto", "ear")):
+        return "bad"
     return "eeg"
 
 
@@ -78,7 +83,7 @@ def build_epoch_stream_configuration(
     for channel in channel_settings:
         channel_name = channel.get("name", "")
         enabled = bool(channel.get("enabled", True))
-        channel_type = str(channel.get("type", "eeg"))
+        channel_type = normalize_live_channel_type(channel.get("type", "eeg"))
         event_id = int(channel.get("event_id", 0) or 0)
         event_name = str(channel.get("event_name", "") or "").strip()
 
@@ -282,6 +287,181 @@ def calculate_mne_style_layout(coords_2d, radius=0.5, width=None, height=None):
     ]
     return pos
 
+
+def channel_grid_positions(coords_2d: np.ndarray) -> list[tuple[float, float]]:
+    """Return stable 2D layout anchors for channel preview placement."""
+    positions = calculate_mne_style_layout(np.asarray(coords_2d, dtype=float))
+    return [tuple(float(value) for value in row[:2]) for row in positions]
+
+
+def apply_artifact_mask(
+    epoch_batch: np.ndarray,
+    times: np.ndarray,
+    art_rem: tuple[float | None, float | None],
+) -> np.ndarray:
+    """Mask the artifact window with NaN so downstream averaging ignores it."""
+    plot_data = epoch_batch.copy()
+    art_rem_start, art_rem_end = art_rem
+    if art_rem_start is None or art_rem_end is None or art_rem_end <= art_rem_start:
+        return plot_data
+
+    start_idx = np.searchsorted(times, art_rem_start, side="left")
+    end_idx = np.searchsorted(times, art_rem_end, side="right")
+    if end_idx > start_idx:
+        plot_data[:, :, start_idx:end_idx] = np.nan
+    return plot_data
+
+
+def average_reference_ignore_nan(epoch_batch: np.ndarray) -> np.ndarray:
+    """Apply average reference while preserving NaN-masked samples."""
+    if epoch_batch.shape[1] <= 1:
+        return epoch_batch
+
+    finite_mask = np.isfinite(epoch_batch)
+    counts = np.sum(finite_mask, axis=1, keepdims=True)
+    sums = np.where(finite_mask, epoch_batch, 0.0).sum(axis=1, keepdims=True)
+    channel_mean = np.divide(
+        sums,
+        counts,
+        out=np.zeros_like(sums, dtype=float),
+        where=counts > 0,
+    )
+    return epoch_batch - channel_mean
+
+
+def buffer_epoch_snapshot(
+    epoch_buffer: np.ndarray,
+    buffer_idx: int,
+    n_valid_epochs: int,
+    display_epoch_count: int = 0,
+) -> np.ndarray:
+    """Return a chronological snapshot of the buffered epochs."""
+    if n_valid_epochs <= 0:
+        return epoch_buffer[:0].copy()
+
+    max_epochs = epoch_buffer.shape[0]
+    if n_valid_epochs < max_epochs:
+        ordered = epoch_buffer[:n_valid_epochs]
+    else:
+        ordered = np.concatenate(
+            (epoch_buffer[buffer_idx:], epoch_buffer[:buffer_idx]),
+            axis=0,
+        )
+
+    if display_epoch_count > 0:
+        ordered = ordered[-min(display_epoch_count, ordered.shape[0]) :]
+
+    return ordered.copy()
+
+
+def compute_epoch_mean_std(epoch_batch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute mean/std across epochs while ignoring NaN-masked samples."""
+    if epoch_batch.size == 0:
+        raise ValueError("epoch_batch must not be empty")
+
+    finite_mask = np.isfinite(epoch_batch)
+    counts = np.sum(finite_mask, axis=0)
+    sums = np.where(finite_mask, epoch_batch, 0.0).sum(axis=0)
+    mean_data = np.divide(
+        sums,
+        counts,
+        out=np.full(sums.shape, np.nan, dtype=float),
+        where=counts > 0,
+    )
+
+    centered = np.where(finite_mask, epoch_batch - mean_data[np.newaxis, :, :], 0.0)
+    sq_sums = np.square(centered).sum(axis=0)
+    std_data = np.sqrt(
+        np.divide(
+            sq_sums,
+            counts,
+            out=np.full(mean_data.shape, np.nan, dtype=float),
+            where=counts > 0,
+        )
+    )
+    return mean_data, std_data
+
+
+def build_live_filter_pipeline(
+    sfreq: float,
+    params: dict,
+) -> tuple[np.ndarray | None, list[tuple[np.ndarray, np.ndarray]]]:
+    """Build dynamic filter coefficients for live visualization."""
+    nyquist = sfreq / 2.0
+    bandpass_sos = None
+    notch_filters: list[tuple[np.ndarray, np.ndarray]] = []
+
+    if params.get("apply_bandpass", False):
+        low, high = params.get("bandpass_range", (None, None))
+        low = float(low) if low is not None else None
+        high = float(high) if high is not None else None
+
+        if low is not None and low <= 0:
+            low = None
+        if high is not None and high >= nyquist:
+            high = None
+
+        if low is not None and high is not None and low < high:
+            bandpass_sos = signal.butter(
+                4,
+                [low, high],
+                btype="bandpass",
+                fs=sfreq,
+                output="sos",
+            )
+        elif low is not None:
+            bandpass_sos = signal.butter(
+                4,
+                low,
+                btype="highpass",
+                fs=sfreq,
+                output="sos",
+            )
+        elif high is not None:
+            bandpass_sos = signal.butter(
+                4,
+                high,
+                btype="lowpass",
+                fs=sfreq,
+                output="sos",
+            )
+
+    if params.get("apply_notch", False):
+        for freq in params.get("notch_freqs", []) or []:
+            try:
+                freq_value = float(freq)
+            except (TypeError, ValueError):
+                continue
+            if 0 < freq_value < nyquist:
+                notch_filters.append(signal.iirnotch(freq_value, Q=30.0, fs=sfreq))
+
+    return bandpass_sos, notch_filters
+
+
+def apply_frequency_filters(
+    data: np.ndarray,
+    bandpass_sos: np.ndarray | None,
+    notch_filters: list[tuple[np.ndarray, np.ndarray]],
+) -> np.ndarray:
+    """Apply the active live filters to raw or epoched data."""
+    if bandpass_sos is None and not notch_filters:
+        return np.array(data, copy=True)
+
+    filtered = np.array(data, copy=True, dtype=float)
+    if bandpass_sos is not None:
+        try:
+            filtered = signal.sosfiltfilt(bandpass_sos, filtered, axis=-1)
+        except ValueError:
+            filtered = signal.sosfilt(bandpass_sos, filtered, axis=-1)
+
+    for b, a in notch_filters:
+        try:
+            filtered = signal.filtfilt(b, a, filtered, axis=-1)
+        except ValueError:
+            filtered = signal.lfilter(b, a, filtered, axis=-1)
+
+    return filtered
+
 class PlayerWidget(QWidget):
     """A widget to play a file as an LSL stream."""
     def __init__(self, parent=None):
@@ -292,6 +472,8 @@ class PlayerWidget(QWidget):
 
     def setup_ui(self):
         layout = QFormLayout(self)
+        layout.setVerticalSpacing(8)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         
         # File selection
         file_layout = QHBoxLayout()
@@ -411,11 +593,16 @@ class ConnectionWidget(QWidget):
         """Initializes the user interface for the connection settings."""
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(12)
+        main_layout.setSpacing(10)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         # --- Connection Group ---
         conn_group_box = QGroupBox("Connection Settings")
         form_layout = QFormLayout(conn_group_box)
+        form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        form_layout.setVerticalSpacing(8)
         self.stream_name_input = QLineEdit()
         self.stream_duration_input = QSpinBox()
         self.stream_duration_input.setRange(1, 60 * 5)
@@ -441,19 +628,21 @@ class ConnectionWidget(QWidget):
         chan_group_box = QGroupBox("Channel Configuration")
         chan_layout = QVBoxLayout(chan_group_box)
         helper_label = QLabel(
-            "Find, load or manually define channels. Stim channels are auto-detected by name. Leave Event ID as Auto unless you want to restrict epoching to a specific trigger code."
+            "Live mode currently keeps only EEG and stim channels. Unsupported channels are excluded. Stim channels are auto-detected by name."
         )
         helper_label.setObjectName("mutedLabel")
         helper_label.setWordWrap(True)
         chan_layout.addWidget(helper_label)
         self.channel_table = QTableWidget()
-        self.channel_table.setColumnCount(5)
-        self.channel_table.setHorizontalHeaderLabels(["Enabled", "Name", "Type", "Event ID", "Event Name"])
+        self.channel_table.setColumnCount(3)
+        self.channel_table.setHorizontalHeaderLabels(["Enabled", "Name", "Type"])
+        self.channel_table.setAlternatingRowColors(True)
+        self.channel_table.setMinimumHeight(280)
         self.channel_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.channel_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.channel_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.channel_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.channel_table.verticalHeader().setVisible(False)
+        self.channel_table.verticalHeader().setDefaultSectionSize(28)
         chan_layout.addWidget(self.channel_table)
         
         save_load_layout = QHBoxLayout()
@@ -511,18 +700,7 @@ class ConnectionWidget(QWidget):
             type_combo = QComboBox()
             type_combo.addItems(CHANNEL_TYPE_OPTIONS)
             self.channel_table.setCellWidget(i, 2, type_combo)
-            type_combo.currentTextChanged.connect(lambda text, row=i: self._on_type_changed(text, row))
             type_combo.setCurrentText(suggest_channel_type(name))
-
-            # Event ID & Name
-            spin_box = QSpinBox()
-            spin_box.setRange(0, 999999)
-            spin_box.setSpecialValueText("Auto")
-            spin_box.setValue(0)
-            self.channel_table.setCellWidget(i, 3, spin_box)
-            self.channel_table.setItem(i, 4, QTableWidgetItem())
-
-            self._on_type_changed(type_combo.currentText(), i)
 
         self.channel_table.resizeRowsToContents()
 
@@ -550,27 +728,6 @@ class ConnectionWidget(QWidget):
         layout.setContentsMargins(0,0,0,0)
         return centered_widget
         
-    def _on_type_changed(self, text, row):
-        is_stim = (text == 'stim')
-        
-        # Event ID SpinBox
-        id_widget = self.channel_table.cellWidget(row, 3)
-        if id_widget:
-            id_widget.setEnabled(is_stim)
-            if not is_stim:
-                id_widget.setValue(0)
-
-        # Event Name Item
-        name_item = self.channel_table.item(row, 4)
-        if name_item:
-            flags = name_item.flags()
-            if is_stim:
-                flags |= Qt.ItemIsEditable
-            else:
-                flags &= ~Qt.ItemIsEditable
-                name_item.setText("")
-            name_item.setFlags(flags)
-                
     def save_channel_config(self):
         if self.channel_table.rowCount() == 0:
             QMessageBox.warning(self, "No Channels", "No channel information to save.")
@@ -618,17 +775,10 @@ class ConnectionWidget(QWidget):
             type_widget = self.channel_table.cellWidget(i, 2)
             ch_type = type_widget.currentText() if type_widget else "eeg"
             
-            id_widget = self.channel_table.cellWidget(i, 3)
-            event_id = id_widget.value() if id_widget else 0
-            
-            event_name = self.channel_table.item(i, 4).text() if self.channel_table.item(i, 4) else ""
-            
             channels_config.append({
                 "name": name,
                 "enabled": enabled,
                 "type": ch_type,
-                "event_id": event_id,
-                "event_name": event_name,
             })
         return channels_config
 
@@ -644,15 +794,7 @@ class ConnectionWidget(QWidget):
                 
                 type_widget = self.channel_table.cellWidget(i, 2)
                 if type_widget:
-                    type_widget.setCurrentText(ch_config.get('type', 'eeg'))
-
-                id_widget = self.channel_table.cellWidget(i, 3)
-                if id_widget:
-                    id_widget.setValue(ch_config.get('event_id', 0))
-                
-                name_item = self.channel_table.item(i, 4)
-                if name_item:
-                    name_item.setText(ch_config.get('event_name', ''))
+                    type_widget.setCurrentText(normalize_live_channel_type(ch_config.get('type', 'eeg')))
         else:
             config_map = {item['name']: item for item in config}
             for i in range(self.channel_table.rowCount()):
@@ -666,15 +808,7 @@ class ConnectionWidget(QWidget):
                     
                     type_widget = self.channel_table.cellWidget(i, 2)
                     if type_widget:
-                        type_widget.setCurrentText(ch_config.get('type', 'eeg'))
-
-                    id_widget = self.channel_table.cellWidget(i, 3)
-                    if id_widget:
-                        id_widget.setValue(ch_config.get('event_id', 0))
-                    
-                    name_item = self.channel_table.item(i, 4)
-                    if name_item:
-                        name_item.setText(ch_config.get('event_name', ''))
+                        type_widget.setCurrentText(normalize_live_channel_type(ch_config.get('type', 'eeg')))
 
     def get_settings(self) -> dict:
         base_settings = {
@@ -774,7 +908,8 @@ class ConnectionManager:
                         if orig_name != new_name:
                             ch_rename_map[orig_name] = new_name
                         
-                        c_type = ch["type"] if ch["type"] in ["eeg", "eog", "stim", "misc"] else "misc"
+                        normalized_type = normalize_live_channel_type(ch.get("type", "eeg"))
+                        c_type = normalized_type if normalized_type in {"eeg", "stim"} else "misc"
                         ch_types[new_name] = c_type
 
                 if ch_rename_map:
@@ -801,15 +936,6 @@ class ConnectionManager:
                     self.raw.set_montage(mne.channels.make_standard_montage(default_montage))
                 except Exception as exc:
                     print(f"Warning: could not apply montage '{default_montage}': {exc}")
-
-            if self.params.get("apply_bandpass", False):
-                low, high = self.params.get("bandpass_range", (None, None))
-                if low is not None or high is not None:
-                    self.raw.filter(low, high, picks="eeg", iir_params=None, verbose=False)
-
-            if self.params.get("apply_notch", False):
-                for freq in self.params.get("notch_freqs", []):
-                    self.raw.notch_filter(freq, picks="eeg", iir_params=None, verbose=False)
 
             event_id = resolve_regular_stream_event_id(
                 self.raw,
@@ -874,14 +1000,20 @@ class RealTimeSettingsWidget(QWidget):
         """Initializes the user interface for the plot settings."""
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(8)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
         group_box = QGroupBox("Real-Time Plot Settings")
+        group_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         main_layout.addWidget(group_box)
 
         form_layout = QFormLayout(group_box)
         form_layout.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
         )
+        form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        form_layout.setVerticalSpacing(8)
 
         self.refresh_rate_input = QSpinBox()
         self.refresh_rate_input.setSuffix(" Hz")
@@ -907,10 +1039,12 @@ class RealTimeSettingsWidget(QWidget):
 
         self.apply_notch = QCheckBox("Apply Notch Filter")
         self.notch_input = QLineEdit()
+        self.notch_input.setPlaceholderText("50, 100")
         form_layout.addRow(self.apply_notch, self.notch_input)
 
         self.apply_bandpass.toggled.connect(self.bandpass_input.setEnabled)
         self.apply_notch.toggled.connect(self.notch_input.setEnabled)
+        main_layout.addStretch(1)
 
     def get_settings(self) -> dict:
         """Returns the current settings as a dictionary."""
@@ -1028,13 +1162,15 @@ class DataProcessingWorker(QObject):
         self.epochs = epochs
         self.params = params
         self.is_running = True
-        self.max_epochs = params.get("max_epochs", 200)
+        self.max_epochs = int(params.get("max_epochs", 200) or 200)
+        self.display_epoch_count = int(params.get("display_epoch_count", 0) or 0)
 
         n_channels = len(epochs.info['ch_names'])
         n_times = len(epochs.times)
-        self.epoch_buffer = np.zeros((self.max_epochs, n_channels, n_times))
+        self.epoch_buffer = np.full((self.max_epochs, n_channels, n_times), np.nan)
         self.buffer_idx = 0
         self.n_valid_epochs = 0
+        self.total_epochs_seen = 0
         
         self.original_times = self.epochs.times.copy()
         self.original_sfreq = self.epochs.info["sfreq"]
@@ -1043,6 +1179,9 @@ class DataProcessingWorker(QObject):
         self.raw_picks = mne.pick_types(self.stream.info, eeg=True, exclude=())
         self.ch_names = self.params.get("ch_names", [])
         self.bads = self.params.get("bads", [])
+        self.bandpass_sos = None
+        self.notch_filters: list[tuple[np.ndarray, np.ndarray]] = []
+        self._rebuild_filter_pipeline()
 
     def run(self):
         """Starts the data processing loop."""
@@ -1066,6 +1205,7 @@ class DataProcessingWorker(QObject):
         try:
             raw_chunk, _ = self.stream.get_data(picks=self.raw_picks)
             if raw_chunk is not None and raw_chunk.shape[1] > 0:
+                raw_chunk = self._apply_live_filters(raw_chunk)
                 n_samples = raw_chunk.shape[1]
                 time_axis = np.linspace(-n_samples / self.original_sfreq, 0, n_samples)
                 
@@ -1098,37 +1238,47 @@ class DataProcessingWorker(QObject):
             try:
                 new_data = self.epochs.get_data(n_epochs=new_epoch_count)
                 if new_data is not None and new_data.shape[0] > 0:
-                    processed_batch = self._process_epoch_batch(new_data)
-                    
-                    # Copy new data into the circular buffer
-                    n_new = processed_batch.shape[0]
-                    start_idx = self.buffer_idx
-                    end_idx = start_idx + n_new
-                    
-                    if end_idx <= self.max_epochs:
-                        self.epoch_buffer[start_idx:end_idx] = processed_batch
-                    else: # Wrap-around
-                        part1_n = self.max_epochs - start_idx
-                        self.epoch_buffer[start_idx:] = processed_batch[:part1_n]
-                        part2_n = n_new - part1_n
-                        self.epoch_buffer[:part2_n] = processed_batch[part1_n:]
+                    stored_batch = np.array(new_data, copy=True)
+                    n_new_total = stored_batch.shape[0]
+                    self.total_epochs_seen += n_new_total
 
-                    self.buffer_idx = end_idx % self.max_epochs
-                    self.n_valid_epochs = min(self.max_epochs, self.n_valid_epochs + n_new)
+                    if n_new_total >= self.max_epochs:
+                        stored_batch = stored_batch[-self.max_epochs :]
+                        self.epoch_buffer[:] = stored_batch
+                        self.buffer_idx = 0
+                        self.n_valid_epochs = self.max_epochs
+                        new_data = None
+                    else:
+                        # Copy new data into the circular buffer
+                        n_new = stored_batch.shape[0]
+                        start_idx = self.buffer_idx
+                        end_idx = start_idx + n_new
+                        
+                        if end_idx <= self.max_epochs:
+                            self.epoch_buffer[start_idx:end_idx] = stored_batch
+                        else: # Wrap-around
+                            part1_n = self.max_epochs - start_idx
+                            self.epoch_buffer[start_idx:] = stored_batch[:part1_n]
+                            part2_n = n_new - part1_n
+                            self.epoch_buffer[:part2_n] = stored_batch[part1_n:]
+
+                        self.buffer_idx = end_idx % self.max_epochs
+                        self.n_valid_epochs = min(self.max_epochs, self.n_valid_epochs + n_new)
 
             except Exception as e:
                 print(f"Error fetching epoch data: {e}")
 
-        if self.n_valid_epochs > 0:
-            # Create a consistent snapshot for this processing iteration
-            plot_data = self.epoch_buffer[:self.n_valid_epochs]
+        plot_data = buffer_epoch_snapshot(
+            self.epoch_buffer,
+            self.buffer_idx,
+            self.n_valid_epochs,
+            self.display_epoch_count,
+        )
+        displayed_epochs = plot_data.shape[0]
 
-            # Decimate after processing so the on-screen data stays light.
-            processed_data = plot_data[:, :, :: self.decimate]
-
-            # Calculate mean and std for plotting
-            mean_data = np.nanmean(processed_data, axis=0)
-            std_data = np.nanstd(processed_data, axis=0)
+        if displayed_epochs > 0:
+            processed_data = self._process_epoch_batch(plot_data)[:, :, :: self.decimate]
+            mean_data, std_data = compute_epoch_mean_std(processed_data)
 
             valid_data = [
                 mean_data[i]
@@ -1144,45 +1294,35 @@ class DataProcessingWorker(QObject):
             if global_min >= global_max:
                 global_min -= 1.0
                 global_max += 1.0
-            
-            # Add epoch data to the emit dictionary
-            emit_dict["epoch_data"] = {
-                "mean_data": mean_data,
-                "std_data": std_data,
-                "n_epochs": self.n_valid_epochs,
-                "global_min": global_min,
-                "global_max": global_max,
-            }
+        else:
+            mean_data = np.full((self.epoch_buffer.shape[1], len(self.times)), np.nan)
+            std_data = np.full_like(mean_data, np.nan)
+            global_min, global_max = -10.0, 10.0
+
+        emit_dict["epoch_data"] = {
+            "mean_data": mean_data,
+            "std_data": std_data,
+            "n_epochs": displayed_epochs,
+            "buffered_epochs": self.n_valid_epochs,
+            "total_epochs": self.total_epochs_seen,
+            "global_min": global_min,
+            "global_max": global_max,
+        }
         
         # Emit data for UI thread
         if emit_dict:
             self.data_ready.emit(emit_dict)
 
     def _process_epoch_batch(self, epoch_batch: np.ndarray) -> np.ndarray:
-        plot_data = epoch_batch.copy()
-
-        art_rem_start, art_rem_end = self.params.get("art_rem", (0, 0))
-        if art_rem_end > art_rem_start:
-            start_idx = np.searchsorted(self.original_times, art_rem_start, side="left")
-            end_idx = np.searchsorted(self.original_times, art_rem_end, side="right")
-            if end_idx > start_idx and start_idx > 0 and end_idx < len(self.original_times) - 1:
-                # Vectorized interpolation for performance
-                x0, x1 = start_idx - 1, end_idx
-                y0 = plot_data[:, :, x0]
-                y1 = plot_data[:, :, x1]
-
-                slope = (y1 - y0) / (x1 - x0)
-                intercept = y0 - slope * x0
-                
-                x_interp = np.arange(start_idx, end_idx)
-                
-                # Use broadcasting to apply to all epochs and channels
-                y_interp = slope[:, :, np.newaxis] * x_interp + intercept[:, :, np.newaxis]
-                
-                plot_data[:, :, start_idx:end_idx] = y_interp
+        plot_data = self._apply_live_filters(epoch_batch)
+        plot_data = apply_artifact_mask(
+            plot_data,
+            self.original_times,
+            self.params.get("art_rem", (0, 0)),
+        )
 
         if self.params.get("reference", "average") == "average" and plot_data.shape[1] > 1:
-            plot_data -= np.nanmean(plot_data, axis=1, keepdims=True)
+            plot_data = average_reference_ignore_nan(plot_data)
 
         return plot_data
 
@@ -1194,8 +1334,28 @@ class DataProcessingWorker(QObject):
             self.ch_names = new_params["ch_names"]
         if "bads" in new_params:
             self.bads = new_params["bads"]
+        if "display_epoch_count" in new_params:
+            self.display_epoch_count = int(new_params["display_epoch_count"] or 0)
+        self._rebuild_filter_pipeline()
         if hasattr(self, "timer"):
             self.timer.setInterval(max(1, int(round(1000 / self.params.get("refresh_rate", 24)))))
+
+    @Slot()
+    def clear_epochs(self):
+        """Reset the circular epoch buffer and counters."""
+        self.epoch_buffer.fill(np.nan)
+        self.buffer_idx = 0
+        self.n_valid_epochs = 0
+        self.total_epochs_seen = 0
+
+    def _rebuild_filter_pipeline(self):
+        self.bandpass_sos, self.notch_filters = build_live_filter_pipeline(
+            self.original_sfreq,
+            self.params,
+        )
+
+    def _apply_live_filters(self, data: np.ndarray) -> np.ndarray:
+        return apply_frequency_filters(data, self.bandpass_sos, self.notch_filters)
 
 class SingleChannelPlot(QDialog):
     """A dialog for plotting data from a single EEG channel using pyqtgraph."""
@@ -1206,6 +1366,8 @@ class SingleChannelPlot(QDialog):
         self.ch_name = ch_name
         self.times = times * 1e3 # Convert to ms
         self.parent = parent
+        self.latest_evoked_uV = np.full_like(self.times, np.nan, dtype=float)
+        self.latest_std_uV = np.full_like(self.times, np.nan, dtype=float)
         self.setup_ui()
         self.show()
 
@@ -1222,6 +1384,9 @@ class SingleChannelPlot(QDialog):
         self.position_label.setObjectName("mutedLabel")
         self.position_label.setWordWrap(True)
         layout.addWidget(self.position_label)
+        self.cursor_label = QLabel("Cursor: hover over the plot")
+        self.cursor_label.setObjectName("mutedLabel")
+        layout.addWidget(self.cursor_label)
         self.plot_widget = pg.PlotWidget()
         layout.addWidget(self.plot_widget)
 
@@ -1240,6 +1405,9 @@ class SingleChannelPlot(QDialog):
         self.v_line = pg.InfiniteLine(angle=90, movable=False)
         self.plot_widget.addItem(self.v_line)
         self.v_line.setPos(0)
+        self.plot_widget.setXRange(float(self.times[0]), float(self.times[-1]), padding=0)
+        self.plot_widget.setLimits(xMin=float(self.times[0]), xMax=float(self.times[-1]))
+        self.plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.refresh_theme()
 
     def refresh_theme(self):
@@ -1261,15 +1429,65 @@ class SingleChannelPlot(QDialog):
 
     def update_plot(self, evoked_uV, std_uV, n_epochs):
         """Updates the plot with new data."""
+        self.latest_evoked_uV = np.array(evoked_uV, copy=True)
+        self.latest_std_uV = np.array(std_uV, copy=True)
         self.mean_curve.setData(self.times, evoked_uV)
         self.upper_bound_curve.setData(self.times, evoked_uV + std_uV)
         self.lower_bound_curve.setData(self.times, evoked_uV - std_uV)
 
-        t0_idx = np.argmin(abs(self.times))
-        self.plot_widget.setTitle(
-            f"{self.ch_name} (n={n_epochs} | "
-            f"R_std={np.nanmean(std_uV[t0_idx:]):.1f} uV)"
+        finite_envelope = np.concatenate(
+            [
+                np.asarray(evoked_uV + std_uV)[np.isfinite(evoked_uV + std_uV)],
+                np.asarray(evoked_uV - std_uV)[np.isfinite(evoked_uV - std_uV)],
+            ]
         )
+        if finite_envelope.size > 0:
+            y_min = float(np.min(finite_envelope))
+            y_max = float(np.max(finite_envelope))
+            padding = max(1.0, (y_max - y_min) * 0.12)
+            if y_min >= y_max:
+                y_min -= padding
+                y_max += padding
+            else:
+                y_min -= padding
+                y_max += padding
+            self.plot_widget.setYRange(y_min, y_max, padding=0)
+        else:
+            self.plot_widget.setYRange(-10.0, 10.0, padding=0)
+
+        if n_epochs <= 0:
+            self.plot_widget.setTitle(f"{self.ch_name} (no epochs)")
+            self.cursor_label.setText("Cursor: no data")
+            return
+
+        t0_idx = int(np.argmin(abs(self.times)))
+        rms_std = np.nanmean(std_uV[t0_idx:])
+        if np.isnan(rms_std):
+            self.plot_widget.setTitle(f"{self.ch_name} (n={n_epochs})")
+        else:
+            self.plot_widget.setTitle(
+                f"{self.ch_name} (n={n_epochs} | R_std={rms_std:.1f} uV)"
+            )
+
+    def _on_mouse_moved(self, scene_pos):
+        if not self.plot_widget.sceneBoundingRect().contains(scene_pos):
+            return
+
+        mouse_point = self.plot_widget.getViewBox().mapSceneToView(scene_pos)
+        if self.times.size == 0:
+            return
+
+        idx = int(np.clip(np.searchsorted(self.times, mouse_point.x()), 0, len(self.times) - 1))
+        if idx > 0 and abs(self.times[idx - 1] - mouse_point.x()) <= abs(self.times[idx] - mouse_point.x()):
+            idx -= 1
+
+        time_ms = float(self.times[idx])
+        amp_uV = float(self.latest_evoked_uV[idx]) if idx < len(self.latest_evoked_uV) else np.nan
+        self.v_line.setPos(time_ms)
+        if np.isfinite(amp_uV):
+            self.cursor_label.setText(f"Cursor: {time_ms:.1f} ms | {amp_uV:.2f} uV")
+        else:
+            self.cursor_label.setText(f"Cursor: {time_ms:.1f} ms | n/a")
 
     def closeEvent(self, event):
         self.closed.emit()
@@ -1287,6 +1505,7 @@ class TopomapPlot(QDialog):
             | Qt.WindowMaximizeButtonHint
             | Qt.WindowCloseButtonHint
         )
+        self.resize(760, 620)
         self.fig = Figure(layout="constrained")
         self.canvas = FigureCanvas(self.fig)
         self.ax = self.fig.add_subplot(111)
@@ -1310,7 +1529,7 @@ class TopomapPlot(QDialog):
             self.cbar.update_normal(im)
         self.ax.set_title(title)
         self.refresh_theme()
-        self.canvas.draw()
+        self.canvas.draw_idle()
 
     def refresh_theme(self):
         tokens = theme_tokens()
@@ -1328,6 +1547,7 @@ class TopomapPlot(QDialog):
 
 class RealTimeERP(QDialog):
     params_changed = Signal(dict)
+    clear_epochs_requested = Signal()
     """Main widget for real-time ERP visualization."""
 
     def __init__(self, params, parent=None):
@@ -1338,6 +1558,8 @@ class RealTimeERP(QDialog):
         self.mean_data = None
         self.std_data = None
         self.n_epochs = 0
+        self.buffered_epochs = 0
+        self.total_epochs = 0
         self.ch_names = []
         self.coords_2d = []
         self.channel_coords = {}
@@ -1345,7 +1567,14 @@ class RealTimeERP(QDialog):
         self.times = []
         self.opened_single_channels = {}
         self.bads = self.params.get('bads', [])
+        self.max_buffered_epochs = int(self.params.get("max_epochs", 200) or 200)
+        self.params["max_epochs"] = self.max_buffered_epochs
+        self.params["display_epoch_count"] = int(self.params.get("display_epoch_count", 0) or 0)
         self.topomap_dialog = None
+        self.topomap_refresh_timer = QTimer(self)
+        self.topomap_refresh_timer.setSingleShot(True)
+        self.topomap_refresh_timer.setInterval(140)
+        self.topomap_refresh_timer.timeout.connect(self._flush_topomap_update)
         self.raw_plot_buffer = None
         self.active_montage_name = None
         self.topo_label_items = {}
@@ -1359,28 +1588,27 @@ class RealTimeERP(QDialog):
         apply_pyqtgraph_theme(self.theme_name)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.toolbar = self._create_toolbar()
-        layout.addWidget(self.toolbar)
-
-        v_splitter = QSplitter(Qt.Orientation.Vertical)
-        h_splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.setSpacing(6)
 
         self.raw_widget = self._create_raw_widget()
         self.topo_widget = self._create_topo_widget()
         self.evoked_widget = self._create_evoked_widget()
 
-        h_splitter.addWidget(self.raw_widget)
-        h_splitter.addWidget(self.topo_widget)
+        self.top_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.top_splitter.addWidget(self.raw_widget)
+        self.top_splitter.addWidget(self.topo_widget)
 
-        v_splitter.addWidget(h_splitter)
-        v_splitter.addWidget(self.evoked_widget)
-        
-        v_splitter.setStretchFactor(0, 2)
-        v_splitter.setStretchFactor(1, 1)
+        self.vertical_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.vertical_splitter.addWidget(self.top_splitter)
+        self.vertical_splitter.addWidget(self.evoked_widget)
+        self.vertical_splitter.setStretchFactor(0, 2)
+        self.vertical_splitter.setStretchFactor(1, 1)
 
-        layout.addWidget(v_splitter)
+        self.toolbar = self._create_toolbar()
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.vertical_splitter)
 
+        self._rebalance_splitters()
         self.refresh_theme()
 
     def refresh_theme(self):
@@ -1436,9 +1664,21 @@ class RealTimeERP(QDialog):
         toolbar = QToolBar()
         toolbar.setObjectName("RealTimeToolBar")
         toolbar.setMovable(False)
-        toolbar.addAction("Raw").triggered.connect(lambda: self.raw_widget.setVisible(not self.raw_widget.isVisible()))
-        toolbar.addAction("Channel Layout").triggered.connect(lambda: self.topo_widget.setVisible(not self.topo_widget.isVisible()))
-        toolbar.addAction("Butterfly").triggered.connect(lambda: self.evoked_widget.setVisible(not self.evoked_widget.isVisible()))
+
+        self.raw_toggle_action = toolbar.addAction("Raw")
+        self.raw_toggle_action.setCheckable(True)
+        self.raw_toggle_action.setChecked(True)
+        self.raw_toggle_action.toggled.connect(lambda checked: self._toggle_panel(self.raw_widget, checked))
+
+        self.topo_toggle_action = toolbar.addAction("Channel Layout")
+        self.topo_toggle_action.setCheckable(True)
+        self.topo_toggle_action.setChecked(True)
+        self.topo_toggle_action.toggled.connect(lambda checked: self._toggle_panel(self.topo_widget, checked))
+
+        self.evoked_toggle_action = toolbar.addAction("Butterfly")
+        self.evoked_toggle_action.setCheckable(True)
+        self.evoked_toggle_action.setChecked(True)
+        self.evoked_toggle_action.toggled.connect(lambda checked: self._toggle_panel(self.evoked_widget, checked))
         
         toolbar.addSeparator()
         
@@ -1454,10 +1694,66 @@ class RealTimeERP(QDialog):
         self.n_chan_spinbox.valueChanged.connect(self._update_n_channels_shown)
         toolbar.addWidget(QLabel(" View Chans: "))
         toolbar.addWidget(self.n_chan_spinbox)
-        
+
+        toolbar.addSeparator()
+        self.display_epoch_spinbox = QSpinBox()
+        self.display_epoch_spinbox.setRange(0, self.max_buffered_epochs)
+        self.display_epoch_spinbox.setSpecialValueText("All")
+        self.display_epoch_spinbox.setToolTip("0 shows all buffered epochs; any positive value shows the last N epochs.")
+        self.display_epoch_spinbox.setValue(self.params["display_epoch_count"])
+        self.display_epoch_spinbox.valueChanged.connect(self._on_display_epoch_count_changed)
+        toolbar.addWidget(QLabel(" View Epochs: "))
+        toolbar.addWidget(self.display_epoch_spinbox)
+
+        self.clear_epochs_action = toolbar.addAction("Clear Epochs")
+        self.clear_epochs_action.triggered.connect(self.clear_epochs)
+
+        self.epoch_count_label = QLabel("Epochs: 0")
+        self.epoch_count_label.setObjectName("mutedLabel")
+        toolbar.addWidget(self.epoch_count_label)
+
         toolbar.addSeparator()
         toolbar.addAction("Settings").triggered.connect(self.update_settings)
         return toolbar
+
+    def _toggle_panel(self, widget: QWidget, visible: bool):
+        widget.setVisible(visible)
+        self._rebalance_splitters()
+
+    def _rebalance_splitters(self):
+        raw_visible = self.raw_toggle_action.isChecked()
+        topo_visible = self.topo_toggle_action.isChecked()
+        evoked_visible = self.evoked_toggle_action.isChecked()
+
+        top_visible = raw_visible or topo_visible
+        self.top_splitter.setVisible(top_visible)
+
+        if raw_visible and topo_visible:
+            self.top_splitter.setSizes([1, 1])
+        elif raw_visible:
+            self.top_splitter.setSizes([1, 0])
+        elif topo_visible:
+            self.top_splitter.setSizes([0, 1])
+
+        if top_visible and evoked_visible:
+            self.vertical_splitter.setSizes([2, 1])
+        elif top_visible:
+            self.vertical_splitter.setSizes([1, 0])
+        elif evoked_visible:
+            self.vertical_splitter.setSizes([0, 1])
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._rebalance_splitters()
+
+    def _update_epoch_count_label(self):
+        self.epoch_count_label.setText(f"Epochs: {self.n_epochs}")
+
+    def _on_display_epoch_count_changed(self, value: int):
+        self.params["display_epoch_count"] = int(value)
+        self._update_epoch_count_label()
+        if hasattr(self, "data_worker"):
+            self.params_changed.emit({"display_epoch_count": int(value)})
 
     def _create_raw_widget(self):
         group = QGroupBox("Raw Data Monitor")
@@ -1490,7 +1786,7 @@ class RealTimeERP(QDialog):
         self.evoked_plot.setLabel('bottom', 'Time (ms)')
         self.evoked_plot.showGrid(x=True, y=True)
         self.roi = pg.LinearRegionItem(orientation=pg.LinearRegionItem.Vertical)
-        self.roi.sigRegionChanged.connect(self.on_roi_changed)
+        self.roi.sigRegionChangeFinished.connect(self.on_roi_changed)
         self.evoked_plot.addItem(self.roi)
         layout = QVBoxLayout(group)
         layout.setContentsMargins(2, 8, 2, 2)
@@ -1528,6 +1824,7 @@ class RealTimeERP(QDialog):
         eeg_picks = mne.pick_types(self.epochs.info, eeg=True, exclude=())
         self.info = mne.pick_info(self.epochs.info, eeg_picks)
         self.ch_names = self.info["ch_names"]
+        self.info["bads"] = [name for name in self.bads if name in self.ch_names]
         self.sfreq = self.info["sfreq"]
         coords_3d = []
         for ch in self.info["chs"]:
@@ -1544,11 +1841,14 @@ class RealTimeERP(QDialog):
         }
         self.colors = build_trace_colors(len(self.ch_names))
 
+        self.n_chan_spinbox.setRange(1, max(1, len(self.ch_names)))
         self.n_chan_spinbox.setValue(len(self.ch_names))
 
         self.params["ch_names"] = self.ch_names
-        self.params["bads"] = self.bads
+        self.params["bads"] = self.info["bads"]
         self.params["scale_mode"] = self.scale_mode_combo.currentText()
+        self.params["display_epoch_count"] = self.display_epoch_spinbox.value()
+        self._update_epoch_count_label()
 
         # Start data processing worker thread
         self.data_thread = QThread(self)
@@ -1566,6 +1866,7 @@ class RealTimeERP(QDialog):
         self.data_thread.finished.connect(self.data_worker.deleteLater)
         self.data_thread.finished.connect(self.data_thread.deleteLater)
         self.params_changed.connect(self.data_worker.update_params)
+        self.clear_epochs_requested.connect(self.data_worker.clear_epochs)
         self.data_thread.start()
 
     def _on_connection_failure(self, error_message):
@@ -1583,7 +1884,7 @@ class RealTimeERP(QDialog):
         ]
         self.evoked_plot.setXRange(self.times[0] * 1e3, self.times[-1] * 1e3)
         self.evoked_plot.setLimits(xMin=self.times[0] * 1e3, xMax=self.times[-1] * 1e3)
-        self.evoked_plot.setYRange(-10, 10)
+        self.evoked_plot.setYRange(-10.0, 10.0)
 
         # Topo Plot Setup
         self.topo_plot_widget.clear()
@@ -1635,7 +1936,7 @@ class RealTimeERP(QDialog):
     def _update_n_channels_shown(self):
         if not self.ch_names:
             return
-        n_show = self.n_chan_spinbox.value()
+        n_show = min(self.n_chan_spinbox.value(), len(self.ch_names))
         max_y = len(self.ch_names)
         min_y = max_y - n_show
         self.raw_plot_widget.setYRange(min_y - 0.5, max_y - 0.5, padding=0)
@@ -1666,23 +1967,29 @@ class RealTimeERP(QDialog):
         self.mean_data = epoch_data["mean_data"]
         self.std_data = epoch_data["std_data"]
         self.n_epochs = epoch_data["n_epochs"]
+        self.buffered_epochs = epoch_data.get("buffered_epochs", self.n_epochs)
+        self.total_epochs = epoch_data.get("total_epochs", self.buffered_epochs)
         global_min = epoch_data["global_min"]
         global_max = epoch_data["global_max"]
 
+        self._update_epoch_count_label()
         self.setWindowTitle(f"Real-Time TEP - Epochs: {self.n_epochs}")
-        self.evoked_widget.setTitle(f"Evoked Potentials (Epochs: {self.n_epochs})")
+        self.evoked_widget.setTitle("Evoked Potentials")
 
         # Update Evoked Butterfly Plot
+        time_axis_ms = self.times * 1e3
         for i, line in enumerate(self.evoked_lines):
             if self.ch_names[i] in self.bads:
-                line.setData(self.times * 1e3, np.full_like(self.times, np.nan))
+                line.setData(time_axis_ms, np.full_like(self.times, np.nan))
             else:
-                line.setData(self.times * 1e3, self.mean_data[i] * 1e6)
+                line.setData(time_axis_ms, self.mean_data[i] * 1e6)
+
+        y_padding = max(1.0, (global_max - global_min) * 0.12)
+        self.evoked_plot.setYRange(global_min - y_padding, global_max + y_padding, padding=0)
 
         # Update Unified Topo Plot
         mean_data_uV = self.mean_data * 1e6
         v_range = global_max - global_min if global_max > global_min else 1.0
-        time_axis_ms = self.times * 1e3
         t_range = time_axis_ms[-1] - time_axis_ms[0] if len(time_axis_ms) > 1 else 1.0
         
         positions = calculate_mne_style_layout(self.coords_2d)
@@ -1714,13 +2021,15 @@ class RealTimeERP(QDialog):
             label = self.topo_channel_labels[i]
             label.setPos(left + width / 2, bottom + height)
 
-
         # Update any open single channel plots
         for ch_name, plot_dialog in self.opened_single_channels.items():
             ch_idx = self.ch_names.index(ch_name)
             evoked_uV = self.mean_data[ch_idx, :] * 1e6
             std_uV = self.std_data[ch_idx, :] * 1e6
             plot_dialog.update_plot(evoked_uV, std_uV, self.n_epochs)
+
+        if self.topomap_dialog is not None:
+            self._schedule_topomap_update()
 
     def _update_raw_plot(self, raw_data_dict):
         time_axis = raw_data_dict["time_axis"]
@@ -1736,31 +2045,78 @@ class RealTimeERP(QDialog):
         for i, curve in enumerate(self.raw_curves):
             curve.setData(time_axis, scaled_data[i, :] + self.raw_offsets[i])
 
+    def clear_epochs(self):
+        self.n_epochs = 0
+        self.buffered_epochs = 0
+        self.total_epochs = 0
+        self.topomap_refresh_timer.stop()
+        if self.ch_names and len(self.times) > 0:
+            empty = np.full((len(self.ch_names), len(self.times)), np.nan)
+            self.mean_data = empty.copy()
+            self.std_data = empty.copy()
+            self._update_epoch_plots(
+                {
+                    "mean_data": self.mean_data,
+                    "std_data": self.std_data,
+                    "n_epochs": 0,
+                    "buffered_epochs": 0,
+                    "total_epochs": 0,
+                    "global_min": -10.0,
+                    "global_max": 10.0,
+                }
+            )
+        if self.topomap_dialog is not None:
+            self.topomap_dialog.close()
+        if hasattr(self, "data_worker"):
+            self.clear_epochs_requested.emit()
+
     def update_settings(self):
         """Opens the settings dialog and applies changes."""
         dialog = RealTimeSettings(self)
         if dialog.exec():
             new_params = dialog.get_settings()
             dialog.settings_widget.save_settings()
-            filter_restart_needed = any(
-                self.params.get(key) != new_params.get(key)
-                for key in ("apply_bandpass", "bandpass_range", "apply_notch", "notch_freqs")
-            )
             self.params.update(new_params)
             if hasattr(self, "data_worker"):
                 self.params_changed.emit(new_params)
-            if filter_restart_needed:
-                QMessageBox.information(
-                    self,
-                    "Restart Required for Filters",
-                    "Filter changes are applied when the live stream connects. Relaunch the visualizer to use the new filter settings.",
-                )
 
     def on_roi_changed(self):
         """Handles changes in the ROI selection to update the topomap."""
+        self._schedule_topomap_update()
+
+    def _schedule_topomap_update(self, immediate: bool = False):
         if self.mean_data is None:
             return
+        if immediate:
+            self.topomap_refresh_timer.stop()
+            self._flush_topomap_update()
+            return
+        if not self.topomap_refresh_timer.isActive():
+            self.topomap_refresh_timer.start()
 
+    def _flush_topomap_update(self):
+        payload = self._build_topomap_payload()
+        if payload is None:
+            if self.topomap_dialog is not None:
+                self.topomap_dialog.close()
+            return
+
+        topo_data, info_good, title = payload
+        if self.topomap_dialog is None:
+            self.topomap_dialog = TopomapPlot(self)
+            self.topomap_dialog.closed.connect(self._on_topomap_closed)
+
+        self.topomap_dialog.update_plot(
+            topo_data,
+            info_good,
+            title,
+            names=info_good['ch_names'],
+            cmap="RdBu_r",
+        )
+
+    def _build_topomap_payload(self):
+        if self.mean_data is None:
+            return None
         rgn = self.roi.getRegion()
         start_ms, end_ms = rgn
 
@@ -1768,24 +2124,36 @@ class RealTimeERP(QDialog):
         end_idx = np.searchsorted(self.times * 1e3, end_ms, side="right")
 
         if start_idx >= end_idx:
-            return
+            return None
 
-        good_indices = mne.pick_types(self.info, eeg=True, exclude='bads')
+        good_indices = np.asarray(mne.pick_types(self.info, eeg=True, exclude='bads'))
         if len(good_indices) == 0:
-            return
+            return None
         
-        topo_data = np.nanmean(self.mean_data[good_indices, start_idx:end_idx], axis=1)
+        topo_window = self.mean_data[good_indices, start_idx:end_idx]
+        finite_mask = np.isfinite(topo_window)
+        counts = np.sum(finite_mask, axis=1)
+        sums = np.where(finite_mask, topo_window, 0.0).sum(axis=1)
+        topo_data = np.divide(
+            sums,
+            counts,
+            out=np.full(good_indices.shape, np.nan, dtype=float),
+            where=counts > 0,
+        )
+        valid_mask = np.isfinite(topo_data)
+        if not np.any(valid_mask):
+            return None
 
-        if self.topomap_dialog is None:
-            self.topomap_dialog = TopomapPlot(self)
-            self.topomap_dialog.closed.connect(self._on_topomap_closed)
+        good_indices = good_indices[valid_mask]
+        topo_data = topo_data[valid_mask]
 
         info_good = mne.pick_info(self.info, good_indices)
             
         title = f"Topomap from {start_ms:.1f} to {end_ms:.1f} ms"
-        self.topomap_dialog.update_plot(topo_data, info_good, title, names=info_good['ch_names'], cmap="RdBu_r")
+        return topo_data, info_good, title
 
     def _on_topomap_closed(self):
+        self.topomap_refresh_timer.stop()
         self.topomap_dialog = None
 
     def _handle_topo_scene_click(self, event):
@@ -1808,10 +2176,10 @@ class RealTimeERP(QDialog):
                 if event.button() == Qt.MouseButton.LeftButton:
                     self.on_topo_pick(name)
                 elif event.button() == Qt.MouseButton.RightButton:
-                    if name in self.bads:
-                        self.bads.remove(name)
-                    else:
-                        self.bads = list(set(self.bads + [name])
+                    next_bads = [bad for bad in self.bads if bad != name]
+                    if name not in self.bads:
+                        next_bads.append(name)
+                    self._set_bad_channels(next_bads)
                 return
 
     def on_topo_pick(self, ch_name):
@@ -1829,6 +2197,60 @@ class RealTimeERP(QDialog):
             evoked_uV = self.mean_data[ch_idx, :] * 1e6
             std_uV = self.std_data[ch_idx, :] * 1e6
             dialog.update_plot(evoked_uV, std_uV, self.n_epochs)
+
+    def _set_bad_channels(self, bads: list[str]):
+        ordered_bads = [name for name in self.ch_names if name in set(bads)]
+        self.bads = ordered_bads
+        self.params["bads"] = ordered_bads
+        if hasattr(self, "info"):
+            self.info["bads"] = ordered_bads.copy()
+        if self.epochs is not None:
+            self.epochs.info["bads"] = ordered_bads.copy()
+        if hasattr(self, "data_worker"):
+            self.params_changed.emit({"bads": ordered_bads})
+        if self.topomap_dialog is not None and self.mean_data is not None:
+            self._schedule_topomap_update()
+
+    def _shutdown_threads(self):
+        self.topomap_refresh_timer.stop()
+
+        if hasattr(self, "data_worker"):
+            try:
+                self.data_worker.stop()
+            except Exception:
+                pass
+
+        if hasattr(self, "data_thread") and self.data_thread is not None and self.data_thread.isRunning():
+            self.data_thread.quit()
+            if not self.data_thread.wait(1500):
+                self.data_thread.terminate()
+                self.data_thread.wait(1500)
+
+        if hasattr(self, "epochs") and self.epochs is not None:
+            try:
+                self.epochs.disconnect()
+            except Exception:
+                pass
+
+        if hasattr(self, "stream") and self.stream is not None:
+            try:
+                self.stream.disconnect()
+            except Exception:
+                pass
+
+        if hasattr(self, "conn_thread") and self.conn_thread is not None and self.conn_thread.isRunning():
+            self.conn_thread.quit()
+            if not self.conn_thread.wait(1500):
+                self.conn_thread.terminate()
+                self.conn_thread.wait(1500)
+
+    def closeEvent(self, event):
+        self._shutdown_threads()
+        if self.topomap_dialog is not None:
+            self.topomap_dialog.close()
+        for dialog in list(self.opened_single_channels.values()):
+            dialog.close()
+        super().closeEvent(event)
 
     @staticmethod
     def project_electrodes_to_2d(coords_3d):
@@ -1876,15 +2298,19 @@ class RealTimeMainWidget(QWidget):
         """Sets up the UI for the main widget."""
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
         self.setMinimumWidth(640)
 
         self.main_container = QWidget()
+        self.main_container.setMaximumWidth(1480)
+        self.main_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(self.main_container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
+        layout.setSpacing(12)
 
         self.connection_widget = ConnectionWidget()
         self.plot_settings_widget = RealTimeSettingsWidget()
+        self.plot_settings_widget.setMaximumWidth(420)
         self.player_widget = PlayerWidget()
 
         live_card = self._build_card("Connect to Live Stream")
@@ -1898,29 +2324,37 @@ class RealTimeMainWidget(QWidget):
 
         config_row = QHBoxLayout()
         config_row.setContentsMargins(0, 0, 0, 0)
-        config_row.setSpacing(16)
+        config_row.setSpacing(12)
+        config_row.setAlignment(Qt.AlignmentFlag.AlignTop)
         config_row.addWidget(self.connection_widget, 2)
-        config_row.addWidget(self.plot_settings_widget, 1)
+        config_row.addWidget(self.plot_settings_widget, 1, Qt.AlignmentFlag.AlignTop)
         live_layout.addLayout(config_row)
 
         self.launch_button = QPushButton("Launch Live Visualizer")
         self.launch_button.setDefault(True)
+        self.launch_button.setMinimumWidth(260)
         self.launch_button.clicked.connect(self.launch_visualizer)
-        live_layout.addWidget(self.launch_button)
+
+        launch_row = QHBoxLayout()
+        launch_row.setContentsMargins(0, 4, 0, 0)
+        launch_row.addStretch(1)
+        launch_row.addWidget(self.launch_button)
+        launch_row.addStretch(1)
+        live_layout.addLayout(launch_row)
         layout.addWidget(live_card)
 
         file_card = self._build_card("Play from File")
-        file_card.layout().addWidget(self.player_widget)
+        file_card.layout().addWidget(self.player_widget, 0, Qt.AlignmentFlag.AlignTop)
         layout.addWidget(file_card)
         layout.addStretch()
-        main_layout.addWidget(self.main_container)
+        main_layout.addWidget(self.main_container, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
 
     def _build_card(self, title: str) -> QFrame:
         card = QFrame()
         card.setObjectName("pipelineCard")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(18, 18, 18, 18)
-        card_layout.setSpacing(12)
+        card_layout.setContentsMargins(16, 16, 16, 16)
+        card_layout.setSpacing(10)
 
         title_label = QLabel(title)
         title_label.setObjectName("panelTitle")
