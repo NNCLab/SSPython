@@ -7,17 +7,7 @@ fig.mne.view.scene().sigMouseClicked.connect(fig._redraw) # Important fix for MN
 
 # TODO:
 
-- [ ] `ICA Sources Plot` as option of `Plot ICA`
-- [ ] `Better handling of multi-event data: Evoked plot, topoplot and such`
-- [ ] `TFR vizualization module`
-- [ ] `Move average reference to epoching dialog` 
-- [ ] `Real-time Filter issue (nan instead of interp)` 
-- [ ] `Real-time single/fixed trials option`
-- [ ] `Real-time docking`
-- [ ] `Real time error when closing thread:`
-
-```plaintext
-RuntimeError: Error calling Python override of QDialog::closeEvent(): Internal C++ object (PySide6.QtCore.QThread) already deleted.
-QObject::killTimer: Timers cannot be stopped from another thread
-QObject::~QObject: Timers cannot be stopped from another thread
-```
+- [ ] `Check why some pulses are missing (sometimes). Might be device related (trigger to lsl not capping properly).`
+- [ ] Check muilti-event data visualization
+- [ ] Finish convert and merge utils
+- [ ] Add TFR module

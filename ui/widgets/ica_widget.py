@@ -43,6 +43,9 @@ from core.app_settings import get_settings_store
 
 logger = logging.getLogger(__file__)
 
+ICA_INSPECT_MODE_VIEWER = "ICA Viewer"
+ICA_INSPECT_MODE_SOURCES = "ICA Sources"
+
 
 class ICAPlottingSettingsWidget(QWidget):
     """
@@ -89,6 +92,15 @@ class ICAPlottingSettingsWidget(QWidget):
         )
         plot_layout.addRow("PSD Limits: ", self.psd_input)
 
+        self.inspect_mode_input = QComboBox()
+        self.inspect_mode_input.addItems(
+            [ICA_INSPECT_MODE_VIEWER, ICA_INSPECT_MODE_SOURCES]
+        )
+        self.inspect_mode_input.setToolTip(
+            "Choose whether to open the full ICA viewer or the ICA sources plot."
+        )
+        plot_layout.addRow("Inspect Mode:", self.inspect_mode_input)
+
         self.plot_type_input = QComboBox()
         self.plot_type_input.addItems(["Overlay", "Side-by-side"])
         self.plot_type_input.setToolTip(
@@ -103,6 +115,7 @@ class ICAPlottingSettingsWidget(QWidget):
             "decimate": self.decimate_input.value(),
             "cmap": self.cmap_input.currentText(),
             "psd_flim": self.psd_input.value(),
+            "inspect_mode": self.inspect_mode_input.currentText(),
             "plot_type": self.plot_type_input.currentText(),
         }
 
@@ -113,6 +126,7 @@ class ICAPlottingSettingsWidget(QWidget):
             "decimate": 1,
             "cmap": "turbo",
             "psd_flim": (0.0, 80.0),
+            "inspect_mode": ICA_INSPECT_MODE_VIEWER,
             "plot_type": "Overlay",
         }
 
@@ -127,6 +141,9 @@ class ICAPlottingSettingsWidget(QWidget):
         self.decimate_input.setValue(params.get("decimate", 5))
         self.cmap_input.setCurrentText(params.get("cmap", "turbo"))
         self.psd_input.setValue(params.get("psd_flim"))
+        self.inspect_mode_input.setCurrentText(
+            params.get("inspect_mode", ICA_INSPECT_MODE_VIEWER)
+        )
         self.plot_type_input.setCurrentText(params.get("plot_type", "Overlay"))
 
     def save_settings(self):
@@ -163,6 +180,7 @@ class ICAPlottingDialog(QDialog):
 
     def accept(self):
         """Saves settings when the user clicks 'OK'."""
+        self.settings_widget.save_settings()
         super().accept()
 
     def get_settings(self):
@@ -603,6 +621,8 @@ class ICAViewer(QDialog):
         super().__init__(parent)
         self.ica = ica
         self.params = params
+        self.source_inst = inst.copy()
+        self._source_figures = []
         self.setModal(True)
         self.setWindowTitle("ICA Viewer")
         self.baseline = (None, 0)
@@ -682,6 +702,9 @@ class ICAViewer(QDialog):
 
         # Buttons
         button_box = QDialogButtonBox()
+        self.inspect_sources_button = button_box.addButton(
+            "Inspect Sources", QDialogButtonBox.ActionRole
+        )
         self.home_button = button_box.addButton("🏠 Home", QDialogButtonBox.ResetRole)
         self.accept_button = button_box.addButton(
             "✔ Accept", QDialogButtonBox.AcceptRole
@@ -689,6 +712,7 @@ class ICAViewer(QDialog):
         self.cancel_button = button_box.addButton(
             "✖ Cancel", QDialogButtonBox.RejectRole
         )
+        left_layout.addWidget(self.inspect_sources_button)
         left_layout.addWidget(self.home_button)
         left_layout.addStretch(1)
         left_layout.addWidget(self.accept_button)
@@ -731,6 +755,7 @@ class ICAViewer(QDialog):
         self.home_page.component_status_toggled.connect(
             self.toggle_component_status_from_click
         )
+        self.inspect_sources_button.clicked.connect(self.inspect_sources)
         self.home_button.clicked.connect(self.show_home_view)
         self.accept_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
@@ -876,6 +901,18 @@ class ICAViewer(QDialog):
                 target_list.scrollToItem(item)
                 break
 
+    def inspect_sources(self):
+        figure = open_ica_sources_view(self.ica, self.source_inst, self)
+        if figure is None:
+            return
+        self._source_figures.append(figure)
+        if hasattr(figure, "gotClosed"):
+            figure.gotClosed.connect(
+                lambda fig=figure: self._source_figures.remove(fig)
+                if fig in self._source_figures
+                else None
+            )
+
     def closeEvent(self, event):
         self.accept()
 
@@ -894,6 +931,12 @@ def run_ica_viewer(ica, inst, parent=None):
     else:
         return False
 
+    logger.info(f"Running ICA Viewer with parameters: {params}")
+    inspect_mode = params.get("inspect_mode", ICA_INSPECT_MODE_VIEWER)
+    if inspect_mode == ICA_INSPECT_MODE_SOURCES:
+        open_ica_sources_view(ica, inst, parent)
+        return False
+
     pixmap = QPixmap(get_path("assets/icon.png"))
     splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
     splash.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -903,13 +946,34 @@ def run_ica_viewer(ica, inst, parent=None):
         Qt.AlignCenter | Qt.AlignBottom,
         Qt.black,
     )
-    logger.info(f"Running ICA Viewer with parameters: {params}")
     dialog = ICAViewer(ica, inst, parent, **params)
     splash.finish(dialog)
     if dialog.exec():
         return dialog.ica
     else:
         return False
+
+
+def open_ica_sources_view(ica, inst, parent=None):
+    try:
+        source_inst = inst.copy()
+        if hasattr(source_inst, "preload") and not source_inst.preload:
+            Worker(
+                lambda: source_inst.load_data(), parent=parent
+            ).exec_with_dialog("Loading...", "Loading ICA source data...")
+
+        return ica.plot_sources(
+            source_inst,
+            block=False,
+            splash=False,
+        )
+    except Exception as exc:
+        QMessageBox.critical(
+            parent,
+            "ICA Sources Error",
+            f"Failed to open ICA sources: {exc}",
+        )
+        return None
 
 
 if __name__ == "__main__":

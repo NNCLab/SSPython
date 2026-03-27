@@ -1,6 +1,6 @@
 import logging
 import sys
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -35,6 +35,31 @@ from core.app_settings import get_settings_store
 logger = logging.getLogger(__name__)
 
 
+def _bounded_dialog_size(
+    hint: QSize,
+    *,
+    min_size: QSize,
+    max_size: QSize,
+    width_padding: int = 96,
+    height_padding: int = 120,
+) -> QSize:
+    width = min(max(hint.width() + width_padding, min_size.width()), max_size.width())
+    height = min(
+        max(hint.height() + height_padding, min_size.height()),
+        max_size.height(),
+    )
+    return QSize(width, height)
+
+
+def _selected_channels_button_text(
+    selected_channels: list[str], empty_text: str
+) -> str:
+    display_text = ", ".join(selected_channels)
+    if len(display_text) > 30:
+        return f"{len(selected_channels)} channels selected"
+    return display_text or empty_text
+
+
 # Channel Selection
 class ChannelSelectionDialog(QDialog):
     """A dialog to select channels from a list."""
@@ -47,7 +72,8 @@ class ChannelSelectionDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Select Custom Reference Channels")
-        self.resize(420, 520)
+        self.setMinimumSize(380, 340)
+        self.resize(420, 460)
         self.setObjectName("appDialog")
         layout = QVBoxLayout(self)
 
@@ -104,8 +130,6 @@ class BaseProcessingDialog(QDialog):
         self.preprocessor = preprocessor
         self.setWindowTitle(title)
         self.setModal(True)
-        self.resize(720, 620)
-        self.setMinimumSize(620, 480)
         self.setObjectName("appDialog")
         self.settings_widget = settings_widget
 
@@ -143,6 +167,26 @@ class BaseProcessingDialog(QDialog):
             self.reset_button.clicked.connect(self.settings_widget.load_settings)
         else:
             self.reset_button.hide()
+
+        self._apply_compact_size()
+
+    def _apply_compact_size(
+        self,
+        *,
+        min_size: QSize = QSize(520, 320),
+        max_size: QSize = QSize(760, 720),
+    ):
+        self.layout().activate()
+        self.adjustSize()
+        dialog_size = _bounded_dialog_size(
+            self.sizeHint(),
+            min_size=min_size,
+            max_size=max_size,
+            width_padding=40,
+            height_padding=32,
+        )
+        self.setMinimumSize(min_size)
+        self.resize(dialog_size)
 
     def run_process(self):
         """To be implemented by subclasses to perform the actual processing logic."""
@@ -435,7 +479,13 @@ class EpochingSettingsWidget(BaseSettingsWidget):
     def __init__(self, show_events_list=False, parent=None):
         super().__init__(parent)
         self.detrend_map = {"Constant (DC)": 0, "Linear": 1, "No detrend": None}
+        self.mode_map = {
+            "Event-based": "event",
+            "Fixed-length (Resting State)": "fixed",
+        }
         self.show_events_list = show_events_list
+        self.event_id_map: dict[str, int] = {}
+        self._pending_event_selection: dict[str, int] | list[int] | int | None = None
 
         layout = QVBoxLayout(self)
         self.init_form(layout)
@@ -463,12 +513,16 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         )
         self.detrend_combobox = QComboBox()
         self.detrend_combobox.addItems(list(self.detrend_map.keys()))
+        self.average_reference_checkbox = QCheckBox()
 
         epoching_layout.addRow("Notch (Hz):", self.notch_input)
         epoching_layout.addRow("Bandpass (low, high) Hz:", self.bandpass_input)
         epoching_layout.addRow("Detrend:", self.detrend_combobox)
         epoching_layout.addRow("Pick only EEG channels:", self.pick_eeg_only_checkbox)
         epoching_layout.addRow("Resample (Hz):", self.resample_edit)
+        epoching_layout.addRow(
+            "Apply average reference:", self.average_reference_checkbox
+        )
 
         # --- 3. Event-Based Specifics ---
         self.tlim_label = QLabel("Time Limits (tmin, tmax) ms:")
@@ -552,6 +606,34 @@ class EpochingSettingsWidget(BaseSettingsWidget):
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
             self.events_list.addItem(item)
+        self._apply_event_selection(self._pending_event_selection)
+
+    def _apply_event_selection(
+        self, selection: dict[str, int] | list[int] | int | None
+    ):
+        if self.events_list is None or self.events_list.count() == 0:
+            return
+
+        if selection is None:
+            for index in range(self.events_list.count()):
+                self.events_list.item(index).setCheckState(Qt.Checked)
+            return
+
+        if isinstance(selection, dict):
+            selected_ids = {int(value) for value in selection.values()}
+        elif isinstance(selection, (list, tuple, set)):
+            selected_ids = {int(value) for value in selection}
+        else:
+            selected_ids = {int(selection)}
+
+        for index in range(self.events_list.count()):
+            item = self.events_list.item(index)
+            event_id = self.event_id_map.get(item.text())
+            item.setCheckState(
+                Qt.Checked
+                if event_id in selected_ids
+                else Qt.Unchecked
+            )
 
     def get_event_selection(self):
         if (
@@ -561,17 +643,17 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         ):
             return None  # Return empty if hidden
 
-        selected_events = []
+        selected_events: dict[str, int] = {}
         for i in range(self.events_list.count()):
             item = self.events_list.item(i)
             if item.checkState() == Qt.Checked:
                 event_description = item.text()
-                selected_events.append(self.event_id_map[event_description])
-        return selected_events
+                selected_events[event_description] = self.event_id_map[event_description]
+        return selected_events or None
 
     def get_defaults(self) -> dict:
         return {
-            "mode": "Event-based",
+            "mode": "event",
             "resample": None,
             "tlim": (-0.800, 0.800),
             "fixed_duration": 2.0,
@@ -581,10 +663,20 @@ class EpochingSettingsWidget(BaseSettingsWidget):
             "notch": None,
             "bandpass": (0.5, None),
             "pick_eeg_only": True,
+            "reference": None,
         }
 
     def set_params(self, params: dict):
-        self.mode_combobox.setCurrentText(params["mode"])
+        mode = params.get("mode", "event")
+        display_mode = next(
+            (
+                label
+                for label, value in self.mode_map.items()
+                if mode in {label, value}
+            ),
+            "Event-based",
+        )
+        self.mode_combobox.setCurrentText(display_mode)
         self.resample_edit.setText(to_display_string(params.get("resample")))
         self.tlim_edit.setValue(params.get("tlim"))
         self.fixed_dur_edit.setText(to_display_string(params.get("fixed_duration")))
@@ -600,13 +692,19 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         self.pick_eeg_only_checkbox.setChecked(params.get("pick_eeg_only"))
         self.notch_input.setText(to_display_string(params.get("notch")))
         self.bandpass_input.setValue(params.get("bandpass"))
+        self.average_reference_checkbox.setChecked(
+            params.get("reference") == "average"
+        )
+        self._pending_event_selection = params.get("event_id")
+        self._apply_event_selection(self._pending_event_selection)
 
     def get_params(self) -> dict:
         mode = self.mode_combobox.currentText()
-        is_fixed = mode == "Fixed-length (Resting State)"
+        mode_value = self.mode_map[mode]
+        is_fixed = mode_value == "fixed"
 
         return {
-            "mode": "fixed" if is_fixed else "event",
+            "mode": mode_value,
             # Event based params
             "event_id": self.get_event_selection() if not is_fixed else None,
             "tlim": self.tlim_edit.value() if not is_fixed else None,
@@ -623,6 +721,9 @@ class EpochingSettingsWidget(BaseSettingsWidget):
             "pick_eeg_only": self.pick_eeg_only_checkbox.isChecked(),
             "notch": parse_numeric(self.notch_input.text()),
             "bandpass": self.bandpass_input.value(),
+            "reference": (
+                "average" if self.average_reference_checkbox.isChecked() else None
+            ),
         }
 
 
@@ -630,7 +731,6 @@ class EpochingDialog(BaseProcessingDialog):
     def __init__(self, preprocessor, parent=None):
         settings_widget = EpochingSettingsWidget(show_events_list=True)
         super().__init__(preprocessor, "Epoch Segmentation", settings_widget, parent)
-        self.resize(450, 600)  # Slightly taller
 
         # Populate events if raw data exists
         if self.preprocessor.has("raw"):
@@ -638,6 +738,10 @@ class EpochingDialog(BaseProcessingDialog):
             # Force a visibility refresh after populating data
             current_mode = self.settings_widget.mode_combobox.currentText()
             self.settings_widget.update_ui_visibility(current_mode)
+        self._apply_compact_size(
+            min_size=QSize(560, 380),
+            max_size=QSize(760, 700),
+        )
 
     def run_process(self):
         try:
@@ -692,7 +796,7 @@ class ReReferenceSettingsWidget(BaseSettingsWidget):
         ref_group = QGroupBox("Reference")
         ref_layout = QVBoxLayout(ref_group)
         self.average_ref_radio = QRadioButton("Average of all channels")
-        self.no_ref_radio = QRadioButton("No re-referencing")
+        self.no_ref_radio = QRadioButton("Keep current reference")
 
         custom_ref_layout = QHBoxLayout()
         self.custom_ref_radio = QRadioButton("Custom channel(s):")
@@ -717,14 +821,15 @@ class ReReferenceSettingsWidget(BaseSettingsWidget):
         )
         if dialog.exec():
             self._selected_ref_channels = dialog.get_selected_channels()
-            display_text = ", ".join(self._selected_ref_channels)
-            if len(display_text) > 30:
-                display_text = f"{len(self._selected_ref_channels)} channels selected"
-            self.select_channels_button.setText(display_text or "Select Channels...")
+            self.select_channels_button.setText(
+                _selected_channels_button_text(
+                    self._selected_ref_channels, "Select Channels..."
+                )
+            )
 
     def get_defaults(self) -> dict:
         return {
-            "reference": "average",
+            "reference": None,
         }
 
     def set_params(self, params: dict):
@@ -734,7 +839,11 @@ class ReReferenceSettingsWidget(BaseSettingsWidget):
         elif isinstance(reference, list):
             self.custom_ref_radio.setChecked(True)
             self._selected_ref_channels = reference
-            self.show_ref_channel_selection_dialog()
+            self.select_channels_button.setText(
+                _selected_channels_button_text(
+                    self._selected_ref_channels, "Select Channels..."
+                )
+            )
         else:
             self.no_ref_radio.setChecked(True)
 
@@ -829,7 +938,7 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
         ref_group = QGroupBox("Reference")
         ref_layout = QVBoxLayout(ref_group)
         self.average_ref_radio = QRadioButton("Average of all channels")
-        self.no_ref_radio = QRadioButton("No re-referencing")
+        self.no_ref_radio = QRadioButton("Keep current reference")
 
         custom_ref_layout = QHBoxLayout()
         self.custom_ref_radio = QRadioButton("Custom channel(s):")
@@ -877,13 +986,13 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
         dialog = EvokedPlotDialog(parent=self)
         if self.preprocessor.has("epochs_ica"):
             logger.info(f"Applying ICA to epochs data...")
-            evoked = self.preprocessor.epochs_ica.apply(
+            epochs = self.preprocessor.epochs_ica.apply(
                 self.preprocessor.epochs.load_data().copy()
-            ).average()
+            )
         else:
-            logger.info(f"Averaging epochs data...")
-            evoked = self.preprocessor.epochs.average()
-        dialog.update_plot(evoked, label=self.preprocessor.label)
+            logger.info(f"Preparing epochs data...")
+            epochs = self.preprocessor.epochs.copy()
+        dialog.update_plot(epochs, label=self.preprocessor.label)
         dialog.exec()
 
     def show_bad_channel_selection(self):
@@ -892,11 +1001,10 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
         )
         if dialog.exec():
             self._selected_bad_channels = dialog.get_selected_channels()
-            display_text = ", ".join(self._selected_bad_channels)
-            if len(display_text) > 30:
-                display_text = f"{len(self._selected_bad_channels)} channels selected"
             self.select_bad_channels_button.setText(
-                display_text or "Extra Bad Channels..."
+                _selected_channels_button_text(
+                    self._selected_bad_channels, "Extra Bad Channels..."
+                )
             )
 
     def show_ref_channel_selection_dialog(self):
@@ -905,11 +1013,10 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
         )
         if dialog.exec():
             self._selected_ref_channels = dialog.get_selected_channels()
-            display_text = ", ".join(self._selected_ref_channels)
-            if len(display_text) > 30:
-                display_text = f"{len(self._selected_ref_channels)} channels selected"
             self.select_ref_channels_button.setText(
-                display_text or "Select Channels..."
+                _selected_channels_button_text(
+                    self._selected_ref_channels, "Select Channels..."
+                )
             )
 
     def get_defaults(self) -> dict:
@@ -917,7 +1024,7 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
             "bads": None,
             "bandpass": (1, 80),
             "interpolate_bad_channels": True,
-            "reference": "average",
+            "reference": None,
             "resample": None,
             "baseline": (None, 0),
         }
@@ -936,7 +1043,11 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
         elif isinstance(reference, list):
             self.custom_ref_radio.setChecked(True)
             self._selected_ref_channels = reference
-            self.show_channel_selection_dialog()  # Re-call to update button text
+            self.select_ref_channels_button.setText(
+                _selected_channels_button_text(
+                    self._selected_ref_channels, "Select Channels..."
+                )
+            )
         else:
             self.no_ref_radio.setChecked(True)
 
@@ -974,9 +1085,9 @@ class ApplyPreprocessingDialog(BaseProcessingDialog):
         super().__init__(preprocessor, "Apply Preprocessing", settings_widget, parent)
 
         if preprocessor.epochs.proj:
+            self.settings_widget.average_ref_radio.setEnabled(False)
             self.settings_widget.custom_ref_radio.setEnabled(False)
             self.settings_widget.select_ref_channels_button.setEnabled(False)
-            self.settings_widget.average_ref_radio.setEnabled(False)
             self.settings_widget.no_ref_radio.setEnabled(False)
             self.settings_widget.no_ref_radio.setChecked(True)
 

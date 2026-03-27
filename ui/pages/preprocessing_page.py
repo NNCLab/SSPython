@@ -107,11 +107,9 @@ class ProcessingPage(BasePage):
 
         second_actions = QVBoxLayout()
         self.run_continuous_ica_button = QPushButton("Run Continuous ICA")
-        self.inspect_continuous_ica_sources_button = QPushButton("Inspect ICA Sources")
         self.inspect_continuous_ica_button = QPushButton("Inspect Continuous ICA")
         for button in (
             self.run_continuous_ica_button,
-            self.inspect_continuous_ica_sources_button,
             self.inspect_continuous_ica_button,
         ):
             second_actions.addWidget(button)
@@ -175,7 +173,6 @@ class ProcessingPage(BasePage):
         self.artifact_removal_button.clicked.connect(self.artifact_removal)
         self.filter_continuous_button.clicked.connect(self.filter_continuous)
         self.run_continuous_ica_button.clicked.connect(self.run_continuous_ica)
-        self.inspect_continuous_ica_sources_button.clicked.connect(self.inspect_continuous_ica_sources)
         self.inspect_continuous_ica_button.clicked.connect(self.inspect_continuous_ica)
         self.segment_button.clicked.connect(self.segment_epochs)
 
@@ -192,7 +189,6 @@ class ProcessingPage(BasePage):
             self.artifact_removal_button: {"stage_id": "filtered_raw", "role": "process"},
             self.filter_continuous_button: {"stage_id": "filtered_raw", "role": "process"},
             self.run_continuous_ica_button: {"stage_id": "continuous_ica", "role": "process"},
-            self.inspect_continuous_ica_sources_button: {"stage_id": "continuous_ica", "role": "inspect"},
             self.inspect_continuous_ica_button: {"stage_id": "continuous_ica", "role": "inspect"},
             self.segment_button: {"stage_id": "epochs", "role": "process"},
             self.plot_raw_evoked_button: {"stage_id": "epochs", "role": "inspect"},
@@ -361,7 +357,6 @@ class ProcessingPage(BasePage):
             self.filter_continuous_button: has_raw,
             self.segment_button: has_raw,
             self.run_continuous_ica_button: has_raw,
-            self.inspect_continuous_ica_sources_button: has_continuous_ica,
             self.inspect_continuous_ica_button: has_continuous_ica,
             self.plot_raw_evoked_button: has_epochs,
             self.inspect_epochs_button: has_epochs,
@@ -377,7 +372,7 @@ class ProcessingPage(BasePage):
         self.plot_widget.setVisible(has_preprocessed)
         if has_preprocessed and self.preprocessor.preprocessed is not None:
             self.plot_widget.update_plot(
-                self.preprocessor.preprocessed.average(),
+                self.preprocessor.preprocessed,
                 label=self.preprocessor.label,
             )
         else:
@@ -423,16 +418,6 @@ class ProcessingPage(BasePage):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._refresh_after_step()
 
-    def inspect_continuous_ica_sources(self):
-        if not self.preprocessor or not self.preprocessor.has("continuous_ica"):
-            return
-        figure = self.preprocessor.continuous_ica.plot_sources(
-            self.preprocessor._get_last_continuous().load_data(),
-            block=False,
-            splash=False,
-        )
-        figure.gotClosed.connect(lambda: self.update_ui_state())
-
     def inspect_continuous_ica(self):
         if not self.preprocessor or not self.preprocessor.has("continuous_ica"):
             return
@@ -460,14 +445,18 @@ class ProcessingPage(BasePage):
             return
 
         try:
-            evoked = self.preprocessor.epochs.average().pick(
-                [
-                    channel
-                    for channel in self.preprocessor.epochs.ch_names
-                    if channel not in self.preprocessor.epochs.info["bads"]
-                ]
+            good_channels = [
+                channel
+                for channel in self.preprocessor.epochs.ch_names
+                if channel not in self.preprocessor.epochs.info["bads"]
+            ]
+            epochs = self.preprocessor.epochs.copy()
+            if good_channels:
+                epochs.pick(good_channels)
+            self.raw_evoked_plot_widget.update_plot(
+                epochs,
+                label=f"<b>{self.preprocessor.label}</b>",
             )
-            self.raw_evoked_plot_widget.update_plot(evoked, label=f"<b>{self.preprocessor.label}</b>")
             self.raw_evoked_plot_widget.activateWindow()
         except Exception as exc:
             QMessageBox.critical(self, "Plotting Error", f"An error occurred while plotting: {exc}")

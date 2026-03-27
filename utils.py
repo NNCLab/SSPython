@@ -15,11 +15,6 @@ import traceback
 from typing import Any, Optional, Tuple, Type, Callable
 import matplotlib.pyplot as plt
 
-try:
-    import pyqtgraph as pg
-except ImportError:  # pragma: no cover - optional at import time
-    pg = None
-
 from core.app_settings import get_settings_store
 
 logging.basicConfig(level=logging.INFO)
@@ -86,15 +81,6 @@ def theme_tokens(theme: str | None = None) -> dict[str, str]:
     return dict(THEME_TOKENS.get(theme_name, THEME_TOKENS["dark"]))
 
 
-def apply_pyqtgraph_theme(theme: str | None = None):
-    if pg is None:
-        return
-
-    tokens = theme_tokens(theme)
-    pg.setConfigOption("background", tokens["plot_background"])
-    pg.setConfigOption("foreground", tokens["plot_foreground"])
-
-
 @lru_cache(maxsize=64)
 def _render_svg_pixmap(svg_path: str, color_hex: str, width: int, height: int) -> QPixmap:
     svg_text = Path(svg_path).read_text(encoding="utf-8")
@@ -154,8 +140,6 @@ def apply_theme(theme: str | None = None):
         settings_store.set("theme", theme)
     except FileNotFoundError:
         logger.warning(f"Stylesheet not found at: {qss_path}")
-
-    apply_pyqtgraph_theme(theme)
 
     # Apply a corresponding matplotlib style
     mpl_style = "dark_background" if theme == "dark" else "default"

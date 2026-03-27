@@ -1,8 +1,14 @@
 import unittest
 import mne
 import numpy as np
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QListWidgetItem
 from main import MainWindow
+from ui.widgets.evoked_plot import EvokedPlotWidget
+from ui.widgets.preprocessing_widgets import (
+    EpochingSettingsWidget,
+    PreprocessingSettingsWidget,
+)
 from ui.widgets.tools.object_info_widget import ObjectInfoWidget, extract_event_counts
 from ui.widgets.real_time_widget import (
     ConnectionWidget,
@@ -171,7 +177,105 @@ class TestUI(unittest.TestCase):
             widget.channel_table.horizontalHeaderItem(i).text()
             for i in range(widget.channel_table.columnCount())
         ]
-        self.assertEqual(headers, ["Enabled", "Name", "Type"])
+        self.assertEqual(headers, ["Enabled", "Name", "Type", ""])
+        self.assertEqual(widget.channel_table.columnCount(), 4)
+        widget.close()
+
+    def test_epoching_settings_preserve_selected_event_mapping(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = EpochingSettingsWidget(show_events_list=True)
+        widget.event_id_map = {"Pulse": 7, "Sham": 42}
+        widget.events_list.clear()
+        for label in ("Pulse", "Sham"):
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            widget.events_list.addItem(item)
+        widget.show()
+        app.processEvents()
+        widget.events_list.item(1).setCheckState(Qt.CheckState.Unchecked)
+        self.assertEqual(widget.get_event_selection(), {"Pulse": 7})
+        widget.close()
+
+    def test_evoked_plot_widget_rebuilds_axes_cleanly_on_update(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        montage = mne.channels.make_standard_montage("standard_1020")
+        ch_names = montage.ch_names[:8]
+        info = mne.create_info(ch_names=ch_names, sfreq=1000, ch_types="eeg")
+        info.set_montage(montage)
+        evoked = mne.EvokedArray(
+            np.random.randn(len(ch_names), 300) * 1e-6,
+            info,
+            tmin=-0.1,
+            verbose=False,
+        )
+
+        widget = EvokedPlotWidget()
+        widget.update_plot(evoked, label="Test")
+        first_axes_count = len(widget.canvas.figure.axes)
+        widget.update_plot(evoked, label="Test")
+        second_axes_count = len(widget.canvas.figure.axes)
+
+        self.assertEqual(second_axes_count, first_axes_count)
+        widget.close()
+
+    def test_evoked_plot_widget_exposes_event_selector_for_epochs(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        montage = mne.channels.make_standard_montage("standard_1020")
+        ch_names = montage.ch_names[:8]
+        info = mne.create_info(ch_names=ch_names, sfreq=1000, ch_types="eeg")
+        info.set_montage(montage)
+        data = np.random.randn(6, len(ch_names), 300) * 1e-6
+        events = np.array(
+            [
+                [0, 0, 1],
+                [400, 0, 2],
+                [800, 0, 1],
+                [1200, 0, 2],
+                [1600, 0, 1],
+                [2000, 0, 2],
+            ]
+        )
+        epochs = mne.EpochsArray(
+            data,
+            info,
+            events=events,
+            event_id={"Pulse": 1, "Sham": 2},
+            tmin=-0.1,
+            verbose=False,
+        )
+
+        widget = EvokedPlotWidget()
+        widget.update_plot(epochs, label="Test")
+        self.assertEqual(widget.event_selector.count(), 3)
+        self.assertIsNone(widget.event_selector.currentData())
+
+        widget.event_selector.setCurrentIndex(widget.event_selector.findData("Sham"))
+        app.processEvents()
+
+        self.assertEqual(widget.selected_event_name, "Sham")
+        self.assertIn("Sham", widget.title_label.text())
+        widget.close()
+
+    def test_preprocessing_settings_widget_supports_average_reference(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = PreprocessingSettingsWidget()
+        widget.set_params(widget.get_defaults() | {"reference": "average"})
+
+        self.assertTrue(widget.average_ref_radio.isChecked())
+        self.assertEqual(widget.get_params()["reference"], "average")
         widget.close()
 
 if __name__ == '__main__':

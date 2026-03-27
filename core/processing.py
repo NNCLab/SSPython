@@ -481,7 +481,7 @@ class Preprocessor:
         mode: str = "event",  # New parameter: 'event' or 'fixed'
         fixed_duration: float | None = None,  # New parameter
         fixed_overlap: float = 0.0,  # New parameter
-        event_id: dict | None = None,
+        event_id: dict | list[int] | int | None = None,
         detrend: (
             int | None
         ) = None,  # Changed type to int per your GUI map (0 or 1) or None
@@ -587,13 +587,17 @@ class Preprocessor:
                     "No annotations found in Raw data for event-based epoching."
                 )
 
-            events, _ = mne.events_from_annotations(raw)
+            events, annotation_event_map = mne.events_from_annotations(raw)
+            resolved_event_id = self._resolve_annotation_event_id(
+                annotation_event_map,
+                event_id,
+            )
 
             logger.info(f"Creating event-based epochs: {tlim}")
             epochs = mne.Epochs(
                 raw,
                 events=events,
-                event_id=event_id,
+                event_id=resolved_event_id,
                 tmin=tlim[0],
                 tmax=tlim[1],
                 picks="eeg" if pick_eeg_only else None,
@@ -616,7 +620,9 @@ class Preprocessor:
                 "epoching": {
                     "mode": mode,
                     "continuous_ica": self.has("continuous_ica"),
-                    "event_id": event_id if mode == "event" else "N/A",
+                    "event_id": (
+                        resolved_event_id if mode == "event" else "N/A"
+                    ),
                     "tlim": tlim if mode == "event" else "N/A",
                     "fixed_duration": fixed_duration if mode == "fixed" else "N/A",
                     "fixed_overlap": fixed_overlap if mode == "fixed" else "N/A",
@@ -633,6 +639,39 @@ class Preprocessor:
         logger.info("Saving epochs...")
         epochs.save(self.paths["epochs"], overwrite=True, verbose=verbose)
         self._epochs = epochs
+
+    @staticmethod
+    def _resolve_annotation_event_id(
+        annotation_event_map: dict[str, int],
+        selected_event_id: dict[str, int] | list[int] | int | None,
+    ) -> dict[str, int] | int | None:
+        if selected_event_id is None:
+            return annotation_event_map or None
+
+        if isinstance(selected_event_id, dict):
+            resolved_map = {}
+            for label, code in selected_event_id.items():
+                label = str(label)
+                resolved_map[label] = int(annotation_event_map.get(label, code))
+            return resolved_map
+
+        if isinstance(selected_event_id, (list, tuple, set, np.ndarray)):
+            selected_codes = {
+                int(code) for code in selected_event_id if code is not None
+            }
+        else:
+            selected_codes = {int(selected_event_id)}
+
+        resolved_map = {
+            label: int(code)
+            for label, code in annotation_event_map.items()
+            if int(code) in selected_codes
+        }
+        if resolved_map:
+            return resolved_map
+        if len(selected_codes) == 1:
+            return next(iter(selected_codes))
+        return {str(code): int(code) for code in sorted(selected_codes)}
 
     def update_epochs(self, epochs: mne.Epochs):
         self._clear_downstream_files("epochs")

@@ -34,6 +34,9 @@ from ui.widgets.tools.qss_helper import QSSEditorDialog
 from ui.widgets.workspace_panel import DatasetInspectorPanel, WorkspacePanel
 from utils import apply_theme, get_path, themed_svg_icon, toggle_theme as toggle_app_theme
 
+import os
+os.environ["MNE_FORCE_EAGER"] = "1"
+
 APP_NAME = "SSPython"
 ORGANIZATION_NAME = "SSPython"
 

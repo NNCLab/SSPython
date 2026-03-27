@@ -1,5 +1,7 @@
 import logging
 
+import mne
+
 from PySide6.QtCore import Slot
 from PySide6.QtWidgets import QGroupBox, QLabel, QPushButton, QVBoxLayout
 
@@ -141,7 +143,7 @@ class ErpAnalysisPage(BasePage):
         has_data = self.tep is not None and self.tep.epochs is not None
         if has_data:
             self.epochs_info_widget.update_info(self.tep.epochs, "Preprocessed epochs")
-            self.evoked_plot_widget.update_plot(self.tep.evoked, self.tep.label)
+            self.evoked_plot_widget.update_plot(self.tep.epochs, self.tep.label)
         else:
             self.epochs_info_widget.clear_info()
             self.evoked_plot_widget.update_plot(None)
@@ -161,9 +163,27 @@ class ErpAnalysisPage(BasePage):
     def topoplot(self):
         if not self.tep:
             return
-        figure = self.tep.evoked.copy().apply_baseline().plot_topo(title=self.tep.label)
-        for line in figure.axes[0].lines:
-            line.set_linewidth(1.25)
+        event_names = list(self.tep.epochs.event_id.keys()) if self.tep.epochs.event_id else []
+        if len(event_names) > 1:
+            evokeds = [
+                self.tep.epochs[event_name].average().apply_baseline()
+                for event_name in event_names
+            ]
+            colors = [f"C{index % 10}" for index in range(len(evokeds))]
+            figure = mne.viz.plot_evoked_topo(
+                evokeds,
+                color=colors,
+                title=self.tep.label,
+                legend=True,
+                show=True,
+            )
+        else:
+            figure = self.tep.evoked.copy().apply_baseline().plot_topo(
+                title=self.tep.label
+            )
+        for axes in figure.axes:
+            for line in axes.lines:
+                line.set_linewidth(1.25)
 
     def run_excitability(self):
         if not self.tep:
