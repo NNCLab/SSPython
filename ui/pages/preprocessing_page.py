@@ -445,16 +445,8 @@ class ProcessingPage(BasePage):
             return
 
         try:
-            good_channels = [
-                channel
-                for channel in self.preprocessor.epochs.ch_names
-                if channel not in self.preprocessor.epochs.info["bads"]
-            ]
-            epochs = self.preprocessor.epochs.copy()
-            if good_channels:
-                epochs.pick(good_channels)
             self.raw_evoked_plot_widget.update_plot(
-                epochs,
+                self.preprocessor.epochs,
                 label=f"<b>{self.preprocessor.label}</b>",
             )
             self.raw_evoked_plot_widget.activateWindow()

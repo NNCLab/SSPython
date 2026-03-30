@@ -732,7 +732,7 @@ class Preprocessor:
         if "(extended)" in method:
             method = method.replace(" (extended)", "").strip()
             fit_params = dict(extended=True)
-
+        pbar = tqdm(total=0, desc="Fitting ICA...", disable=not verbose)
         ica = mne.preprocessing.ICA(
             n_components=n_components,
             random_state=random_state,

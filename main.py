@@ -28,8 +28,7 @@ from ui.pages.home_page import HomePage
 from ui.pages.preferences_page import PreferencesPage
 from ui.pages.preprocessing_page import ProcessingPage
 from ui.pages.real_time_page import RealTimePage
-from ui.widgets.tools.convert_brainamp import BrainampConverter
-from ui.widgets.tools.convert_gtec import GtecConverter
+from ui.widgets.tools.conversion_tool import ConversionToolDialog
 from ui.widgets.tools.qss_helper import QSSEditorDialog
 from ui.widgets.workspace_panel import DatasetInspectorPanel, WorkspacePanel
 from utils import apply_theme, get_path, themed_svg_icon, toggle_theme as toggle_app_theme
@@ -193,8 +192,7 @@ class MainWindow(QMainWindow):
         file_menu = menu_bar.addMenu("&File")
         self._add_action(file_menu, "Open Workspace", self.workspace_panel.select_folder, "Ctrl+O")
         file_menu.addSeparator()
-        self._add_action(file_menu, "Convert Brainamp data", self._convert_brainamp_data)
-        self._add_action(file_menu, "Convert gTEC data", self._convert_gtec_data)
+        self._add_action(file_menu, "Convert / Merge EEG data", self._open_conversion_tool)
         file_menu.addSeparator()
         self._add_action(file_menu, "Exit", self.close)
 
@@ -433,13 +431,8 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     @Slot()
-    def _convert_brainamp_data(self):
-        dialog = BrainampConverter(self)
-        dialog.exec()
-
-    @Slot()
-    def _convert_gtec_data(self):
-        dialog = GtecConverter(self)
+    def _open_conversion_tool(self):
+        dialog = ConversionToolDialog(self)
         dialog.exec()
 
     def _open_qss_dialog(self):

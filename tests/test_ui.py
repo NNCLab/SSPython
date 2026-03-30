@@ -257,12 +257,13 @@ class TestUI(unittest.TestCase):
         widget = EvokedPlotWidget()
         widget.update_plot(epochs, label="Test")
         self.assertEqual(widget.event_selector.count(), 3)
-        self.assertIsNone(widget.event_selector.currentData())
+        self.assertEqual(widget.event_selector.currentData()["code"], None)
 
-        widget.event_selector.setCurrentIndex(widget.event_selector.findData("Sham"))
+        widget.event_selector.setCurrentIndex(2)
         app.processEvents()
 
-        self.assertEqual(widget.selected_event_name, "Sham")
+        self.assertEqual(widget.selected_event_code, 2)
+        self.assertEqual(widget.selected_event_label, "Sham")
         self.assertIn("Sham", widget.title_label.text())
         widget.close()
 

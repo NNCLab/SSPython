@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QSignalBlocker
+from PySide6.QtCore import Qt, Signal, QSignalBlocker
 import time
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -122,9 +122,12 @@ class EvokedPlotWidget(QWidget):
         self.evoked = None
         self.display_evoked = None
         self.evoked_lines = []
+        self.line_channel_names = {}
         self.zero_line = None
         self.label = None
-        self.selected_event_name = None
+        self.selected_event_code = None
+        self.selected_event_label = None
+        self.selected_channel_name = None
         self.open_topomaps = []
 
         self.setMinimumSize(400, 500)
@@ -143,8 +146,10 @@ class EvokedPlotWidget(QWidget):
         self.event_selector.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents
         )
+        self.channel_label = QLabel()
         self.event_label.hide()
         self.event_selector.hide()
+        self.channel_label.hide()
 
         self.topbar = QToolBar()
         self.topbar.setMovable(False)
@@ -152,6 +157,7 @@ class EvokedPlotWidget(QWidget):
         self.topbar.addWidget(self.reference_widget)
         self.topbar.addWidget(self.event_label)
         self.topbar.addWidget(self.event_selector)
+        self.topbar.addWidget(self.channel_label)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.topbar.addWidget(spacer)
@@ -174,11 +180,11 @@ class EvokedPlotWidget(QWidget):
         self.drag_press_event = None
         self.drag_active = False
         self.drag_threshold_px = 6
-        self.picked_artists_in_click = []
         self.original_zorders = {}
         self.ch_names = []
         self.evoked = None
         self.drag_span = None
+        self.click_tolerance_px = 12
         self.throttle_interval = 0.04  # (0.04s ≈ 25 FPS)
         self.last_update_time = 0
 
@@ -202,13 +208,14 @@ class EvokedPlotWidget(QWidget):
     def _reset_canvas(self):
         self.canvas.reset_axes()
         self.evoked_lines = []
+        self.line_channel_names = {}
         self.zero_line = None
         self.original_zorders = {}
         self.drag_start_coords = None
         self.drag_press_event = None
         self.drag_active = False
-        self.picked_artists_in_click.clear()
         self.drag_span = None
+        self._set_selected_channel(None)
 
     def _set_event_selector_visible(self, visible: bool):
         self.event_label.setVisible(visible)
@@ -218,44 +225,60 @@ class EvokedPlotWidget(QWidget):
         blocker = QSignalBlocker(self.event_selector)
         self.event_selector.clear()
         del blocker
-        self.selected_event_name = None
+        self.selected_event_code = None
+        self.selected_event_label = None
         self._set_event_selector_visible(False)
 
     def _populate_event_selector(self, epochs: mne.BaseEpochs):
-        event_names = list(epochs.event_id.keys()) if epochs.event_id else []
-        if not event_names:
+        if epochs.events is None or len(epochs.events) == 0:
             self._clear_event_selector()
             return
 
-        preferred_event = (
-            self.selected_event_name if self.selected_event_name in event_names else None
-        )
-        counts = {
-            event_name: int(np.sum(epochs.events[:, 2] == event_code))
-            for event_name, event_code in epochs.event_id.items()
-        }
+        names_by_code = {}
+        for event_name, event_code in (epochs.event_id or {}).items():
+            names_by_code.setdefault(int(event_code), []).append(str(event_name))
+
+        event_options = [{"label": "All events", "code": None, "title": None}]
+        for event_code in sorted({int(code) for code in epochs.events[:, 2]}):
+            names = names_by_code.get(event_code, [])
+            if len(names) == 1 and names[0].isdigit() and int(names[0]) == event_code:
+                event_label = f"Event {event_code}"
+            elif names:
+                event_label = " / ".join(names)
+            else:
+                event_label = f"Event {event_code}"
+            count = int(np.sum(epochs.events[:, 2] == event_code))
+            event_options.append(
+                {
+                    "label": f"{event_label} ({count})",
+                    "code": event_code,
+                    "title": event_label,
+                }
+            )
 
         blocker = QSignalBlocker(self.event_selector)
         self.event_selector.clear()
-        if len(event_names) > 1:
-            self.event_selector.addItem("All events", None)
-        for event_name in event_names:
-            self.event_selector.addItem(
-                f"{event_name} ({counts.get(event_name, 0)})",
-                event_name,
-            )
-
-        if preferred_event is not None:
-            index = self.event_selector.findData(preferred_event)
-            if index >= 0:
-                self.event_selector.setCurrentIndex(index)
-        else:
-            self.event_selector.setCurrentIndex(0)
+        preferred_index = 0
+        for index, option in enumerate(event_options):
+            self.event_selector.addItem(option["label"], option)
+            if option["code"] == self.selected_event_code:
+                preferred_index = index
+        self.event_selector.setCurrentIndex(preferred_index)
         del blocker
 
-        self.selected_event_name = self.event_selector.currentData()
+        self._sync_selected_event_from_selector()
         self._set_event_selector_visible(True)
-        self.event_selector.setEnabled(self.event_selector.count() > 1)
+        self.event_selector.setEnabled(self.event_selector.count() > 0)
+
+    def _sync_selected_event_from_selector(self):
+        selected_option = self.event_selector.currentData()
+        if not selected_option:
+            self.selected_event_code = None
+            self.selected_event_label = None
+            return
+
+        self.selected_event_code = selected_option.get("code")
+        self.selected_event_label = selected_option.get("title")
 
     def _get_epochs_for_display(self, epochs: mne.BaseEpochs) -> mne.BaseEpochs:
         display_epochs = epochs.copy()
@@ -264,10 +287,15 @@ class EvokedPlotWidget(QWidget):
             for channel in display_epochs.ch_names
             if channel not in display_epochs.info["bads"]
         ]
-        if good_channels:
+        if good_channels and len(good_channels) != len(display_epochs.ch_names):
+            if not display_epochs.preload:
+                display_epochs.load_data()
             display_epochs.pick(good_channels)
-        if self.selected_event_name:
-            display_epochs = display_epochs[self.selected_event_name]
+        if self.selected_event_code is not None:
+            selected_indices = np.flatnonzero(
+                display_epochs.events[:, 2] == self.selected_event_code
+            )
+            display_epochs = display_epochs[selected_indices]
         return display_epochs
 
     def _resolve_current_evoked(self) -> mne.Evoked | None:
@@ -276,15 +304,27 @@ class EvokedPlotWidget(QWidget):
         if isinstance(self.source_data, mne.Evoked):
             return self.source_data
         if isinstance(self.source_data, mne.BaseEpochs):
-            return self._get_epochs_for_display(self.source_data).average()
+            display_epochs = self._get_epochs_for_display(self.source_data)
+            if len(display_epochs) == 0:
+                return None
+            return display_epochs.average()
         return None
 
     def _build_title_text(self) -> str:
         base_label = self.label or "Evoked Potential Plot"
         if self.epochs is None:
             return base_label
-        event_label = self.selected_event_name or "All events"
+        event_label = self.selected_event_label or "All events"
         return f"{base_label} - {event_label}"
+
+    def _set_selected_channel(self, channel_name: str | None):
+        self.selected_channel_name = channel_name
+        if channel_name:
+            self.channel_label.setText(f"Channel: {channel_name}")
+            self.channel_label.show()
+        else:
+            self.channel_label.clear()
+            self.channel_label.hide()
 
     def _prepare_display_evoked(self, evoked: mne.Evoked) -> mne.Evoked:
         display_evoked = evoked.copy()
@@ -345,18 +385,20 @@ class EvokedPlotWidget(QWidget):
     def _register_evoked_lines(self, evoked: mne.Evoked):
         stds = np.std(evoked.data, axis=1)
         z_order_indices = np.argsort(stds)
-        self.evoked_lines = list(self.canvas.axes.get_lines())
+        self.evoked_lines = list(self.canvas.axes.get_lines())[: len(evoked.ch_names)]
         self.original_zorders = {}
+        self.line_channel_names = {}
 
         for i, line in enumerate(self.evoked_lines):
             if i >= len(z_order_indices):
                 break
             z_order = int(z_order_indices[i])
+            channel_name = evoked.ch_names[i]
             line.set_zorder(z_order)
-            line.set_picker(5)
             line.set_linewidth(1.5)
-            line.set_label(self.ch_names[i])
+            line.set_label(channel_name)
             self.original_zorders[line] = z_order
+            self.line_channel_names[line] = channel_name
 
     def _add_zero_line(self):
         self.zero_line = self.canvas.axes.axvline(
@@ -370,6 +412,7 @@ class EvokedPlotWidget(QWidget):
     def _show_empty_state(self):
         self.evoked = None
         self.display_evoked = None
+        self._set_selected_channel(None)
         self.title_label.setText("No Data Available")
         self.toolbar.hide()
         self.canvas.hide()
@@ -383,6 +426,43 @@ class EvokedPlotWidget(QWidget):
             line.set_linewidth(1.5)
             line.set_alpha(1.0)
             line.set_zorder(self.original_zorders.get(line, 0))
+
+    def _find_clicked_line(self, event):
+        if (
+            event.inaxes is not self.canvas.axes
+            or event.x is None
+            or event.y is None
+            or event.xdata is None
+            or not self.evoked_lines
+        ):
+            return None
+
+        nearest_line = None
+        min_distance = float("inf")
+
+        for line in self.evoked_lines:
+            x_data = np.asarray(line.get_xdata(orig=False), dtype=float)
+            y_data = np.asarray(line.get_ydata(orig=False), dtype=float)
+            if x_data.size == 0 or y_data.size == 0:
+                continue
+
+            x_min = float(np.min(x_data))
+            x_max = float(np.max(x_data))
+            if event.xdata < x_min or event.xdata > x_max:
+                continue
+
+            y_at_cursor = float(np.interp(event.xdata, x_data, y_data))
+            x_px, y_px = self.canvas.axes.transData.transform(
+                (event.xdata, y_at_cursor)
+            )
+            distance = float(np.hypot(x_px - event.x, y_px - event.y))
+            if distance < min_distance:
+                min_distance = distance
+                nearest_line = line
+
+        if min_distance <= self.click_tolerance_px:
+            return nearest_line
+        return None
 
     def _render_current_view(self):
         self.reference_widget.setEnabled(True)
@@ -431,7 +511,6 @@ class EvokedPlotWidget(QWidget):
         """Connects the required Matplotlib events to their callback methods."""
         self.canvas.mpl_connect("button_press_event", self.on_button_press)
         self.canvas.mpl_connect("button_release_event", self.on_button_release)
-        self.canvas.mpl_connect("pick_event", self.on_pick)
         self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
         self.canvas.mpl_connect("scroll_event", lambda e: self.scrolled.emit(e.button))
         self.reference_widget.toggled.connect(self._render_current_view)
@@ -440,7 +519,7 @@ class EvokedPlotWidget(QWidget):
         )
 
     def _on_event_selection_changed(self):
-        self.selected_event_name = self.event_selector.currentData()
+        self._sync_selected_event_from_selector()
         self._render_current_view()
 
     def _clear_drag_span(self):
@@ -453,7 +532,6 @@ class EvokedPlotWidget(QWidget):
         if event.inaxes is not self.canvas.axes:
             return
         if event.button == 1:
-            self.picked_artists_in_click.clear()
             self.drag_press_event = event
             self.drag_start_coords = (event.xdata, event.ydata)
             self.drag_active = False
@@ -489,7 +567,6 @@ class EvokedPlotWidget(QWidget):
                 return
 
             self.drag_active = True
-            self.picked_artists_in_click.clear()
             start_x = self.drag_start_coords[0]
             if start_x is None:
                 return
@@ -535,36 +612,11 @@ class EvokedPlotWidget(QWidget):
             and start_coords[0] is not None
             and event.xdata is not None
         ):
-            self.picked_artists_in_click.clear()
             self.handle_drag_selection(start=start_coords, end=(event.xdata, event.ydata))
             self.canvas.draw_idle()
             return
 
-        QTimer.singleShot(0, self._process_pick_event)
-
-    def on_pick(self, event):
-        """Callback for a pick event. Just adds the picked artist to a list."""
-        if (
-            self.drag_press_event is not None
-            and event.mouseevent.button == 1
-            and event.artist in self.evoked_lines
-        ):
-            self.picked_artists_in_click.append(event.artist)
-
-    def _process_pick_event(self):
-        """
-        This function runs after a short delay following any left-click.
-        It checks if any artists were collected by on_pick. If not, it was a background click.
-        """
-        if not self.picked_artists_in_click:
-            self.handle_line_click(None)  # No artists picked -> background click
-            return
-
-        top_artist = max(
-            self.picked_artists_in_click, key=lambda artist: artist.get_zorder()
-        )
-        self.picked_artists_in_click.clear()
-        self.handle_line_click(top_artist)
+        self.handle_line_click(self._find_clicked_line(event))
 
     def handle_drag_selection(self, start, end):
         """Called when a drag selection is completed. Plots a topomap in a dialog."""
@@ -584,7 +636,7 @@ class EvokedPlotWidget(QWidget):
         data = self.display_evoked.data[:, idx[0] : idx[1]].mean(axis=1)
 
         event_prefix = (
-            f"{self.selected_event_name} - " if self.selected_event_name else ""
+            f"{self.selected_event_label} - " if self.selected_event_label else ""
         )
         title = (
             f"{event_prefix}Topomap ({start_x:.2f} to {end_x:.2f}) "
@@ -610,12 +662,18 @@ class EvokedPlotWidget(QWidget):
         """Called for the single, top-most line that was clicked, or None for a background click."""
         if line_artist is None:
             self._restore_line_state()
+            self._set_selected_channel(None)
             self.canvas.draw()
             return
 
+        channel_name = self.line_channel_names.get(line_artist, line_artist.get_label())
         self.canvas.axes.legend(
-            handles=[line_artist], fontsize="small", loc="upper right"
+            handles=[line_artist],
+            labels=[channel_name],
+            fontsize="small",
+            loc="upper right",
         )
+        self._set_selected_channel(channel_name)
 
         max_zorder = len(self.original_zorders) + 1
         line_artist.set_linewidth(3)
