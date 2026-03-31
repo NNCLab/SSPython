@@ -7,8 +7,8 @@ from matplotlib.backend_bases import MouseButton
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtWidgets import QDockWidget, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, QTimer, Signal, QSize
+from PySide6.QtWidgets import QDockWidget, QSizePolicy, QVBoxLayout, QWidget
 
 
 class BasePlotDock(QDockWidget):
@@ -20,6 +20,7 @@ class BasePlotDock(QDockWidget):
         super().__init__(title, parent)
         self.setObjectName(title.replace(" ", "") + "Dock")
         self.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self.setMinimumSize(0, 0)
         self.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetClosable
             | QDockWidget.DockWidgetFeature.DockWidgetMovable
@@ -27,16 +28,24 @@ class BasePlotDock(QDockWidget):
         )
 
         container = QWidget(self)
+        container.setMinimumSize(0, 0)
+        container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
         self.figure = Figure()
         self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumSize(0, 0)
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         layout.addWidget(self.canvas)
         self.setWidget(container)
 
         self._draw_pending = False
+        self._resize_refresh_timer = QTimer(self)
+        self._resize_refresh_timer.setSingleShot(True)
+        self._resize_refresh_timer.setInterval(40)
+        self._resize_refresh_timer.timeout.connect(self._rerender_cached_data)
 
     def request_draw(self):
         if self._draw_pending:
@@ -72,11 +81,14 @@ class BasePlotDock(QDockWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._rerender_cached_data()
+        self._resize_refresh_timer.start()
 
     def _rerender_cached_data(self):
         """Subclasses can reapply cached full-resolution data after a resize."""
         return
+
+    def minimumSizeHint(self):
+        return QSize(0, 0)
 
 
 class RawMonitorDock(QDockWidget):
@@ -84,6 +96,7 @@ class RawMonitorDock(QDockWidget):
         super().__init__("Raw Data Monitor", parent)
         self.setObjectName("RawDataMonitorDock")
         self.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self.setMinimumSize(0, 0)
         self.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetClosable
             | QDockWidget.DockWidgetFeature.DockWidgetMovable
@@ -91,11 +104,15 @@ class RawMonitorDock(QDockWidget):
         )
 
         container = QWidget(self)
+        container.setMinimumSize(0, 0)
+        container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
         self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setMinimumSize(0, 0)
+        self.plot_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         self.plot_item = self.plot_widget.getPlotItem()
         self.plot_item.hideButtons()
         self.plot_item.showGrid(x=True, y=False, alpha=0.22)
@@ -113,6 +130,9 @@ class RawMonitorDock(QDockWidget):
         self.latest_time_axis = np.array([], dtype=float)
         self.latest_scaled_data = np.empty((0, 0), dtype=float)
         self._visible_count = 0
+
+    def minimumSizeHint(self):
+        return QSize(0, 0)
 
     @staticmethod
     def _pen_from_color(color: tuple[float, float, float, float]):

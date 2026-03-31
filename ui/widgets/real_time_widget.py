@@ -370,15 +370,7 @@ def apply_raw_artifact_mask(
     if stim_chunk.size == 0 or art_rem_start is None or art_rem_end is None or art_rem_end <= art_rem_start:
         return masked
 
-    stim_values = np.asarray(stim_chunk, dtype=int)
-    if stim_values.ndim == 1:
-        stim_values = stim_values[np.newaxis, :]
-    if stim_values.shape[-1] == 0:
-        return masked
-
-    combined = np.max(np.maximum(stim_values, 0), axis=0)
-    previous = np.concatenate(([0], combined[:-1]))
-    event_samples = np.flatnonzero((combined > 0) & (combined != previous))
+    event_samples, _ = detect_stim_onsets(stim_chunk)
     if event_samples.size == 0:
         return masked
 
@@ -390,6 +382,174 @@ def apply_raw_artifact_mask(
         if end_idx > start_idx:
             masked[:, start_idx:end_idx] = np.nan
     return masked
+
+
+def normalize_live_event_values(
+    event_id: int | dict[str, int] | None,
+) -> set[int] | None:
+    if event_id is None:
+        return None
+    if isinstance(event_id, dict):
+        return {int(value) for value in event_id.values() if int(value) > 0}
+    value = int(event_id)
+    return {value} if value > 0 else set()
+
+
+def detect_stim_onsets(
+    stim_chunk: np.ndarray,
+    *,
+    previous_value: int = 0,
+    allowed_event_values: set[int] | None = None,
+) -> tuple[np.ndarray, int]:
+    stim_values = np.asarray(stim_chunk, dtype=int)
+    if stim_values.ndim == 1:
+        stim_values = stim_values[np.newaxis, :]
+    if stim_values.size == 0 or stim_values.shape[-1] == 0:
+        return np.array([], dtype=int), int(previous_value)
+
+    combined = np.max(np.maximum(stim_values, 0), axis=0)
+    previous = np.concatenate(([int(previous_value)], combined[:-1]))
+    event_samples = np.flatnonzero((combined > 0) & (previous <= 0))
+    if allowed_event_values is not None:
+        event_samples = event_samples[np.isin(combined[event_samples], list(allowed_event_values))]
+    last_value = int(combined[-1]) if combined.size > 0 else int(previous_value)
+    return event_samples.astype(int, copy=False), last_value
+
+
+def _merge_sample_segments(
+    segments: list[tuple[int, int]],
+    sample_count: int,
+) -> list[tuple[int, int]]:
+    if sample_count <= 0 or not segments:
+        return []
+
+    ordered = sorted(
+        (
+            max(0, int(start_idx)),
+            min(sample_count, int(end_idx)),
+        )
+        for start_idx, end_idx in segments
+    )
+    merged: list[list[int]] = []
+    for start_idx, end_idx in ordered:
+        if end_idx <= start_idx:
+            continue
+        if not merged or start_idx > merged[-1][1]:
+            merged.append([start_idx, end_idx])
+            continue
+        merged[-1][1] = max(merged[-1][1], end_idx)
+    return [(start_idx, end_idx) for start_idx, end_idx in merged]
+
+
+def _interpolate_segments_2d(data: np.ndarray, segments: list[tuple[int, int]]) -> np.ndarray:
+    filled = np.array(data, copy=True, dtype=float)
+    if filled.ndim != 2 or filled.shape[-1] == 0:
+        return filled
+
+    for start_idx, end_idx in _merge_sample_segments(segments, filled.shape[-1]):
+        left_idx = start_idx - 1
+        right_idx = end_idx
+        if left_idx < 0 and right_idx >= filled.shape[-1]:
+            filled[:, start_idx:end_idx] = 0.0
+            continue
+        if left_idx < 0:
+            filled[:, start_idx:end_idx] = filled[:, right_idx][:, np.newaxis]
+            continue
+        if right_idx >= filled.shape[-1]:
+            filled[:, start_idx:end_idx] = filled[:, left_idx][:, np.newaxis]
+            continue
+
+        weights = np.linspace(0.0, 1.0, end_idx - start_idx + 2, dtype=float)[1:-1]
+        left = filled[:, left_idx][:, np.newaxis]
+        right = filled[:, right_idx][:, np.newaxis]
+        filled[:, start_idx:end_idx] = left + (right - left) * weights[np.newaxis, :]
+    return filled
+
+
+def _interpolate_segments_3d(data: np.ndarray, segments: list[tuple[int, int]]) -> np.ndarray:
+    filled = np.array(data, copy=True, dtype=float)
+    if filled.ndim != 3 or filled.shape[-1] == 0:
+        return filled
+
+    for start_idx, end_idx in _merge_sample_segments(segments, filled.shape[-1]):
+        left_idx = start_idx - 1
+        right_idx = end_idx
+        if left_idx < 0 and right_idx >= filled.shape[-1]:
+            filled[:, :, start_idx:end_idx] = 0.0
+            continue
+        if left_idx < 0:
+            filled[:, :, start_idx:end_idx] = filled[:, :, right_idx][:, :, np.newaxis]
+            continue
+        if right_idx >= filled.shape[-1]:
+            filled[:, :, start_idx:end_idx] = filled[:, :, left_idx][:, :, np.newaxis]
+            continue
+
+        weights = np.linspace(0.0, 1.0, end_idx - start_idx + 2, dtype=float)[1:-1]
+        left = filled[:, :, left_idx][:, :, np.newaxis]
+        right = filled[:, :, right_idx][:, :, np.newaxis]
+        filled[:, :, start_idx:end_idx] = left + (right - left) * weights[np.newaxis, np.newaxis, :]
+    return filled
+
+
+def fill_raw_artifact_window(
+    raw_chunk: np.ndarray,
+    stim_chunk: np.ndarray,
+    sfreq: float,
+    art_rem: tuple[float | None, float | None],
+) -> np.ndarray:
+    art_rem_start, art_rem_end = art_rem
+    if stim_chunk.size == 0 or art_rem_start is None or art_rem_end is None or art_rem_end <= art_rem_start:
+        return np.array(raw_chunk, copy=True, dtype=float)
+
+    event_samples, _ = detect_stim_onsets(stim_chunk)
+    if event_samples.size == 0:
+        return np.array(raw_chunk, copy=True, dtype=float)
+
+    start_offset = int(np.floor(float(art_rem_start) * float(sfreq)))
+    end_offset = int(np.ceil(float(art_rem_end) * float(sfreq))) + 1
+    segments = [
+        (int(event_sample + start_offset), int(event_sample + end_offset))
+        for event_sample in event_samples
+    ]
+    return _interpolate_segments_2d(raw_chunk, segments)
+
+
+def fill_epoch_artifact_window(
+    epoch_batch: np.ndarray,
+    times: np.ndarray,
+    art_rem: tuple[float | None, float | None],
+) -> np.ndarray:
+    art_rem_start, art_rem_end = art_rem
+    if art_rem_start is None or art_rem_end is None or art_rem_end <= art_rem_start:
+        return np.array(epoch_batch, copy=True, dtype=float)
+
+    start_idx = np.searchsorted(times, art_rem_start, side="left")
+    end_idx = np.searchsorted(times, art_rem_end, side="right")
+    return _interpolate_segments_3d(epoch_batch, [(start_idx, end_idx)])
+
+
+def apply_baseline_correction(
+    epoch_batch: np.ndarray,
+    times: np.ndarray,
+    baseline: tuple[float | None, float | None] = (None, 0.0),
+) -> np.ndarray:
+    corrected = np.array(epoch_batch, copy=True, dtype=float)
+    if corrected.ndim != 3 or corrected.shape[-1] == 0 or times.size == 0:
+        return corrected
+
+    baseline_start, baseline_end = baseline
+    mask = np.ones(times.shape, dtype=bool)
+    if baseline_start is not None:
+        mask &= times >= float(baseline_start)
+    if baseline_end is not None:
+        mask &= times <= float(baseline_end)
+    if not np.any(mask):
+        return corrected
+
+    baseline_values = corrected[:, :, mask]
+    baseline_mean = np.nanmean(baseline_values, axis=-1, keepdims=True)
+    baseline_mean = np.where(np.isfinite(baseline_mean), baseline_mean, 0.0)
+    return corrected - baseline_mean
 
 
 def average_reference_ignore_nan(epoch_batch: np.ndarray) -> np.ndarray:
@@ -1067,15 +1227,12 @@ class ConnectionManager:
     def __init__(self, params):
         self.params = params
         self.raw = None
-        self.stream_for_epochs = None
-        self.epochs = None
 
     def connect_to_stream(self):
         """Establishes a connection to the LSL stream."""
         try:
             stream_duration = self.params.get("stream_duration")
             stream_name = self.params.get("stream_name")
-            tmin, tmax = self.params.get("tlim")
             event_id = self.params.get("event_id")
             event_channels = self.params.get("event_channels")
             event_channel_list = normalize_event_channels(event_channels)
@@ -1131,55 +1288,70 @@ class ConnectionManager:
                 event_channel_list,
             )
             self.params["event_id"] = event_id
-            self.epochs = mne_lsl.stream.EpochsStream(
-                self.raw,
-                bufsize=10,
-                event_id=event_id,
-                event_channels=event_channel_list[0] if len(event_channel_list) == 1 else event_channel_list,
-                tmin=tmin,
-                tmax=tmax,
-                baseline=(None, 0),
-                picks="eeg",
-            )
-            self.epochs.connect(acquisition_delay=0.1)
             print("Connection successful.")
-            return self.raw, self.epochs
+            return self.raw
         except Exception as e:
             print(f"Failed to connect to stream: {e}")
-            return None, None
+            return None
+
+    def disconnect(self):
+        if self.raw is not None:
+            try:
+                self.raw.disconnect()
+            except Exception:
+                pass
 
 class ConnectionWorker(QObject):
     """Worker thread for handling the LSL stream connection."""
 
-    finished = Signal(object, object)  # Emits stream and epochs on success
+    finished = Signal(object)  # Emits the connected stream on success
     error = Signal(str)  # Emits error message on failure
 
     def __init__(self, params):
         super().__init__()
         self.params = params
+        self.conn_manager = None
+        self._stop_requested = False
 
     def run(self):
         """Tries to connect to the stream."""
         try:
-            conn_manager = ConnectionManager(self.params)
-            stream, epochs = conn_manager.connect_to_stream()
-            if stream and epochs:
-                self.finished.emit(stream, epochs)
+            if self._stop_requested:
+                return
+            self.conn_manager = ConnectionManager(self.params)
+            stream = self.conn_manager.connect_to_stream()
+            if self._stop_requested:
+                if self.conn_manager is not None:
+                    self.conn_manager.disconnect()
+                return
+            if stream:
+                self.finished.emit(stream)
             else:
                 self.error.emit(
                     "Failed to connect to the LSL stream. Please check the stream name and ensure it is available."
                 )
         except Exception as e:
             self.error.emit(f"An error occurred during connection: {e}")
+        finally:
+            if self._stop_requested and self.conn_manager is not None:
+                self.conn_manager.disconnect()
+
+    @Slot()
+    def stop(self):
+        self._stop_requested = True
+        if self.conn_manager is not None:
+            self.conn_manager.disconnect()
 
 class RealTimeSettingsWidget(QWidget):
     """A widget to configure real-time plotting parameters."""
 
     SETTINGS_PATH = "real_time/plotting"
+    settingsChanged = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings_store = get_settings_store()
+        self._suppress_settings_changed = False
         self.setup_ui()
         self.load_settings()
 
@@ -1231,6 +1403,12 @@ class RealTimeSettingsWidget(QWidget):
 
         self.apply_bandpass.toggled.connect(self.bandpass_input.setEnabled)
         self.apply_notch.toggled.connect(self.notch_input.setEnabled)
+        self.refresh_rate_input.valueChanged.connect(self._emit_settings_changed)
+        self.art_rem_input.valueChanged.connect(self._emit_settings_changed)
+        self.apply_bandpass.toggled.connect(self._emit_settings_changed)
+        self.bandpass_input.valueChanged.connect(self._emit_settings_changed)
+        self.apply_notch.toggled.connect(self._emit_settings_changed)
+        self.notch_input.textChanged.connect(self._emit_settings_changed)
         main_layout.addStretch(1)
 
     def get_settings(self) -> dict:
@@ -1255,22 +1433,26 @@ class RealTimeSettingsWidget(QWidget):
 
     def set_settings(self, params: dict):
         """Sets the UI components from a settings dictionary."""
-        self.refresh_rate_input.setValue(params.get("refresh_rate"))
-        self.apply_bandpass.setChecked(params.get("apply_bandpass"))
-        self.apply_notch.setChecked(params.get("apply_notch"))
+        self._suppress_settings_changed = True
+        try:
+            self.refresh_rate_input.setValue(params.get("refresh_rate"))
+            self.apply_bandpass.setChecked(params.get("apply_bandpass"))
+            self.apply_notch.setChecked(params.get("apply_notch"))
 
-        self.art_rem_input.setValue(params.get("art_rem"))
-        self.bandpass_input.setValue(params.get("bandpass_range"))
+            self.art_rem_input.setValue(params.get("art_rem"))
+            self.bandpass_input.setValue(params.get("bandpass_range"))
 
-        notch_freqs = params.get("notch_freqs", [])
-        self.notch_input.setText(
-            ", ".join(
-                map(str, notch_freqs if type(notch_freqs) == list else [notch_freqs])
+            notch_freqs = params.get("notch_freqs", [])
+            self.notch_input.setText(
+                ", ".join(
+                    map(str, notch_freqs if type(notch_freqs) == list else [notch_freqs])
+                )
             )
-        )
 
-        self.bandpass_input.setEnabled(self.apply_bandpass.isChecked())
-        self.notch_input.setEnabled(self.apply_notch.isChecked())
+            self.bandpass_input.setEnabled(self.apply_bandpass.isChecked())
+            self.notch_input.setEnabled(self.apply_notch.isChecked())
+        finally:
+            self._suppress_settings_changed = False
 
     def save_settings(self):
         """Saves the current parameters to QSettings under the group."""
@@ -1300,6 +1482,11 @@ class RealTimeSettingsWidget(QWidget):
         params.update(saved_params)
 
         self.set_settings(params)
+
+    def _emit_settings_changed(self, *_):
+        if self._suppress_settings_changed:
+            return
+        self.settingsChanged.emit(self.get_settings())
 
 class RealTimeSettings(QDialog):
     """A dialog for configuring real-time plot settings."""
@@ -1343,35 +1530,14 @@ class DataProcessingWorker(QObject):
     data_ready = Signal(dict)
     finished = Signal()
 
-    def __init__(self, stream, epochs, params, parent=None):
+    def __init__(self, stream, params, parent=None):
         super().__init__(parent)
         self.stream = stream
-        self.epochs = epochs
-        self.params = params
+        self.params = dict(params)
         self.is_running = True
-        self.max_epochs = int(params.get("max_epochs", 200) or 200)
-        self.display_epoch_count = int(params.get("display_epoch_count", 0) or 0)
-        self.ch_names = list(self.params.get("ch_names", []))
-        if not self.ch_names:
-            epoch_eeg_picks = np.asarray(mne.pick_types(self.epochs.info, eeg=True, exclude=()), dtype=int)
-            if epoch_eeg_picks.size > 0:
-                self.ch_names = [self.epochs.info["ch_names"][pick] for pick in epoch_eeg_picks]
-            else:
-                self.ch_names = list(self.epochs.info["ch_names"])
-        self.bads = self.params.get("bads", [])
-        self.epoch_channel_count = len(self.ch_names)
-
-        n_times = len(epochs.times)
-        self.epoch_buffer = np.full((self.max_epochs, self.epoch_channel_count, n_times), np.nan)
-        self.buffer_idx = 0
-        self.n_valid_epochs = 0
-        self.total_epochs_seen = 0
-        
-        self.original_times = self.epochs.times.copy()
-        self.original_sfreq = self.epochs.info["sfreq"]
-        self.decimate = self.params.get("decimate", 5)
-        self.times = self.original_times[:: self.decimate]
-        self.raw_picks = mne.pick_types(self.stream.info, eeg=True, exclude=())
+        self.max_epochs = int(self.params.get("max_epochs", 200) or 200)
+        self.display_epoch_count = int(self.params.get("display_epoch_count", 0) or 0)
+        self.raw_picks = np.asarray(mne.pick_types(self.stream.info, eeg=True, exclude=()), dtype=int)
         self.raw_event_channels = normalize_event_channels(self.params.get("event_channels"))
         self.raw_event_picks = np.asarray(
             mne.pick_channels(self.stream.info["ch_names"], include=self.raw_event_channels, ordered=True),
@@ -1381,9 +1547,54 @@ class DataProcessingWorker(QObject):
             list(self.raw_picks) + [pick for pick in self.raw_event_picks if pick not in set(self.raw_picks)],
             dtype=int,
         )
+
+        self.ch_names = list(self.params.get("ch_names", []))
+        if not self.ch_names:
+            if self.raw_picks.size > 0:
+                self.ch_names = [self.stream.info["ch_names"][pick] for pick in self.raw_picks]
+            else:
+                self.ch_names = list(self.stream.info["ch_names"])
+        self.bads = list(self.params.get("bads", []))
+        self.epoch_channel_count = len(self.ch_names)
+
+        self.original_sfreq = float(self.stream.info["sfreq"])
+        tmin, tmax = self.params.get("tlim", (-0.2, 0.5))
+        self.tmin = float(tmin)
+        self.tmax = float(tmax)
+        self.epoch_start_offset = int(round(self.tmin * self.original_sfreq))
+        self.epoch_end_offset = int(round(self.tmax * self.original_sfreq))
+        if self.epoch_end_offset <= self.epoch_start_offset:
+            self.epoch_end_offset = self.epoch_start_offset + 1
+
+        self.original_times = (
+            np.arange(self.epoch_start_offset, self.epoch_end_offset + 1, dtype=float)
+            / self.original_sfreq
+        )
+        self.decimate = max(1, int(self.params.get("decimate", 5) or 5))
+        self.times = self.original_times[:: self.decimate]
+
+        n_times = self.original_times.size
+        self.epoch_buffer = np.full((self.max_epochs, self.epoch_channel_count, n_times), np.nan)
+        self.buffer_idx = 0
+        self.n_valid_epochs = 0
+        self.total_epochs_seen = 0
+
+        self.raw_display_seconds = max(0.5, float(self.params.get("stream_duration", 5) or 5.0))
+        history_seconds = max(self.raw_display_seconds + 0.25, (self.tmax - self.tmin) + 1.0, 2.0)
+        self.max_history_samples = max(8, int(np.ceil(history_seconds * self.original_sfreq)))
+        self.raw_display_samples = max(1, int(np.ceil(self.raw_display_seconds * self.original_sfreq)))
+        self.raw_history = np.empty((len(self.raw_picks), 0), dtype=float)
+        self.stim_history = np.empty((len(self.raw_event_picks), 0), dtype=float)
+        self.history_start_sample = 0
+        self.total_samples_seen = 0
+        self.pending_events: deque[int] = deque()
+        self.allowed_event_values = normalize_live_event_values(self.params.get("event_id"))
+        self._last_stim_value = 0
+        self._force_epoch_emit = False
+        self._force_raw_emit = False
+
         self.bandpass_sos = None
         self.notch_filters: list[tuple[np.ndarray, np.ndarray]] = []
-        self._epoch_shape_warning = None
         self._rebuild_filter_pipeline()
 
     def run(self):
@@ -1403,92 +1614,227 @@ class DataProcessingWorker(QObject):
             self.finished.emit()
             return
 
-        # Always try to get a raw chunk for continuous visualization
-        emit_dict = {}
-        try:
-            raw_chunk_all, _ = self.stream.get_data(picks=self.raw_monitor_picks)
-            if raw_chunk_all is not None and raw_chunk_all.shape[1] > 0:
-                eeg_count = len(self.raw_picks)
-                raw_chunk = raw_chunk_all[:eeg_count]
-                stim_chunk = raw_chunk_all[eeg_count:] if raw_chunk_all.shape[0] > eeg_count else np.empty((0, raw_chunk_all.shape[1]))
-                raw_chunk = self._apply_live_filters(raw_chunk)
-                raw_chunk = apply_raw_artifact_mask(
-                    raw_chunk,
-                    stim_chunk,
-                    self.original_sfreq,
-                    self.params.get("art_rem", (0, 0)),
-                )
-                n_samples = raw_chunk.shape[1]
-                time_axis = np.linspace(-n_samples / self.original_sfreq, 0, n_samples)
-                
-                means = np.nanmean(raw_chunk, axis=1, keepdims=True)
-                centered_chunk = raw_chunk - means
-                
-                scaled_chunk = np.zeros_like(centered_chunk)
-                scale_mode = self.params.get("scale_mode", "Global Auto-Scale")
-
-                if scale_mode == "Global Auto-Scale":
-                    global_std = np.nanstd(centered_chunk)
-                    scale = 1.0 / (global_std * 6) if (not np.isnan(global_std) and global_std > 0) else 1.0
-                    scaled_chunk = centered_chunk * scale
-                else:  # Local Auto-Scale
-                    local_stds = np.nanstd(centered_chunk, axis=1, keepdims=True)
-                    # Prevent division by zero or NaN
-                    local_stds[np.isnan(local_stds) | (local_stds <= 0)] = 1.0
-                    scales = 1.0 / (local_stds * 6)
-                    scaled_chunk = centered_chunk * scales
-
-                emit_dict["raw_data"] = {
-                    "time_axis": time_axis,
-                    "scaled_data": scaled_chunk,
-                }
-        except Exception:
-            pass
-
         epoch_updated = False
-        new_epoch_count = getattr(self.epochs, "n_new_epochs", 0)
-        if new_epoch_count > 0:
+        new_samples = int(getattr(self.stream, "n_new_samples", 0) or 0)
+        if new_samples > 0:
             try:
-                new_data = self.epochs.get_data(
-                    n_epochs=new_epoch_count,
-                    picks=self.ch_names or None,
+                raw_chunk_all, _ = self.stream.get_data(
+                    winsize=new_samples / self.original_sfreq,
+                    picks=self.raw_monitor_picks,
                     exclude=(),
                 )
-                if new_data is not None and new_data.shape[0] > 0:
-                    stored_batch = np.array(new_data, copy=True)
-                    stored_batch = self._normalize_epoch_batch(stored_batch)
-                    if stored_batch is not None:
-                        epoch_updated = True
-                        n_new_total = stored_batch.shape[0]
-                        self.total_epochs_seen += n_new_total
+                if raw_chunk_all is not None and raw_chunk_all.ndim == 2 and raw_chunk_all.shape[1] > 0:
+                    eeg_count = len(self.raw_picks)
+                    raw_chunk = np.asarray(raw_chunk_all[:eeg_count], dtype=float)
+                    stim_chunk = (
+                        np.asarray(raw_chunk_all[eeg_count:], dtype=float)
+                        if raw_chunk_all.shape[0] > eeg_count
+                        else np.empty((0, raw_chunk_all.shape[1]), dtype=float)
+                    )
+                    self._append_history(raw_chunk, stim_chunk)
+                    self._queue_pending_events(stim_chunk)
+                    epoch_updated = self._consume_pending_events()
+            except Exception:
+                pass
 
-                        if n_new_total >= self.max_epochs:
-                            stored_batch = stored_batch[-self.max_epochs :]
-                            self.epoch_buffer[:] = stored_batch
-                            self.buffer_idx = 0
-                            self.n_valid_epochs = self.max_epochs
-                            new_data = None
-                        else:
-                            # Copy new data into the circular buffer
-                            n_new = stored_batch.shape[0]
-                            start_idx = self.buffer_idx
-                            end_idx = start_idx + n_new
-                            
-                            if end_idx <= self.max_epochs:
-                                self.epoch_buffer[start_idx:end_idx] = stored_batch
-                            else: # Wrap-around
-                                part1_n = self.max_epochs - start_idx
-                                self.epoch_buffer[start_idx:] = stored_batch[:part1_n]
-                                part2_n = n_new - part1_n
-                                self.epoch_buffer[:part2_n] = stored_batch[part1_n:]
+        emit_dict = self._build_snapshot(
+            include_raw=(new_samples > 0 or self._force_raw_emit),
+            include_epoch=(epoch_updated or self._force_epoch_emit),
+        )
+        self._force_raw_emit = False
+        self._force_epoch_emit = False
+        if emit_dict:
+            self.data_ready.emit(emit_dict)
 
-                            self.buffer_idx = end_idx % self.max_epochs
-                            self.n_valid_epochs = min(self.max_epochs, self.n_valid_epochs + n_new)
+    def _process_epoch_batch(self, epoch_batch: np.ndarray) -> np.ndarray:
+        plot_data = apply_baseline_correction(epoch_batch, self.original_times, baseline=(None, 0.0))
+        plot_data = fill_epoch_artifact_window(
+            plot_data,
+            self.original_times,
+            self.params.get("art_rem", (0, 0)),
+        )
+        plot_data = self._apply_live_filters(plot_data)
+        plot_data = apply_artifact_mask(
+            plot_data,
+            self.original_times,
+            self.params.get("art_rem", (0, 0)),
+        )
 
-            except Exception as e:
-                print(f"Error fetching epoch data: {e}")
+        if self.params.get("reference", "average") == "average" and plot_data.shape[1] > 1:
+            plot_data = average_reference_ignore_nan(plot_data)
 
-        if epoch_updated:
+        return plot_data
+
+    @Slot(dict)
+    def update_params(self, new_params):
+        """Update processing parameters."""
+        self.params.update(new_params)
+        if "ch_names" in new_params:
+            self.ch_names = list(new_params["ch_names"])
+            self.epoch_channel_count = len(self.ch_names)
+        if "bads" in new_params:
+            self.bads = list(new_params["bads"])
+        if "display_epoch_count" in new_params:
+            self.display_epoch_count = int(new_params["display_epoch_count"] or 0)
+        if "event_id" in new_params:
+            self.allowed_event_values = normalize_live_event_values(new_params["event_id"])
+        self._rebuild_filter_pipeline()
+        if hasattr(self, "timer"):
+            self.timer.setInterval(max(1, int(round(1000 / self.params.get("refresh_rate", 24)))))
+        self._force_raw_emit = True
+        self._force_epoch_emit = True
+        emit_dict = self._build_snapshot(include_raw=True, include_epoch=True)
+        if emit_dict:
+            self.data_ready.emit(emit_dict)
+
+    @Slot()
+    def clear_epochs(self):
+        """Reset the circular epoch buffer and counters."""
+        self.epoch_buffer.fill(np.nan)
+        self.buffer_idx = 0
+        self.n_valid_epochs = 0
+        self.total_epochs_seen = 0
+
+    def _rebuild_filter_pipeline(self):
+        self.bandpass_sos, self.notch_filters = build_live_filter_pipeline(
+            self.original_sfreq,
+            self.params,
+        )
+
+    def _apply_live_filters(self, data: np.ndarray) -> np.ndarray:
+        return apply_frequency_filters(data, self.bandpass_sos, self.notch_filters)
+
+    def _append_history(self, raw_chunk: np.ndarray, stim_chunk: np.ndarray):
+        if raw_chunk.ndim != 2 or raw_chunk.shape[1] == 0:
+            return
+
+        raw_chunk = np.asarray(raw_chunk, dtype=float)
+        stim_chunk = np.asarray(stim_chunk, dtype=float)
+        self.raw_history = (
+            raw_chunk.copy()
+            if self.raw_history.size == 0
+            else np.concatenate((self.raw_history, raw_chunk), axis=1)
+        )
+
+        if self.raw_event_picks.size > 0:
+            if stim_chunk.size == 0:
+                stim_chunk = np.zeros((len(self.raw_event_picks), raw_chunk.shape[1]), dtype=float)
+            self.stim_history = (
+                stim_chunk.copy()
+                if self.stim_history.size == 0
+                else np.concatenate((self.stim_history, stim_chunk), axis=1)
+            )
+
+        self.total_samples_seen += raw_chunk.shape[1]
+
+        excess = self.raw_history.shape[1] - self.max_history_samples
+        if excess <= 0:
+            return
+
+        self.raw_history = self.raw_history[:, excess:]
+        if self.stim_history.size > 0:
+            self.stim_history = self.stim_history[:, excess:]
+        self.history_start_sample += excess
+
+    def _queue_pending_events(self, stim_chunk: np.ndarray):
+        stim_chunk = np.asarray(stim_chunk, dtype=float)
+        if stim_chunk.ndim != 2 or stim_chunk.shape[1] == 0:
+            return
+
+        event_samples, self._last_stim_value = detect_stim_onsets(
+            stim_chunk,
+            previous_value=self._last_stim_value,
+            allowed_event_values=self.allowed_event_values,
+        )
+        if event_samples.size == 0:
+            return
+
+        chunk_start_sample = self.total_samples_seen - stim_chunk.shape[1]
+        for event_sample in event_samples:
+            self.pending_events.append(int(chunk_start_sample + event_sample))
+
+    def _consume_pending_events(self) -> bool:
+        if self.raw_history.size == 0:
+            return False
+
+        updated = False
+        history_end_sample = self.history_start_sample + self.raw_history.shape[1]
+        while self.pending_events:
+            event_sample = self.pending_events[0]
+            epoch_start_sample = event_sample + self.epoch_start_offset
+            epoch_end_sample = event_sample + self.epoch_end_offset + 1
+            if epoch_end_sample > history_end_sample:
+                break
+
+            self.pending_events.popleft()
+            if epoch_start_sample < self.history_start_sample:
+                continue
+
+            history_start_idx = epoch_start_sample - self.history_start_sample
+            history_end_idx = epoch_end_sample - self.history_start_sample
+            epoch = self.raw_history[:, history_start_idx:history_end_idx]
+            if epoch.shape != (self.epoch_channel_count, self.original_times.size):
+                continue
+            self._store_epoch_batch(epoch[np.newaxis, :, :])
+            updated = True
+        return updated
+
+    def _store_epoch_batch(self, epoch_batch: np.ndarray):
+        n_new = int(epoch_batch.shape[0])
+        if n_new <= 0:
+            return
+        self.total_epochs_seen += n_new
+
+        if n_new >= self.max_epochs:
+            epoch_batch = epoch_batch[-self.max_epochs :]
+            self.epoch_buffer[:] = epoch_batch
+            self.buffer_idx = 0
+            self.n_valid_epochs = self.max_epochs
+            return
+
+        start_idx = self.buffer_idx
+        end_idx = start_idx + n_new
+        if end_idx <= self.max_epochs:
+            self.epoch_buffer[start_idx:end_idx] = epoch_batch
+        else:
+            part1_n = self.max_epochs - start_idx
+            self.epoch_buffer[start_idx:] = epoch_batch[:part1_n]
+            self.epoch_buffer[: n_new - part1_n] = epoch_batch[part1_n:]
+
+        self.buffer_idx = end_idx % self.max_epochs
+        self.n_valid_epochs = min(self.max_epochs, self.n_valid_epochs + n_new)
+
+    def _build_snapshot(self, *, include_raw: bool, include_epoch: bool) -> dict:
+        emit_dict: dict[str, dict] = {}
+
+        if include_raw and self.raw_history.size > 0:
+            sample_count = min(self.raw_display_samples, self.raw_history.shape[1])
+            raw_chunk = self.raw_history[:, -sample_count:]
+            stim_chunk = (
+                self.stim_history[:, -sample_count:]
+                if self.stim_history.size > 0
+                else np.empty((0, sample_count), dtype=float)
+            )
+            raw_chunk = fill_raw_artifact_window(
+                raw_chunk,
+                stim_chunk,
+                self.original_sfreq,
+                self.params.get("art_rem", (0, 0)),
+            )
+            raw_chunk = self._apply_live_filters(raw_chunk)
+            raw_chunk = apply_raw_artifact_mask(
+                raw_chunk,
+                stim_chunk,
+                self.original_sfreq,
+                self.params.get("art_rem", (0, 0)),
+            )
+            time_axis, scaled_chunk = self._scale_raw_chunk(raw_chunk)
+            emit_dict["raw_data"] = {
+                "time_axis": time_axis,
+                "scaled_data": scaled_chunk,
+            }
+
+        if include_epoch:
             plot_data = buffer_epoch_snapshot(
                 self.epoch_buffer,
                 self.buffer_idx,
@@ -1500,11 +1846,10 @@ class DataProcessingWorker(QObject):
             if displayed_epochs > 0:
                 processed_data = self._process_epoch_batch(plot_data)[:, :, :: self.decimate]
                 mean_data, std_data = compute_epoch_mean_std(processed_data)
-
                 valid_data = [
-                    mean_data[i]
-                    for i in range(len(self.ch_names))
-                    if self.ch_names[i] not in self.bads
+                    mean_data[index]
+                    for index in range(len(self.ch_names))
+                    if self.ch_names[index] not in self.bads
                 ]
                 global_min, global_max = -10.0, 10.0
                 if valid_data:
@@ -1529,74 +1874,35 @@ class DataProcessingWorker(QObject):
                 "global_min": global_min,
                 "global_max": global_max,
             }
-        
-        # Emit data for UI thread
-        if emit_dict:
-            self.data_ready.emit(emit_dict)
 
-    def _process_epoch_batch(self, epoch_batch: np.ndarray) -> np.ndarray:
-        plot_data = self._apply_live_filters(epoch_batch)
-        plot_data = apply_artifact_mask(
-            plot_data,
-            self.original_times,
-            self.params.get("art_rem", (0, 0)),
+        return emit_dict
+
+    def _scale_raw_chunk(self, raw_chunk: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        n_samples = raw_chunk.shape[1]
+        time_axis = np.linspace(-n_samples / self.original_sfreq, 0, n_samples, dtype=float)
+
+        finite_mask = np.isfinite(raw_chunk)
+        counts = np.sum(finite_mask, axis=1, keepdims=True)
+        sums = np.where(finite_mask, raw_chunk, 0.0).sum(axis=1, keepdims=True)
+        means = np.divide(
+            sums,
+            counts,
+            out=np.zeros((raw_chunk.shape[0], 1), dtype=float),
+            where=counts > 0,
         )
+        centered_chunk = raw_chunk - means
 
-        if self.params.get("reference", "average") == "average" and plot_data.shape[1] > 1:
-            plot_data = average_reference_ignore_nan(plot_data)
+        scale_mode = self.params.get("scale_mode", "Global Auto-Scale")
+        if scale_mode == "Global Auto-Scale":
+            global_std = float(np.nanstd(centered_chunk))
+            scale = 1.0 / (global_std * 6.0) if np.isfinite(global_std) and global_std > 0 else 1.0
+            scaled_chunk = centered_chunk * scale
+        else:
+            local_stds = np.nanstd(centered_chunk, axis=1, keepdims=True)
+            local_stds[np.isnan(local_stds) | (local_stds <= 0)] = 1.0
+            scaled_chunk = centered_chunk * (1.0 / (local_stds * 6.0))
 
-        return plot_data
-
-    def _normalize_epoch_batch(self, epoch_batch: np.ndarray) -> np.ndarray | None:
-        if epoch_batch.ndim != 3:
-            warning = f"unexpected epoch rank {epoch_batch.ndim}"
-            if warning != self._epoch_shape_warning:
-                print(f"Skipping epoch batch: {warning}.")
-                self._epoch_shape_warning = warning
-            return None
-
-        observed_channels = int(epoch_batch.shape[1])
-        if observed_channels == self.epoch_channel_count:
-            self._epoch_shape_warning = None
-            return epoch_batch
-
-        warning = f"expected {self.epoch_channel_count} epoch channels but got {observed_channels}"
-        if warning != self._epoch_shape_warning:
-            print(f"Skipping epoch batch: {warning}.")
-            self._epoch_shape_warning = warning
-        return None
-
-    @Slot(dict)
-    def update_params(self, new_params):
-        """Update processing parameters."""
-        self.params.update(new_params)
-        if "ch_names" in new_params:
-            self.ch_names = list(new_params["ch_names"])
-            self.epoch_channel_count = len(self.ch_names)
-        if "bads" in new_params:
-            self.bads = new_params["bads"]
-        if "display_epoch_count" in new_params:
-            self.display_epoch_count = int(new_params["display_epoch_count"] or 0)
-        self._rebuild_filter_pipeline()
-        if hasattr(self, "timer"):
-            self.timer.setInterval(max(1, int(round(1000 / self.params.get("refresh_rate", 24)))))
-
-    @Slot()
-    def clear_epochs(self):
-        """Reset the circular epoch buffer and counters."""
-        self.epoch_buffer.fill(np.nan)
-        self.buffer_idx = 0
-        self.n_valid_epochs = 0
-        self.total_epochs_seen = 0
-
-    def _rebuild_filter_pipeline(self):
-        self.bandpass_sos, self.notch_filters = build_live_filter_pipeline(
-            self.original_sfreq,
-            self.params,
-        )
-
-    def _apply_live_filters(self, data: np.ndarray) -> np.ndarray:
-        return apply_frequency_filters(data, self.bandpass_sos, self.notch_filters)
+        return time_axis, scaled_chunk
 
 class SingleChannelPlot(QDialog):
     """A dialog for plotting data from a single EEG channel using Matplotlib."""
@@ -1625,12 +1931,18 @@ class SingleChannelPlot(QDialog):
             | Qt.WindowCloseButtonHint
         )
         layout = QVBoxLayout(self)
-        self.position_label = QLabel(self.parent.channel_position_text(self.ch_name))
+        position_text = self.parent.channel_position_text(self.ch_name)
+        self.position_label = QLabel(position_text)
         self.position_label.setObjectName("mutedLabel")
         self.position_label.setWordWrap(True)
+        self.position_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.position_label.setVisible(bool(position_text))
         layout.addWidget(self.position_label)
-        self.cursor_label = QLabel("Cursor: hover over the plot")
+        self.cursor_label = QLabel()
         self.cursor_label.setObjectName("mutedLabel")
+        self.cursor_label.setWordWrap(True)
+        self.cursor_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._set_cursor_label(message="hover over the plot")
         layout.addWidget(self.cursor_label)
         self.figure = Figure(layout="constrained")
         self.canvas = FigureCanvas(self.figure)
@@ -1672,6 +1984,33 @@ class SingleChannelPlot(QDialog):
         if indices[-1] != sample_count - 1:
             indices = np.append(indices, sample_count - 1)
         return indices
+
+    @staticmethod
+    def _format_cursor_value(value: float, *, decimals: int) -> str:
+        if not np.isfinite(value):
+            return "n/a"
+        return f"{value:.{decimals}f}"
+
+    def _set_cursor_label(
+        self,
+        *,
+        time_ms: float | None = None,
+        amp_uV: float = np.nan,
+        std_uV: float = np.nan,
+        message: str | None = None,
+    ):
+        if message is not None:
+            self.cursor_label.setText(f"<b>Cursor</b>: {message}")
+            return
+
+        time_text = "n/a" if time_ms is None or not np.isfinite(time_ms) else f"{time_ms:.1f} ms"
+        amp_text = self._format_cursor_value(amp_uV, decimals=2)
+        std_text = self._format_cursor_value(std_uV, decimals=2)
+        self.cursor_label.setText(
+            f"<b>Time</b>: {time_text} | "
+            f"<b>Amplitude</b>: {amp_text} uV | "
+            f"<b>SD</b>: {std_text} uV"
+        )
 
     def refresh_theme(self):
         tokens = theme_tokens()
@@ -1751,7 +2090,7 @@ class SingleChannelPlot(QDialog):
 
         if n_epochs <= 0:
             self.ax.set_title(f"{self.ch_name} (no epochs)")
-            self.cursor_label.setText("Cursor: no data")
+            self._set_cursor_label(message="no data")
             self.refresh_theme()
             self.canvas.draw_idle()
             return
@@ -1762,7 +2101,7 @@ class SingleChannelPlot(QDialog):
             self.ax.set_title(f"{self.ch_name} (n={n_epochs})")
         else:
             self.ax.set_title(
-                f"{self.ch_name} (n={n_epochs} | R_std={rms_std:.1f} uV)"
+                rf"{self.ch_name} (n={n_epochs} | $R_{{std}}$={rms_std:.1f} uV)"
             )
         self.refresh_theme()
         self.canvas.draw_idle()
@@ -1785,11 +2124,9 @@ class SingleChannelPlot(QDialog):
 
         time_ms = float(self.times[idx])
         amp_uV = float(self.latest_evoked_uV[idx]) if idx < len(self.latest_evoked_uV) else np.nan
+        std_uV = float(self.latest_std_uV[idx]) if idx < len(self.latest_std_uV) else np.nan
         self.v_line.set_xdata([time_ms, time_ms])
-        if np.isfinite(amp_uV):
-            self.cursor_label.setText(f"Cursor: {time_ms:.1f} ms | {amp_uV:.2f} uV")
-        else:
-            self.cursor_label.setText(f"Cursor: {time_ms:.1f} ms | n/a")
+        self._set_cursor_label(time_ms=time_ms, amp_uV=amp_uV, std_uV=std_uV)
         self.canvas.draw_idle()
 
     def closeEvent(self, event):
@@ -1851,6 +2188,7 @@ class TopomapPlot(QDialog):
 class RealTimeERP(QMainWindow):
     params_changed = Signal(dict)
     clear_epochs_requested = Signal()
+    closed = Signal()
     """Main window for real-time ERP visualization."""
 
     def __init__(self, params, parent=None):
@@ -1902,6 +2240,7 @@ class RealTimeERP(QMainWindow):
         self.active_montage_name = None
         self.theme_name = current_theme_name()
         self.tokens = theme_tokens(self.theme_name)
+        self._shutting_down = False
 
         self.setup_ui()
         self.setWindowTitle("Real-Time TEP Visualization")
@@ -2277,6 +2616,7 @@ class RealTimeERP(QMainWindow):
             setattr(self, attr_name, None)
 
     def start_visualization(self):
+        self._shutting_down = False
         self.conn_thread = QThread(self)
         self.conn_worker = ConnectionWorker(self.params)
         self.conn_worker.moveToThread(self.conn_thread)
@@ -2300,21 +2640,26 @@ class RealTimeERP(QMainWindow):
         self.conn_thread.start()
         self.progress_dialog.exec()
 
-    def _on_connection_success(self, stream, epochs):
+    def _on_connection_success(self, stream):
+        if self._shutting_down:
+            try:
+                stream.disconnect()
+            except Exception:
+                pass
+            return
         if self._qt_object_alive(self.progress_dialog):
             self.progress_dialog.accept()
         self.stream = stream
-        self.epochs = epochs
 
         self._apply_visual_montage()
 
-        eeg_picks = mne.pick_types(self.epochs.info, eeg=True, exclude=())
-        self.info = mne.pick_info(self.epochs.info, eeg_picks)
+        eeg_picks = mne.pick_types(self.stream.info, eeg=True, exclude=())
+        self.info = mne.pick_info(self.stream.info, eeg_picks)
         self.ch_names = self.info["ch_names"]
         self.channel_indices = {name: index for index, name in enumerate(self.ch_names)}
         self.info["bads"] = [name for name in self.bads if name in self.ch_names]
         self.bads = list(self.info["bads"])
-        self.sfreq = self.info["sfreq"]
+        self.sfreq = float(self.info["sfreq"])
         coords_3d = []
         for ch in self.info["chs"]:
             loc = ch.get("loc", np.zeros(12))
@@ -2346,7 +2691,7 @@ class RealTimeERP(QMainWindow):
 
         # Start data processing worker thread
         self.data_thread = QThread(self)
-        self.data_worker = DataProcessingWorker(self.stream, self.epochs, self.params)
+        self.data_worker = DataProcessingWorker(self.stream, self.params)
         self.data_worker.moveToThread(self.data_thread)
         self.data_thread.destroyed.connect(lambda *_: self._clear_qt_attr("data_thread"))
         self.data_worker.destroyed.connect(lambda *_: self._clear_qt_attr("data_worker"))
@@ -2415,6 +2760,7 @@ class RealTimeERP(QMainWindow):
             self.params_changed.emit({"scale_mode": text})
         self.params["scale_mode"] = text
         self._render_epoch_payload(self.latest_epoch_payload, force=True)
+        self._render_raw_payload(self.latest_raw_payload, force=True)
 
     @staticmethod
     def to_rgb(positions_3d):
@@ -2564,15 +2910,42 @@ class RealTimeERP(QMainWindow):
         if self._qt_object_alive(self.data_worker):
             self.clear_epochs_requested.emit()
 
+    def _current_live_plot_settings(self) -> dict:
+        return {
+            "refresh_rate": int(self.params.get("refresh_rate", 24) or 24),
+            "art_rem": self.params.get("art_rem", (-0.005, 0.005)),
+            "apply_bandpass": bool(self.params.get("apply_bandpass", False)),
+            "bandpass_range": self.params.get("bandpass_range", (8.0, 80.0)),
+            "apply_notch": bool(self.params.get("apply_notch", False)),
+            "notch_freqs": list(self.params.get("notch_freqs", [50.0]) or []),
+        }
+
+    @Slot(dict)
+    def apply_live_settings(self, new_params: dict):
+        if not new_params:
+            return
+        self.params.update(new_params)
+        if self._qt_object_alive(self.data_worker):
+            self.params_changed.emit(new_params)
+
     def update_settings(self):
         """Open the settings dialog and apply changes."""
+        previous_params = self._current_live_plot_settings()
         dialog = RealTimeSettings(self)
-        if dialog.exec():
+        dialog.settings_widget.set_settings(previous_params)
+        dialog.settings_widget.settingsChanged.connect(self.apply_live_settings)
+        accepted = bool(dialog.exec())
+        try:
+            dialog.settings_widget.settingsChanged.disconnect(self.apply_live_settings)
+        except (RuntimeError, TypeError):
+            pass
+
+        if accepted:
             new_params = dialog.get_settings()
             dialog.settings_widget.save_settings()
-            self.params.update(new_params)
-            if self._qt_object_alive(self.data_worker):
-                self.params_changed.emit(new_params)
+            self.apply_live_settings(new_params)
+        else:
+            self.apply_live_settings(previous_params)
 
     def on_roi_changed(self, *_):
         """Handle ROI changes on the evoked dock."""
@@ -2685,8 +3058,6 @@ class RealTimeERP(QMainWindow):
         self.params["bads"] = ordered_bads
         if self.info is not None:
             self.info["bads"] = ordered_bads.copy()
-        if self.epochs is not None:
-            self.epochs.info["bads"] = ordered_bads.copy()
         if self._qt_object_alive(self.data_worker):
             self.params_changed.emit({"bads": ordered_bads})
         self.refresh_theme()
@@ -2695,6 +3066,7 @@ class RealTimeERP(QMainWindow):
             self._schedule_topomap_update(immediate=True)
 
     def _shutdown_threads(self):
+        self._shutting_down = True
         self.raw_render_timer.stop()
         self.epoch_render_timer.stop()
         self.topomap_refresh_timer.stop()
@@ -2707,10 +3079,16 @@ class RealTimeERP(QMainWindow):
 
         self._stop_qthread("data_thread")
 
-        if self.epochs is not None:
+        if self._qt_object_alive(self.conn_worker):
             try:
-                self.epochs.disconnect()
-            except Exception:
+                self.conn_worker.stop()
+            except (Exception, RuntimeError):
+                pass
+
+        if self._qt_object_alive(self.progress_dialog):
+            try:
+                self.progress_dialog.reject()
+            except (Exception, RuntimeError):
                 pass
 
         if self.stream is not None:
@@ -2718,8 +3096,14 @@ class RealTimeERP(QMainWindow):
                 self.stream.disconnect()
             except Exception:
                 pass
+            self.stream = None
 
         self._stop_qthread("conn_thread")
+        self.epochs = None
+        self.pending_raw_payload = None
+        self.latest_raw_payload = None
+        self.pending_epoch_payload = None
+        self.latest_epoch_payload = None
 
     def closeEvent(self, event):
         self._shutdown_threads()
@@ -2727,6 +3111,7 @@ class RealTimeERP(QMainWindow):
             self.topomap_dialog.close()
         for dialog in list(self.opened_single_channels.values()):
             dialog.close()
+        self.closed.emit()
         super().closeEvent(event)
 
     @staticmethod
@@ -2740,7 +3125,7 @@ class RealTimeERP(QMainWindow):
         return np.column_stack((theta * np.cos(phi), theta * np.sin(phi)))
 
     def _apply_visual_montage(self):
-        if self.stream is None or self.epochs is None:
+        if self.stream is None:
             return
 
         selected_montage = self.params.get("default_montage")
@@ -2755,12 +3140,11 @@ class RealTimeERP(QMainWindow):
     def channel_position_text(self, ch_name: str) -> str:
         coords = self.channel_coords.get(ch_name)
         if coords is None:
-            return "No channel position available."
+            return ""
         if all(abs(value) < 1e-9 for value in coords) and not self.active_montage_name:
-            return "No channel position available."
+            return ""
 
-        montage_text = self.active_montage_name or "No montage"
-        return f"Montage: {montage_text} | projected x={coords[0]:.3f}, y={coords[1]:.3f}"
+        return f"Layout: x={coords[0]:.3f}, y={coords[1]:.3f}"
 
 class RealTimeMainWidget(QWidget):
     """The main entry point widget for the application."""
@@ -2786,6 +3170,7 @@ class RealTimeMainWidget(QWidget):
 
         self.connection_widget = ConnectionWidget()
         self.plot_settings_widget = RealTimeSettingsWidget()
+        self.plot_settings_widget.settingsChanged.connect(self._forward_plot_settings)
         # self.plot_settings_widget.setMaximumWidth(420)
         self.player_widget = PlayerWidget()
 
@@ -2841,6 +3226,15 @@ class RealTimeMainWidget(QWidget):
         if self.rt_erp_widget is not None:
             self.rt_erp_widget.refresh_theme()
 
+    @Slot(dict)
+    def _forward_plot_settings(self, params: dict):
+        if self.rt_erp_widget is not None:
+            self.rt_erp_widget.apply_live_settings(params)
+
+    @Slot()
+    def _on_visualizer_closed(self):
+        self.rt_erp_widget = None
+
     def launch_visualizer(self):
         """Launches the real-time ERP visualizer."""
         params = self.connection_widget.get_settings()
@@ -2863,6 +3257,7 @@ class RealTimeMainWidget(QWidget):
             self.rt_erp_widget.deleteLater()
 
         self.rt_erp_widget = RealTimeERP(params, self)
+        self.rt_erp_widget.closed.connect(self._on_visualizer_closed)
         self.rt_erp_widget.show()
         self.rt_erp_widget.start_visualization()
 
@@ -2870,6 +3265,7 @@ class RealTimeMainWidget(QWidget):
         self.player_widget.close()
         if self.rt_erp_widget:
             self.rt_erp_widget.close()
+            self.rt_erp_widget = None
         super().closeEvent(event)
 
 if __name__ == "__main__":
