@@ -19,31 +19,39 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
+from core.channel_info import ChannelInfo, MontageValidationError, load_channel_info
 from core.conversion import (
     ConversionEntry,
     convert_files,
     default_output_filename,
     discover_convertible_files,
+    load_montage,
     normalize_output_filename,
+    validate_source_for_montage,
 )
+from ui.widgets.tools.channel_info_dialog import ChannelInfoEditorDialog
+from ui.widgets.tools.merge_tool import MergeToolWidget
 from utils import Worker
 
 
-class ConversionToolDialog(QDialog):
+class ConversionWidget(QWidget):
     BuiltinMontagePlaceholder = "Select montage..."
     CustomMontageLabel = "Custom montage file..."
+    DefaultBuiltinMontage = "easycap-M1"
     SourcePathRole = Qt.ItemDataRole.UserRole + 1
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Convert and Merge EEG Data")
-        self.setMinimumSize(900, 640)
         self.source_folder: Path | None = None
         self.custom_montage_path: Path | None = None
-        self.mat_channel_info_path: Path | None = None
+        self.channel_info_path: Path | None = None
+        self.channel_info: ChannelInfo | None = None
+        self.channel_info_dirty = False
 
         self._setup_ui()
         self._setup_connections()
@@ -69,38 +77,33 @@ class ConversionToolDialog(QDialog):
         for montage_name in sorted(mne.channels.get_builtin_montages()):
             self.montage_combo.addItem(montage_name, montage_name)
         self.montage_combo.addItem(self.CustomMontageLabel, self.CustomMontageLabel)
+        default_index = self.montage_combo.findData(self.DefaultBuiltinMontage)
+        if default_index >= 0:
+            self.montage_combo.setCurrentIndex(default_index)
 
         self.custom_montage_edit = QLineEdit("No custom montage selected...")
         self.custom_montage_edit.setReadOnly(True)
         self.custom_montage_button = QPushButton("Browse...")
 
-        self.mat_info_edit = QLineEdit("Optional unless .mat files are selected...")
-        self.mat_info_edit.setReadOnly(True)
-        self.mat_info_button = QPushButton("Select JSON")
-
-        self.merge_name_edit = QLineEdit()
-        self.merge_name_edit.setPlaceholderText("merged_recording_raw.fif")
+        self.channel_info_edit = QLineEdit("Optional unless .mat files are selected...")
+        self.channel_info_edit.setReadOnly(True)
+        self.channel_info_button = QPushButton("Select JSON")
 
         settings_layout.addWidget(QLabel("Montage:"), 0, 0)
         settings_layout.addWidget(self.montage_combo, 0, 1, 1, 2)
         settings_layout.addWidget(self.custom_montage_edit, 1, 1)
         settings_layout.addWidget(self.custom_montage_button, 1, 2)
-        settings_layout.addWidget(QLabel("MAT Channel Info:"), 2, 0)
-        settings_layout.addWidget(self.mat_info_edit, 2, 1)
-        settings_layout.addWidget(self.mat_info_button, 2, 2)
-        settings_layout.addWidget(QLabel("Merged Output Name:"), 3, 0)
-        settings_layout.addWidget(self.merge_name_edit, 3, 1, 1, 2)
+        settings_layout.addWidget(QLabel("Channel Info JSON:"), 2, 0)
+        settings_layout.addWidget(self.channel_info_edit, 2, 1)
+        settings_layout.addWidget(self.channel_info_button, 2, 2)
         layout.addWidget(settings_group)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["Convert", "Merge", "Source", "Type", "Output File"]
-        )
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Convert", "Source", "Type", "Output File"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         layout.addWidget(self.table, 1)
 
         footer_row = QHBoxLayout()
@@ -117,7 +120,7 @@ class ConversionToolDialog(QDialog):
             self._on_montage_selection_changed
         )
         self.custom_montage_button.clicked.connect(self.select_custom_montage)
-        self.mat_info_button.clicked.connect(self.select_mat_channel_info)
+        self.channel_info_button.clicked.connect(self.select_channel_info)
         self.convert_button.clicked.connect(self.run_conversion)
 
     def select_source_folder(self):
@@ -155,19 +158,27 @@ class ConversionToolDialog(QDialog):
         self.custom_montage_edit.setText(self.custom_montage_path.name)
         self.custom_montage_edit.setToolTip(str(self.custom_montage_path))
 
-    def select_mat_channel_info(self):
+    def select_channel_info(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select MAT Channel Info JSON",
+            "Select Channel Info JSON",
             "",
             "JSON files (*.json)",
         )
         if not file_path:
             return
 
-        self.mat_channel_info_path = Path(file_path)
-        self.mat_info_edit.setText(self.mat_channel_info_path.name)
-        self.mat_info_edit.setToolTip(str(self.mat_channel_info_path))
+        try:
+            channel_info = load_channel_info(Path(file_path))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Channel Info", str(exc))
+            return
+
+        self._set_channel_info(
+            channel_info,
+            source_path=Path(file_path),
+            dirty=False,
+        )
 
     def populate_sources(self, source_paths: list[Path]):
         self.table.setRowCount(0)
@@ -175,7 +186,6 @@ class ConversionToolDialog(QDialog):
             self.table.insertRow(row)
 
             convert_item = self._check_item(checked=True)
-            merge_item = self._check_item(checked=False)
             source_item = QTableWidgetItem(
                 str(source_path.relative_to(self.source_folder))
                 if self.source_folder is not None
@@ -191,10 +201,9 @@ class ConversionToolDialog(QDialog):
             output_item = QTableWidgetItem(default_output_filename(source_path))
 
             self.table.setItem(row, 0, convert_item)
-            self.table.setItem(row, 1, merge_item)
-            self.table.setItem(row, 2, source_item)
-            self.table.setItem(row, 3, file_type_item)
-            self.table.setItem(row, 4, output_item)
+            self.table.setItem(row, 1, source_item)
+            self.table.setItem(row, 2, file_type_item)
+            self.table.setItem(row, 3, output_item)
 
         if source_paths:
             self.summary_label.setText(f"Found {len(source_paths)} convertible file(s).")
@@ -208,10 +217,17 @@ class ConversionToolDialog(QDialog):
 
     def run_conversion(self):
         try:
-            entries, merged_output_path = self._collect_entries()
+            entries = self._collect_entries()
             builtin_montage, custom_montage_path = self._resolve_montage_selection()
         except ValueError as exc:
-            QMessageBox.critical(self, "Invalid Conversion Settings", str(exc))
+            QMessageBox.warning(self, "Invalid Conversion Settings", str(exc))
+            return
+
+        if not self._ensure_montage_ready(
+            entries,
+            builtin_montage=builtin_montage,
+            custom_montage_path=custom_montage_path,
+        ):
             return
 
         worker = Worker(
@@ -219,8 +235,7 @@ class ConversionToolDialog(QDialog):
                 entries,
                 builtin_montage=builtin_montage,
                 custom_montage_path=custom_montage_path,
-                mat_channel_info_path=self.mat_channel_info_path,
-                merged_output_path=merged_output_path,
+                channel_info=self.channel_info,
             ),
             parent=self,
             add_loggers="mne",
@@ -233,33 +248,27 @@ class ConversionToolDialog(QDialog):
             return
 
         converted_paths = result.get("converted", [])
-        merged_path = result.get("merged")
-        message_lines = [
+        QMessageBox.information(
+            self,
+            "Conversion Complete",
             f"Converted {len(converted_paths)} file(s).",
-        ]
-        if merged_path is not None:
-            message_lines.append(f"Merged file saved to:\n{merged_path}")
-        else:
-            message_lines.append("No merged output was requested.")
-        QMessageBox.information(self, "Conversion Complete", "\n\n".join(message_lines))
+        )
 
-    def _collect_entries(self) -> tuple[list[ConversionEntry], Path | None]:
+    def _collect_entries(self) -> list[ConversionEntry]:
         if self.source_folder is None:
             raise ValueError("Select a source folder before converting files.")
         if self.table.rowCount() == 0:
             raise ValueError("No source files are available for conversion.")
 
         entries: list[ConversionEntry] = []
-        merge_count = 0
         seen_outputs: set[Path] = set()
         requires_mat_info = False
 
         for row in range(self.table.rowCount()):
             convert_item = self.table.item(row, 0)
-            merge_item = self.table.item(row, 1)
-            source_item = self.table.item(row, 2)
-            output_item = self.table.item(row, 4)
-            if not all([convert_item, merge_item, source_item, output_item]):
+            source_item = self.table.item(row, 1)
+            output_item = self.table.item(row, 3)
+            if not all([convert_item, source_item, output_item]):
                 continue
 
             if convert_item.checkState() != Qt.CheckState.Checked:
@@ -268,6 +277,7 @@ class ConversionToolDialog(QDialog):
             source_path = source_item.data(self.SourcePathRole)
             if not source_path:
                 continue
+
             source_path = Path(source_path)
             output_name = normalize_output_filename(output_item.text())
             output_item.setText(output_name)
@@ -276,9 +286,6 @@ class ConversionToolDialog(QDialog):
                 raise ValueError(f"Duplicate output file name detected: {output_name}")
             seen_outputs.add(output_path)
 
-            should_merge = merge_item.checkState() == Qt.CheckState.Checked
-            if should_merge:
-                merge_count += 1
             if source_path.suffix.lower() == ".mat":
                 requires_mat_info = True
 
@@ -286,30 +293,17 @@ class ConversionToolDialog(QDialog):
                 ConversionEntry(
                     source_path=source_path,
                     output_path=output_path,
-                    merge=should_merge,
                 )
             )
 
         if not entries:
             raise ValueError("Select at least one file to convert.")
-        if requires_mat_info and self.mat_channel_info_path is None:
+        if requires_mat_info and self.channel_info is None:
             raise ValueError(
-                "At least one selected file is a .mat file. Please provide the MAT channel info JSON."
+                "At least one selected file is a .mat file. Please provide the channel info JSON."
             )
 
-        merged_output_path = None
-        if merge_count > 0:
-            if merge_count < 2:
-                raise ValueError("Select at least two files to create a merged output.")
-            merge_name = normalize_output_filename(self.merge_name_edit.text() or "merged")
-            self.merge_name_edit.setText(merge_name)
-            merged_output_path = self.source_folder / merge_name
-            if merged_output_path in seen_outputs:
-                raise ValueError(
-                    "The merged output name conflicts with an individual converted file."
-                )
-
-        return entries, merged_output_path
+        return entries
 
     def _resolve_montage_selection(self) -> tuple[str | None, Path | None]:
         montage_data = self.montage_combo.currentData()
@@ -326,6 +320,79 @@ class ConversionToolDialog(QDialog):
         self.custom_montage_edit.setVisible(is_custom)
         self.custom_montage_button.setVisible(is_custom)
 
+    def _ensure_montage_ready(
+        self,
+        entries: list[ConversionEntry],
+        *,
+        builtin_montage: str | None,
+        custom_montage_path: Path | None,
+    ) -> bool:
+        montage = load_montage(
+            builtin_name=builtin_montage,
+            custom_path=custom_montage_path,
+        )
+        montage_label = builtin_montage or (
+            custom_montage_path.name if custom_montage_path is not None else "custom montage"
+        )
+
+        for entry in entries:
+            while True:
+                try:
+                    validate_source_for_montage(
+                        entry.source_path,
+                        builtin_montage=builtin_montage,
+                        custom_montage_path=custom_montage_path,
+                        channel_info=self.channel_info,
+                    )
+                    break
+                except MontageValidationError as exc:
+                    dialog = ChannelInfoEditorDialog(
+                        source_label=entry.source_path.name,
+                        montage_label=montage_label,
+                        error_message=str(exc),
+                        channel_info=exc.channel_info,
+                        issues=exc.issues,
+                        montage=montage,
+                        parent=self,
+                    )
+                    if dialog.exec() != QDialog.DialogCode.Accepted:
+                        return False
+
+                    self._set_channel_info(
+                        dialog.get_channel_info(),
+                        source_path=dialog.saved_path,
+                        dirty=dialog.saved_path is None,
+                    )
+                except ValueError:
+                    raise
+
+        return True
+
+    def _set_channel_info(
+        self,
+        channel_info: ChannelInfo | None,
+        *,
+        source_path: Path | None,
+        dirty: bool,
+    ):
+        self.channel_info = channel_info
+        self.channel_info_path = source_path
+        self.channel_info_dirty = dirty
+        if channel_info is None:
+            self.channel_info_edit.setText("Optional unless .mat files are selected...")
+            self.channel_info_edit.setToolTip("")
+            return
+
+        if source_path is not None and not dirty:
+            self.channel_info_edit.setText(source_path.name)
+            self.channel_info_edit.setToolTip(str(source_path))
+            return
+
+        self.channel_info_edit.setText("Edited in session (unsaved)")
+        self.channel_info_edit.setToolTip(
+            "Channel information was edited in the montage repair dialog and has not been saved yet."
+        )
+
     @staticmethod
     def _check_item(*, checked: bool) -> QTableWidgetItem:
         item = QTableWidgetItem()
@@ -338,6 +405,21 @@ class ConversionToolDialog(QDialog):
             Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         )
         return item
+
+
+class ConversionToolDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Convert or Merge EEG Data")
+        self.setMinimumSize(980, 720)
+
+        layout = QVBoxLayout(self)
+        tabs = QTabWidget()
+        self.conversion_widget = ConversionWidget(self)
+        self.merge_widget = MergeToolWidget(self)
+        tabs.addTab(self.conversion_widget, "Convert")
+        tabs.addTab(self.merge_widget, "Merge FIF")
+        layout.addWidget(tabs)
 
 
 if __name__ == "__main__":

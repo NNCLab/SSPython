@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import mne
 import numpy as np
 from scipy.io import loadmat
+
+from core.channel_info import (
+    ChannelInfo,
+    MontageValidationError,
+    apply_channel_info,
+    channel_info_from_raw,
+    identify_montage_issues,
+    resolve_channel_info,
+)
 
 try:
     import mat73
@@ -23,7 +31,6 @@ MAT_VOLT_CHANNEL_TYPES = {"eeg", "eog", "ecg", "emg", "seeg", "ecog", "dbs"}
 class ConversionEntry:
     source_path: Path
     output_path: Path
-    merge: bool = False
 
 
 def normalize_output_filename(name: str) -> str:
@@ -72,21 +79,6 @@ def discover_convertible_files(folder: Path) -> list[Path]:
     return supported_files
 
 
-def load_channel_info(channel_info_path: Path) -> tuple[list[str], list[str]]:
-    with Path(channel_info_path).open("r", encoding="utf-8") as stream:
-        channel_info = json.load(stream)
-
-    ch_names = channel_info.get("ch_names")
-    ch_types = channel_info.get("ch_types")
-    if not isinstance(ch_names, list) or not isinstance(ch_types, list):
-        raise ValueError(
-            "Channel info JSON must include 'ch_names' and 'ch_types' lists."
-        )
-    if len(ch_names) != len(ch_types):
-        raise ValueError("'ch_names' and 'ch_types' must have the same length.")
-    return [str(name) for name in ch_names], [str(kind) for kind in ch_types]
-
-
 def load_montage(*, builtin_name: str | None = None, custom_path: Path | None = None):
     if builtin_name:
         return mne.channels.make_standard_montage(builtin_name)
@@ -103,33 +95,49 @@ def apply_montage(
     *,
     builtin_montage: str | None = None,
     custom_montage_path: Path | None = None,
+    source_label: str | None = None,
 ) -> mne.io.BaseRaw:
     montage = load_montage(
         builtin_name=builtin_montage,
         custom_path=custom_montage_path,
     )
-    raw.set_montage(montage, on_missing="raise")
+    try:
+        raw.set_montage(montage, on_missing="raise", match_case=False)
+    except Exception as exc:
+        channel_info = channel_info_from_raw(raw)
+        issues = identify_montage_issues(channel_info, montage)
+        label = source_label or "the selected recording"
+        raise MontageValidationError(
+            f"Could not apply the selected montage to {label}: {exc}",
+            channel_info=channel_info,
+            issues=issues,
+        ) from exc
     return raw
 
 
 def load_raw_from_source(
     source_path: Path,
     *,
-    mat_channel_info_path: Path | None = None,
+    channel_info: ChannelInfo | Path | str | None = None,
     preload: bool = True,
 ) -> mne.io.BaseRaw:
     source_path = Path(source_path)
+    resolved_channel_info = resolve_channel_info(channel_info)
     if source_path.suffix.lower() == ".mat":
-        return load_raw_from_mat(source_path, channel_info_path=mat_channel_info_path)
-    return mne.io.read_raw(source_path, preload=preload, verbose="error")
+        return load_raw_from_mat(source_path, channel_info=resolved_channel_info)
+    raw = mne.io.read_raw(source_path, preload=preload, verbose="error")
+    if resolved_channel_info is not None:
+        apply_channel_info(raw, resolved_channel_info)
+    return raw
 
 
 def load_raw_from_mat(
     mat_path: Path,
     *,
-    channel_info_path: Path | None,
+    channel_info: ChannelInfo | Path | str | None,
 ) -> mne.io.RawArray:
-    if channel_info_path is None:
+    resolved_channel_info = resolve_channel_info(channel_info)
+    if resolved_channel_info is None:
         raise ValueError(
             f"MAT conversion requires a channel info JSON file: {mat_path.name}"
         )
@@ -137,7 +145,8 @@ def load_raw_from_mat(
     data = _load_mat_file(mat_path)
     sfreq = _extract_scalar(data, MAT_SFREQ_KEYS, "sampling frequency")
     raw_array = _extract_array(data, MAT_DATA_KEYS, "data matrix")
-    ch_names, ch_types = load_channel_info(channel_info_path)
+    ch_names = resolved_channel_info.ch_names
+    ch_types = resolved_channel_info.ch_types
 
     if raw_array.ndim != 2:
         raise ValueError(f"MAT file must contain a 2D array: {mat_path.name}")
@@ -146,7 +155,7 @@ def load_raw_from_mat(
     if raw_array.shape[0] != len(ch_names):
         raise ValueError(
             f"MAT data shape {raw_array.shape} does not match "
-            f"{len(ch_names)} channels in {channel_info_path}."
+            f"{len(ch_names)} channels in the selected channel info."
         )
 
     raw_array = raw_array.astype(float, copy=True)
@@ -167,21 +176,19 @@ def convert_files(
     *,
     builtin_montage: str | None = None,
     custom_montage_path: Path | None = None,
-    mat_channel_info_path: Path | None = None,
-    merged_output_path: Path | None = None,
-) -> dict[str, list[Path] | Path | None]:
+    channel_info: ChannelInfo | Path | str | None = None,
+) -> dict[str, list[Path]]:
     if not entries:
         raise ValueError("No files were selected for conversion.")
 
     converted_paths: list[Path] = []
-    merge_raws: list[mne.io.BaseRaw] = []
     managed_raws: list[mne.io.BaseRaw] = []
 
     try:
         for entry in entries:
             raw = load_raw_from_source(
                 entry.source_path,
-                mat_channel_info_path=mat_channel_info_path,
+                channel_info=channel_info,
                 preload=True,
             )
             managed_raws.append(raw)
@@ -189,30 +196,42 @@ def convert_files(
                 raw,
                 builtin_montage=builtin_montage,
                 custom_montage_path=custom_montage_path,
+                source_label=entry.source_path.name,
             )
 
             entry.output_path.parent.mkdir(parents=True, exist_ok=True)
             raw.save(entry.output_path, overwrite=True, verbose="error")
             converted_paths.append(entry.output_path)
 
-            if entry.merge:
-                merge_raws.append(raw)
-
-        merged_path = None
-        if merged_output_path is not None:
-            if len(merge_raws) < 2:
-                raise ValueError("Select at least two files to create a merged output.")
-            merged_output_path = Path(merged_output_path)
-            merged_output_path.parent.mkdir(parents=True, exist_ok=True)
-            merged_raw = mne.concatenate_raws(merge_raws, verbose="error")
-            merged_raw.save(merged_output_path, overwrite=True, verbose="error")
-            merged_path = merged_output_path
-
-        return {"converted": converted_paths, "merged": merged_path}
+        return {"converted": converted_paths}
     finally:
         for raw in managed_raws:
             if hasattr(raw, "close"):
                 raw.close()
+
+
+def validate_source_for_montage(
+    source_path: Path,
+    *,
+    builtin_montage: str | None = None,
+    custom_montage_path: Path | None = None,
+    channel_info: ChannelInfo | Path | str | None = None,
+) -> None:
+    raw = load_raw_from_source(
+        source_path,
+        channel_info=channel_info,
+        preload=False,
+    )
+    try:
+        apply_montage(
+            raw,
+            builtin_montage=builtin_montage,
+            custom_montage_path=custom_montage_path,
+            source_label=Path(source_path).name,
+        )
+    finally:
+        if hasattr(raw, "close"):
+            raw.close()
 
 
 def _load_mat_file(mat_path: Path) -> dict:

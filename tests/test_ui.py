@@ -2,13 +2,14 @@ import unittest
 import mne
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QListWidgetItem
+from PySide6.QtWidgets import QApplication, QListWidgetItem, QTabWidget
 from main import MainWindow
 from ui.widgets.evoked_plot import EvokedPlotWidget
 from ui.widgets.preprocessing_widgets import (
     EpochingSettingsWidget,
     PreprocessingSettingsWidget,
 )
+from ui.widgets.tools.conversion_tool import ConversionToolDialog
 from ui.widgets.tools.object_info_widget import ObjectInfoWidget, extract_event_counts
 from ui.widgets.real_time_widget import (
     ConnectionWidget,
@@ -180,6 +181,22 @@ class TestUI(unittest.TestCase):
         self.assertEqual(headers, ["Enabled", "Name", "Type", ""])
         self.assertEqual(widget.channel_table.columnCount(), 4)
         widget.close()
+
+    def test_conversion_tool_dialog_separates_convert_and_merge_tabs(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        dialog = ConversionToolDialog()
+        tab_widget = dialog.findChild(QTabWidget)
+        self.assertEqual(tab_widget.count(), 2)
+        self.assertEqual(tab_widget.tabText(0), "Convert")
+        self.assertEqual(tab_widget.tabText(1), "Merge FIF")
+        self.assertEqual(
+            dialog.conversion_widget.montage_combo.currentData(),
+            "easycap-M1",
+        )
+        dialog.close()
 
     def test_epoching_settings_preserve_selected_event_mapping(self):
         app = QApplication.instance()
