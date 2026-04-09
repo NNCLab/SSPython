@@ -12,12 +12,12 @@ uv add setuptools wheel nuitka ordered-set zstandard imageio
 ```
 
 ```plaintext
-uv run python -m nuitka --mode=onefile --enable-plugin=pyside6 --windows-console-mode=disable --windows-icon-from-ico=assets/icon.png --include-data-dir=assets=assets --include-package=mne --report=build-report.xml --output-filename=SSPython.exe --main=main.py
+uv run python -m nuitka --mode=standalone --enable-plugin=pyside6 --windows-console-mode=disable --windows-icon-from-ico=assets/icon.ico --include-data-dir=assets=assets --include-data-dir=style=style --include-package=mne --output-filename=SSPython.exe main.py
+
 ```
 
 # TODO:
 
-- [ ] `Check why some pulses are missing (sometimes). Might be device related (trigger to lsl not capping properly).`
 - [ ] Check muilti-event data visualization
-- [ ] Finish convert and merge utils
+- [ ] Check real-time decays (filter related or sampling rate related?)
 - [ ] Add TFR module
