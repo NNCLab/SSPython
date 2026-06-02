@@ -28,7 +28,7 @@ from ui.pages.home_page import HomePage
 from ui.pages.preferences_page import PreferencesPage
 from ui.pages.preprocessing_page import ProcessingPage
 from ui.pages.real_time_page import RealTimePage
-from ui.widgets.tools.conversion_tool import ConversionToolDialog
+from ui.widgets.tools.conversion_tool import ConvertToolDialog, MergeToolDialog
 from ui.widgets.tools.qss_helper import QSSEditorDialog
 from ui.widgets.workspace_panel import DatasetInspectorPanel, WorkspacePanel
 from utils import apply_theme, get_path, themed_svg_icon, toggle_theme as toggle_app_theme
@@ -189,30 +189,32 @@ class MainWindow(QMainWindow):
     def _setup_menu(self):
         menu_bar = self.menuBar()
 
-        file_menu = menu_bar.addMenu("&File")
-        self._add_action(file_menu, "Open Workspace", self.workspace_panel.select_folder, "Ctrl+O")
-        file_menu.addSeparator()
-        self._add_action(file_menu, "Convert / Merge EEG data", self._open_conversion_tool)
-        file_menu.addSeparator()
-        self._add_action(file_menu, "Exit", self.close)
+        self.file_menu = menu_bar.addMenu("&File")
+        self._add_action(self.file_menu, "Open Workspace", self.workspace_panel.select_folder, "Ctrl+O")
+        self.file_menu.addSeparator()
+        self.conversion_menu = self.file_menu.addMenu("Convert / Merge EEG data")
+        self._add_action(self.conversion_menu, "Convert EEG data", self._open_convert_tool)
+        self._add_action(self.conversion_menu, "Merge FIF data", self._open_merge_tool)
+        self.file_menu.addSeparator()
+        self._add_action(self.file_menu, "Exit", self.close)
 
-        view_menu = menu_bar.addMenu("&View")
-        self._add_action(view_menu, "Toggle Sidebar", self.toggle_sidebar, "Ctrl+B")
-        self._add_action(view_menu, "Toggle Derivative Inspector", self.toggle_derivative_inspector, "Ctrl+I")
-        self._add_action(view_menu, "Toggle Light/Dark Theme", self.toggle_theme)
+        self.view_menu = menu_bar.addMenu("&View")
+        self._add_action(self.view_menu, "Toggle Sidebar", self.toggle_sidebar, "Ctrl+B")
+        self._add_action(self.view_menu, "Toggle Derivative Inspector", self.toggle_derivative_inspector, "Ctrl+I")
+        self._add_action(self.view_menu, "Toggle Light/Dark Theme", self.toggle_theme)
         self._add_action(
-            view_menu,
+            self.view_menu,
             "Toggle Fullscreen",
             lambda: self.showFullScreen() if not self.isFullScreen() else self.showNormal(),
             "F11",
         )
-        view_menu.addSeparator()
+        self.view_menu.addSeparator()
 
-        pipeline_menu = menu_bar.addMenu("&Pipeline")
+        self.pipeline_menu = menu_bar.addMenu("&Pipeline")
         self.pipeline_actions = {}
         for pipeline in all_pipelines():
             action = self._add_action(
-                pipeline_menu,
+                self.pipeline_menu,
                 pipeline.name,
                 lambda checked=False, pipeline_id=pipeline.id: self.set_current_pipeline(pipeline_id),
             )
@@ -431,8 +433,12 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     @Slot()
-    def _open_conversion_tool(self):
-        dialog = ConversionToolDialog(self)
+    def _open_convert_tool(self):
+        dialog = ConvertToolDialog(parent=self)
+        dialog.exec()
+
+    def _open_merge_tool(self):
+        dialog = MergeToolDialog(self)
         dialog.exec()
 
     def _open_qss_dialog(self):

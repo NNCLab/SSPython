@@ -8,6 +8,7 @@ import matplotlib.colors as mcolors
 from dataclasses import dataclass
 from collections import deque
 from functools import lru_cache
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,11 +29,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QCheckBox,
     QMainWindow,
-    QTableWidget,
-    QTableWidgetItem,
-    QHeaderView,
     QComboBox,
-    QGridLayout,
     QFrame,
     QScrollArea,
     QSizePolicy,
@@ -44,16 +41,14 @@ from matplotlib.figure import Figure
 from shiboken6 import isValid
 from .tools.optional_range_widget import OptionalRangeWidget
 from .real_time_plot_docks import ChannelLayoutDock, EvokedButterflyDock, RawMonitorDock
-import json
 from scipy import signal
 from scipy.spatial import distance
 
 from core.app_settings import get_settings_store
+from core.conversion import load_conversion_info, validate_conversion_info
 from utils import apply_theme, current_theme_name, theme_tokens
 
 
-DEFAULT_REAL_TIME_MONTAGE = "easycap-M1"
-CHANNEL_TYPE_OPTIONS = ["eeg", "stim", "bad"]
 DEFAULT_LIVE_EVENT_ID_MAX = 65535
 
 
@@ -79,19 +74,6 @@ def normalize_live_channel_type(channel_type: str | None) -> str:
     if normalized in {"eeg", "stim", "bad"}:
         return normalized
     return "bad"
-
-
-def builtin_montage_names() -> list[str]:
-    return ["None"] + sorted(mne.channels.get_builtin_montages())
-
-
-def suggest_channel_type(channel_name: str) -> str:
-    name = channel_name.strip().lower()
-    if any(token in name for token in ("stim", "sti", "trigger", "trig", "marker", "status", "event")):
-        return "stim"
-    if any(token in name for token in ("eog", "veog", "heog", "time", "ref", "masto", "ear")):
-        return "bad"
-    return "eeg"
 
 
 def build_epoch_stream_configuration(
@@ -150,6 +132,89 @@ def normalize_event_channels(event_channels: str | list[str] | None) -> list[str
     if isinstance(event_channels, str):
         return [event_channels]
     return [channel for channel in event_channels if channel]
+
+
+def validate_realtime_info(info: mne.Info) -> mne.Info:
+    validated = validate_conversion_info(info)
+    eeg_picks = mne.pick_types(validated, eeg=True, exclude=())
+    if len(eeg_picks) == 0:
+        raise ValueError("Real-time info must include at least one EEG channel.")
+    return validated
+
+
+def live_channel_type_from_info(channel_type: str) -> str:
+    normalized = str(channel_type or "").strip().lower()
+    if normalized in {"eeg", "stim"}:
+        return normalized
+    return "bad"
+
+
+def channel_settings_from_info(info: mne.Info) -> list[dict]:
+    validated = validate_realtime_info(info)
+    bads = set(validated.get("bads", []))
+    settings: list[dict] = []
+    for name, channel_type in zip(
+        validated["ch_names"],
+        validated.get_channel_types(),
+        strict=False,
+    ):
+        live_type = live_channel_type_from_info(channel_type)
+        settings.append(
+            {
+                "name": name,
+                "enabled": name not in bads and live_type != "bad",
+                "type": live_type,
+            }
+        )
+    return settings
+
+
+def apply_realtime_info_to_stream(stream, info: mne.Info):
+    realtime_info = validate_realtime_info(info)
+    if len(stream.ch_names) != len(realtime_info["ch_names"]):
+        raise ValueError(
+            f"Stream has {len(stream.ch_names)} channels, "
+            f"but real-time info defines {len(realtime_info['ch_names'])} channels."
+        )
+    if not np.isclose(float(stream.info["sfreq"]), float(realtime_info["sfreq"])):
+        raise ValueError(
+            f"Stream sampling frequency {float(stream.info['sfreq']):g} Hz does not match "
+            f"real-time info sampling frequency {float(realtime_info['sfreq']):g} Hz."
+        )
+
+    rename_map = {
+        old_name: new_name
+        for old_name, new_name in zip(stream.ch_names, realtime_info["ch_names"], strict=False)
+        if old_name != new_name
+    }
+    if rename_map:
+        stream.rename_channels(rename_map)
+
+    channel_types = {
+        channel_name: channel_type
+        for channel_name, channel_type in zip(
+            realtime_info["ch_names"],
+            realtime_info.get_channel_types(),
+            strict=False,
+        )
+    }
+    if channel_types:
+        stream.set_channel_types(channel_types)
+
+    stream.info["bads"] = [
+        channel_name
+        for channel_name in realtime_info["bads"]
+        if channel_name in stream.info["ch_names"]
+    ]
+    try:
+        stream.set_montage(
+            realtime_info.get_montage(),
+            on_missing="raise",
+            match_case=False,
+        )
+    except TypeError:
+        stream.set_montage(realtime_info.get_montage())
+    return stream
 
 
 def detect_regular_stream_event_ids(
@@ -799,7 +864,7 @@ class PlayerWidget(QWidget):
 
 class StreamInfoWorker(QObject):
     """Worker to find an LSL stream and get its info."""
-    finished = Signal(list)
+    finished = Signal(object)
     error = Signal(str)
 
     def __init__(self, stream_name):
@@ -811,9 +876,9 @@ class StreamInfoWorker(QObject):
             # Short duration, we just want the info
             stream = mne_lsl.stream.StreamLSL(1, name=self.stream_name)
             stream.connect(acquisition_delay=0.1, processing_flags="all", timeout=5)
-            ch_names = stream.info["ch_names"]
+            info = stream.info.copy()
             stream.disconnect()
-            self.finished.emit(ch_names)
+            self.finished.emit(info)
         except Exception as e:
             self.error.emit(f"Could not find or connect to stream '{self.stream_name}': {e}")
 
@@ -826,6 +891,9 @@ class ConnectionWidget(QWidget):
         super().__init__(parent)
         self.settings_store = get_settings_store()
         self.ch_names = []
+        self.realtime_info: mne.Info | None = None
+        self.info_source_path: str | None = None
+        self.info_label: str | None = None
         self.setup_ui()
         self.load_settings()
 
@@ -854,59 +922,49 @@ class ConnectionWidget(QWidget):
             scale=1e-3,
             parent=self,
         )
-        self.default_montage_combo = QComboBox()
-        self.default_montage_combo.addItems(builtin_montage_names())
-        self.find_channels_button = QPushButton("Find Channels from Stream")
+        self.info_edit = QLineEdit("No MNE info selected...")
+        self.info_edit.setReadOnly(True)
+        self.select_info_button = QPushButton("Select Info Source")
+        self.find_channels_button = QPushButton("Find Info from Stream")
         form_layout.addRow("Stream Name:", self.stream_name_input)
         form_layout.addRow("Stream Duration (s):", self.stream_duration_input)
         form_layout.addRow("Epoching (t_start, t_end):", self.tlim_input)
-        form_layout.addRow("Fallback Montage:", self.default_montage_combo)
+        form_layout.addRow("MNE Info:", self.info_edit)
+        form_layout.addRow(self.select_info_button)
         form_layout.addRow(self.find_channels_button)
         main_layout.addWidget(conn_group_box)
-        
-        # --- Channel Config Group ---
-        chan_group_box = QGroupBox("Channel Configuration")
-        chan_layout = QVBoxLayout(chan_group_box)
-        helper_label = QLabel(
-            "Live mode currently keeps only EEG and stim channels. Unsupported channels are excluded. Stim channels are auto-detected by name."
-        )
-        helper_label.setObjectName("mutedLabel")
-        helper_label.setWordWrap(True)
-        chan_layout.addWidget(helper_label)
-        table_actions_layout = QHBoxLayout()
-        self.add_channel_button = QPushButton("Add Channel")
-        table_actions_layout.addStretch()
-        table_actions_layout.addWidget(self.add_channel_button)
-        chan_layout.addLayout(table_actions_layout)
-        self.channel_table = QTableWidget()
-        self.channel_table.setColumnCount(4)
-        self.channel_table.setHorizontalHeaderLabels(["Enabled", "Name", "Type", ""])
-        self.channel_table.setMinimumHeight(260)
-        self.channel_table.setAlternatingRowColors(True)
-        self.channel_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.channel_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.channel_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.channel_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.channel_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.channel_table.verticalHeader().setVisible(False)
-        self.channel_table.verticalHeader().setDefaultSectionSize(32)
-        chan_layout.addWidget(self.channel_table)
-        
-        save_load_layout = QHBoxLayout()
-        self.save_button = QPushButton("Save Config to File...")
-        self.load_button = QPushButton("Load Config from File...")
-        save_load_layout.addStretch()
-        save_load_layout.addWidget(self.save_button)
-        save_load_layout.addWidget(self.load_button)
-        chan_layout.addLayout(save_load_layout)
-        
-        main_layout.addWidget(chan_group_box)
+
+        info_group_box = QGroupBox("Info Summary")
+        info_layout = QVBoxLayout(info_group_box)
+        self.info_summary_label = QLabel("No MNE info loaded.")
+        self.info_summary_label.setObjectName("mutedLabel")
+        self.info_summary_label.setWordWrap(True)
+        info_layout.addWidget(self.info_summary_label)
+        main_layout.addWidget(info_group_box)
         
         # --- Connections ---
+        self.select_info_button.clicked.connect(self.select_info_source)
         self.find_channels_button.clicked.connect(self.find_channels)
-        self.add_channel_button.clicked.connect(self.add_channel_row)
-        self.save_button.clicked.connect(self.save_channel_config)
-        self.load_button.clicked.connect(self.load_channel_config)
+
+    def select_info_source(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select MNE Info Source",
+            "",
+            "MNE files (*.fif *.fif.gz);;All files (*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            info = load_conversion_info(file_path)
+            self.set_realtime_info(
+                info,
+                label=Path(file_path).name,
+                source_path=file_path,
+            )
+        except (TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Invalid MNE Info", str(exc))
 
     def find_channels(self):
         stream_name = self.stream_name_input.text()
@@ -928,250 +986,75 @@ class ConnectionWidget(QWidget):
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
 
-    def _populate_channel_table(self, ch_names: list[str]):
-        """Clears and rebuilds the channel table from a list of names."""
-        self.ch_names = list(ch_names)
-        self.channel_table.clearContents()
-        self.channel_table.setRowCount(0)
-
-        for name in self.ch_names:
-            self._insert_channel_row(
-                self.channel_table.rowCount(),
-                name=name,
-                enabled=True,
-                channel_type=suggest_channel_type(name),
-            )
-
-        self.channel_table.resizeRowsToContents()
-
-    def on_channels_found(self, ch_names):
-        """Populates the channel table after finding a stream."""
-        self._populate_channel_table(ch_names)
+    def on_channels_found(self, info):
+        """Applies the stream info after finding a stream."""
+        try:
+            self.set_realtime_info(info, label="Stream info")
+        except ValueError as exc:
+            QMessageBox.warning(self, "Stream Info Missing Montage", str(exc))
         self.find_channels_button.setEnabled(True)
-        self.find_channels_button.setText("Find Channels from Stream")
-        
-        # Try to apply saved settings for the newly found channels
-        saved_channel_config = self.settings_store.get(f"{self.SETTINGS_PATH}/channels", [])
-        if saved_channel_config:
-            self.set_channel_settings(saved_channel_config)
+        self.find_channels_button.setText("Find Info from Stream")
 
     def on_find_error(self, error_message):
         QMessageBox.critical(self, "Error Finding Stream", error_message)
         self.find_channels_button.setEnabled(True)
-        self.find_channels_button.setText("Find Channels from Stream")
+        self.find_channels_button.setText("Find Info from Stream")
 
-    def _create_centered_widget(self, widget):
-        centered_widget = QWidget()
-        layout = QHBoxLayout(centered_widget)
-        layout.addWidget(widget)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setContentsMargins(0,0,0,0)
-        return centered_widget
+    def _info_channel_settings(self) -> list[dict]:
+        if self.realtime_info is None:
+            self.ch_names = []
+            return []
+        settings = channel_settings_from_info(self.realtime_info)
+        self.ch_names = [channel["name"] for channel in settings]
+        return settings
 
-    def _create_name_item(self, name: str) -> QTableWidgetItem:
-        item = QTableWidgetItem(name)
-        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        return item
+    def _update_info_summary(self):
+        if self.realtime_info is None:
+            self.info_summary_label.setText("No MNE info loaded.")
+            return
 
-    def _create_type_combo(self, channel_type: str) -> QComboBox:
-        combo = QComboBox()
-        combo.addItems(CHANNEL_TYPE_OPTIONS)
-        for index in range(combo.count()):
-            combo.setItemData(
-                index,
-                int(Qt.AlignmentFlag.AlignCenter),
-                Qt.ItemDataRole.TextAlignmentRole,
-            )
-        combo.setEditable(True)
-        line_edit = combo.lineEdit()
-        if line_edit is not None:
-            line_edit.setReadOnly(True)
-            line_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        combo.setCurrentText(normalize_live_channel_type(channel_type))
-        combo.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
+        settings = self._info_channel_settings()
+        eeg_count = sum(1 for channel in settings if channel["type"] == "eeg")
+        stim_channels = [channel["name"] for channel in settings if channel["type"] == "stim"]
+        bad_channels = [channel["name"] for channel in settings if not channel["enabled"]]
+        stim_text = ", ".join(stim_channels) if stim_channels else "None"
+        bad_text = ", ".join(bad_channels) if bad_channels else "None"
+        self.info_summary_label.setText(
+            f"{len(settings)} channels | EEG: {eeg_count} | Stim: {stim_text} | Excluded: {bad_text}"
         )
-        return combo
 
-    def _insert_channel_row(
+    def set_realtime_info(
         self,
-        row: int,
+        info: mne.Info,
         *,
-        name: str,
-        enabled: bool,
-        channel_type: str,
+        label: str | None = None,
+        source_path: str | None = None,
     ):
-        self.channel_table.insertRow(row)
-
-        enabled_check = QCheckBox()
-        enabled_check.setChecked(enabled)
-        self.channel_table.setCellWidget(
-            row, 0, self._create_centered_widget(enabled_check)
+        realtime_info = validate_realtime_info(info).copy()
+        self.realtime_info = realtime_info
+        self.info_source_path = str(source_path) if source_path else None
+        self.info_label = label or "Provided MNE Info"
+        self.info_edit.setText(
+            f"{self.info_label} ({len(realtime_info['ch_names'])} channels, {realtime_info['sfreq']:g} Hz)"
         )
-
-        self.channel_table.setItem(row, 1, self._create_name_item(name))
-
-        type_combo = self._create_type_combo(channel_type)
-        self.channel_table.setCellWidget(row, 2, type_combo)
-
-        remove_button = QPushButton("Remove")
-        remove_button.clicked.connect(self._remove_channel_row_from_button)
-        self.channel_table.setCellWidget(
-            row, 3, self._create_centered_widget(remove_button)
-        )
-
-    def _channel_name_for_row(self, row: int) -> str:
-        item = self.channel_table.item(row, 1)
-        if item is None:
-            return f"CH_{row + 1}"
-        name = item.text().strip()
-        if name:
-            return name
-        name = f"CH_{row + 1}"
-        item.setText(name)
-        return name
-
-    def _enabled_checkbox_for_row(self, row: int) -> QCheckBox | None:
-        cell_widget = self.channel_table.cellWidget(row, 0)
-        return cell_widget.findChild(QCheckBox) if cell_widget else None
-
-    def _type_combo_for_row(self, row: int) -> QComboBox | None:
-        cell_widget = self.channel_table.cellWidget(row, 2)
-        if isinstance(cell_widget, QComboBox):
-            return cell_widget
-        return cell_widget.findChild(QComboBox) if cell_widget else None
-
-    def _update_channel_name_cache(self):
-        self.ch_names = [
-            self._channel_name_for_row(row)
-            for row in range(self.channel_table.rowCount())
-        ]
-
-    def _next_manual_channel_name(self) -> str:
-        existing_names = {
-            self._channel_name_for_row(row).strip().lower()
-            for row in range(self.channel_table.rowCount())
-        }
-        index = self.channel_table.rowCount() + 1
-        while f"ch_{index}".lower() in existing_names:
-            index += 1
-        return f"CH_{index}"
-
-    def add_channel_row(self):
-        row = self.channel_table.rowCount()
-        self._insert_channel_row(
-            row,
-            name=self._next_manual_channel_name(),
-            enabled=True,
-            channel_type="eeg",
-        )
-        self.channel_table.resizeRowsToContents()
-        self._update_channel_name_cache()
-
-    def _remove_channel_row_from_button(self):
-        remove_button = self.sender()
-        for row in range(self.channel_table.rowCount()):
-            cell_widget = self.channel_table.cellWidget(row, 3)
-            if cell_widget and cell_widget.findChild(QPushButton) is remove_button:
-                self.channel_table.removeRow(row)
-                self._update_channel_name_cache()
-                return
-        
-    def save_channel_config(self):
-        if self.channel_table.rowCount() == 0:
-            QMessageBox.warning(self, "No Channels", "No channel information to save.")
-            return
-
-        path, _ = QFileDialog.getSaveFileName(self, "Save Channel Configuration", "", "JSON Files (*.json)")
-        if not path:
-            return
-
-        config = self.get_channel_settings()
-        try:
-            with open(path, 'w') as f:
-                json.dump(config, f, indent=4)
-        except IOError as e:
-            QMessageBox.critical(self, "Error Saving File", f"Could not save configuration file: {e}")
-
-    def load_channel_config(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Load Channel Configuration", "", "JSON Files (*.json)")
-        if not path:
-            return
-
-        try:
-            with open(path, 'r') as f:
-                config = json.load(f)
-        except (IOError, json.JSONDecodeError) as e:
-            QMessageBox.critical(self, "Error Loading File", f"Could not load or parse configuration file: {e}")
-            return
-        
-        if not isinstance(config, list) or not all(isinstance(item, dict) and 'name' in item for item in config):
-            QMessageBox.warning(self, "Invalid File", "Config must be a JSON list of objects, each with a 'name' key.")
-            return
-
-        ch_names = [item.get('name', f'CH_{i}') for i, item in enumerate(config)]
-        self._populate_channel_table(ch_names)
-        self.set_channel_settings(config)
-
-    def get_channel_settings(self):
-        channels_config = []
-        for i in range(self.channel_table.rowCount()):
-            name = self._channel_name_for_row(i)
-            
-            enabled_check = self._enabled_checkbox_for_row(i)
-            enabled = enabled_check.isChecked() if enabled_check else True
-            
-            type_combo = self._type_combo_for_row(i)
-            ch_type = type_combo.currentText() if type_combo else "eeg"
-            
-            channels_config.append({
-                "name": name,
-                "enabled": enabled,
-                "type": ch_type,
-            })
-        self.ch_names = [channel["name"] for channel in channels_config]
-        return channels_config
-
-    def set_channel_settings(self, config):
-        config_map = {
-            item.get('name'): item
-            for item in config
-            if isinstance(item, dict) and item.get('name')
-        }
-        for i in range(self.channel_table.rowCount()):
-            row_name = self._channel_name_for_row(i)
-            ch_config = config_map.get(row_name)
-            if ch_config is None and i < len(config):
-                ch_config = config[i]
-            if not isinstance(ch_config, dict):
-                continue
-
-            enabled_check = self._enabled_checkbox_for_row(i)
-            if enabled_check:
-                enabled_check.setChecked(ch_config.get('enabled', True))
-
-            type_combo = self._type_combo_for_row(i)
-            if type_combo:
-                type_combo.setCurrentText(
-                    normalize_live_channel_type(ch_config.get('type', 'eeg'))
-                )
-        self._update_channel_name_cache()
+        self.info_edit.setToolTip("Real-time info includes a montage.")
+        self._update_info_summary()
 
     def get_settings(self) -> dict:
         base_settings = {
             "stream_name": self.stream_name_input.text(),
             "stream_duration": self.stream_duration_input.value(),
             "tlim": self.tlim_input.value(),
-            "default_montage": self.default_montage_combo.currentText(),
         }
-        channel_settings = self.get_channel_settings()
+        if self.realtime_info is not None:
+            base_settings["info"] = self.realtime_info.copy()
+            base_settings["info_label"] = self.info_label
+        channel_settings = self._info_channel_settings()
         event_id, event_channels, bads = build_epoch_stream_configuration(channel_settings)
 
         base_settings['event_id'] = event_id
         base_settings['event_channels'] = event_channels
         base_settings['bads'] = bads
-        base_settings['channels'] = channel_settings
 
         return base_settings
 
@@ -1181,11 +1064,9 @@ class ConnectionWidget(QWidget):
             "stream_name": self.stream_name_input.text(),
             "stream_duration": self.stream_duration_input.value(),
             "tlim": self.tlim_input.value(),
-            "default_montage": self.default_montage_combo.currentText(),
         }
-        channel_settings = self.get_channel_settings()
-        if channel_settings:
-            params["channels"] = channel_settings
+        if self.info_source_path:
+            params["info_source_path"] = self.info_source_path
 
         self.settings_store.set(self.SETTINGS_PATH, params)
         self.settings_store.sync()
@@ -1196,8 +1077,7 @@ class ConnectionWidget(QWidget):
             "stream_name": "EEGStream",
             "stream_duration": 5,
             "tlim": (-0.1, 0.3),
-            "default_montage": DEFAULT_REAL_TIME_MONTAGE,
-            "channels": [],
+            "info_source_path": "",
         }
         saved_params = self.settings_store.get(
             self.SETTINGS_PATH,
@@ -1211,13 +1091,18 @@ class ConnectionWidget(QWidget):
         self.stream_name_input.setText(params.get("stream_name"))
         self.stream_duration_input.setValue(int(params.get("stream_duration")))
         self.tlim_input.setValue(params.get("tlim"))
-        self.default_montage_combo.setCurrentText(params.get("default_montage", DEFAULT_REAL_TIME_MONTAGE))
-        
-        channel_config = params.get("channels", [])
-        if channel_config:
-            ch_names = [item.get('name', '') for item in channel_config]
-            self._populate_channel_table(ch_names)
-            self.set_channel_settings(channel_config)
+
+        info_source_path = params.get("info_source_path")
+        if info_source_path:
+            try:
+                self.set_realtime_info(
+                    load_conversion_info(info_source_path),
+                    label=Path(info_source_path).name,
+                    source_path=info_source_path,
+                )
+                return
+            except (TypeError, ValueError):
+                self.info_edit.setText("Saved MNE info source could not be loaded.")
 
 
 class ConnectionManager:
@@ -1227,6 +1112,7 @@ class ConnectionManager:
     def __init__(self, params):
         self.params = params
         self.raw = None
+        self.last_error = ""
 
     def connect_to_stream(self):
         """Establishes a connection to the LSL stream."""
@@ -1236,51 +1122,31 @@ class ConnectionManager:
             event_id = self.params.get("event_id")
             event_channels = self.params.get("event_channels")
             event_channel_list = normalize_event_channels(event_channels)
+            realtime_info = self.params.get("info")
+            if realtime_info is None:
+                raise ValueError("Real-time visualization requires an mne.Info object with a montage.")
 
             self.raw = mne_lsl.stream.StreamLSL(stream_duration, name=stream_name)
             self.raw.connect(
                 acquisition_delay=0.1, processing_flags="all", timeout=5
             )
 
-            # Apply channel names and types
-            if self.params.get("channels"):
-                ch_rename_map = {}
-                ch_types = {}
-                for idx, ch in enumerate(self.params["channels"]):
-                    if idx < len(self.raw.ch_names):
-                        orig_name = self.raw.ch_names[idx]
-                        new_name = ch["name"]
-                        if orig_name != new_name:
-                            ch_rename_map[orig_name] = new_name
-                        
-                        normalized_type = normalize_live_channel_type(ch.get("type", "eeg"))
-                        c_type = normalized_type if normalized_type in {"eeg", "stim"} else "misc"
-                        ch_types[new_name] = c_type
-
-                if ch_rename_map:
-                    try:
-                        self.raw.rename_channels(ch_rename_map)
-                        print(f"Renamed channels: {ch_rename_map}")
-                    except Exception as e:
-                        print(f"Warning: could not rename channels: {e}")
-
-                if ch_types:
-                    try:
-                        self.raw.set_channel_types(ch_types)
-                        print(f"Set channel types: {ch_types}")
-                    except Exception as e:
-                        print(f"Warning: could not set channel types: {e}")
+            apply_realtime_info_to_stream(self.raw, realtime_info)
 
             bads = self.params.get('bads', [])
             if bads:
                 self.raw.info['bads'] = bads
 
-            default_montage = self.params.get("default_montage")
-            if default_montage and default_montage != "None" and self.raw.get_montage() is None:
-                try:
-                    self.raw.set_montage(mne.channels.make_standard_montage(default_montage))
-                except Exception as exc:
-                    print(f"Warning: could not apply montage '{default_montage}': {exc}")
+            missing_event_channels = [
+                channel
+                for channel in event_channel_list
+                if channel not in self.raw.info["ch_names"]
+            ]
+            if missing_event_channels:
+                raise ValueError(
+                    "Event channel(s) are not present in the real-time info: "
+                    + ", ".join(missing_event_channels)
+                )
 
             event_id = resolve_regular_stream_event_id(
                 self.raw,
@@ -1291,6 +1157,7 @@ class ConnectionManager:
             print("Connection successful.")
             return self.raw
         except Exception as e:
+            self.last_error = str(e)
             print(f"Failed to connect to stream: {e}")
             return None
 
@@ -1328,7 +1195,8 @@ class ConnectionWorker(QObject):
                 self.finished.emit(stream)
             else:
                 self.error.emit(
-                    "Failed to connect to the LSL stream. Please check the stream name and ensure it is available."
+                    self.conn_manager.last_error
+                    or "Failed to connect to the LSL stream. Please check the stream name and ensure it is available."
                 )
         except Exception as e:
             self.error.emit(f"An error occurred during connection: {e}")
@@ -2259,6 +2127,9 @@ class RealTimeERP(QMainWindow):
         self.raw_dock = RawMonitorDock(self)
         self.topo_dock = ChannelLayoutDock(self)
         self.evoked_dock = EvokedButterflyDock(self)
+        self.top_splitter = self.raw_dock
+        self.raw_widget = self.raw_dock
+        self.topo_widget = self.topo_dock
         self.plot_docks = {
             "raw": self.raw_dock,
             "topo": self.topo_dock,
@@ -3128,11 +2999,8 @@ class RealTimeERP(QMainWindow):
         if self.stream is None:
             return
 
-        selected_montage = self.params.get("default_montage")
         if self.stream.get_montage() is not None:
-            self.active_montage_name = (
-                selected_montage if selected_montage and selected_montage != "None" else "Stream montage"
-            )
+            self.active_montage_name = self.params.get("info_label") or "MNE info montage"
             return
 
         self.active_montage_name = None
@@ -3177,7 +3045,7 @@ class RealTimeMainWidget(QWidget):
         live_card = self._build_card("Connect to Live Stream")
         live_layout = live_card.layout()
         live_help = QLabel(
-            "Find channels, confirm which inputs are EEG or stim, then launch the live visualizer."
+            "Select an MNE info source with montage, then launch the live visualizer."
         )
         live_help.setObjectName("mutedLabel")
         live_help.setWordWrap(True)
@@ -3238,14 +3106,18 @@ class RealTimeMainWidget(QWidget):
     def launch_visualizer(self):
         """Launches the real-time ERP visualizer."""
         params = self.connection_widget.get_settings()
-        if not params.get("channels"):
-            QMessageBox.warning(self, "No Channel Configuration", "Find channels before launching the live visualizer.")
+        if params.get("info") is None:
+            QMessageBox.warning(
+                self,
+                "No MNE Info",
+                "Select an MNE info source with a montage before launching the live visualizer.",
+            )
             return
         if not params.get("event_channels"):
             QMessageBox.warning(
                 self,
                 "No Event Channel",
-                "Mark at least one enabled channel as 'stim' so epochs can be built from incoming events.",
+                "The selected MNE info must include at least one stim channel so epochs can be built from incoming events.",
             )
             return
 

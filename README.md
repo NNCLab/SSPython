@@ -2,10 +2,9 @@
 
 SSPython is a desktop EEG analysis application built with PySide6 and MNE-Python. It is designed to take a recording from raw import through preprocessing, inspection, real-time visualization, and downstream analysis inside a single workspace-oriented interface.
 
-The current application ships two analysis pipelines:
+The current application ships one built-in `Standard` pipeline. It provides the shared preprocessing workflow and lets users choose event-based or fixed-length epoch segmentation from the `Segment into Epochs` dialog.
 
-- `TMS-EEG`: artifact-aware preprocessing and ERP/TEP analysis.
-- `Continuous EEG`: continuous inspection, filtering, PSD analysis, and fixed-length epoch workflows.
+The pipeline system is structured so future custom pipelines can define different workflow sections and actions without duplicating the standard workflow.
 
 The software is currently in a pre-release stage. Validate all outputs before using them for publication, regulatory work, or clinical interpretation.
 
@@ -54,7 +53,7 @@ SSPython uses MNE-Python as its signal-processing foundation and recommends the 
 - Shared conversion dialog for folder scanning, output renaming, montage selection, and optional file merging.
 - Special-case `.mat` import for datasets that are not directly readable by MNE.
 - Workspace browser that discovers all `*_raw.fif` files under the selected workspace.
-- Pipeline-specific derivative tracking with progress indicators and stage inspection.
+- Pipeline derivative tracking with progress indicators and stage inspection.
 - Interactive evoked plotting with single-click channel selection, event-condition dropdowns, and drag-to-topomap inspection.
 - PSD visualization for continuous data.
 - ERP/TEP analysis tools including topoplot, response amplitude analysis, natural frequency analysis, and time-frequency analysis.
@@ -120,7 +119,7 @@ Recommended first steps:
 
 1. Launch the app.
 2. Open the `Preferences` page.
-3. Set the active pipeline.
+3. Confirm the active pipeline.
 4. Set the derivative root folder name if you do not want the default `derivatives`.
 5. Review preprocessing defaults, ICA defaults, and real-time settings.
 6. Open a workspace folder.
@@ -148,7 +147,7 @@ workspace/
 |  \- eeg/
 |     \- sub-02_task-tms_raw.fif
 \- derivatives/
-   \- tms_eeg/
+   \- standard/
       \- sub-02/
          \- eeg/
             |- sub-02_task-tms_desc-filtered_raw.fif
@@ -158,7 +157,7 @@ workspace/
 
 ### Pipeline Awareness
 
-Each discovered dataset is interpreted in the context of the currently active pipeline. The same raw source file can therefore appear under different derivative trees depending on the selected pipeline.
+Each discovered dataset is interpreted in the context of the currently active pipeline. The built-in `Standard` pipeline writes derivatives under `standard`; future custom pipelines can use their own derivative trees.
 
 ## 8. Data Conversion and Merging
 

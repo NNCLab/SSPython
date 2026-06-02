@@ -6,7 +6,6 @@ import mne
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QDialog,
     QFileDialog,
     QGridLayout,
@@ -19,43 +18,42 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from core.channel_info import ChannelInfo, MontageValidationError, load_channel_info
 from core.conversion import (
     ConversionEntry,
     convert_files,
     default_output_filename,
     discover_convertible_files,
-    load_montage,
+    load_conversion_info,
     normalize_output_filename,
-    validate_source_for_montage,
+    validate_conversion_info,
+    validate_source_for_info,
 )
-from ui.widgets.tools.channel_info_dialog import ChannelInfoEditorDialog
 from ui.widgets.tools.merge_tool import MergeToolWidget
 from utils import Worker
 
 
 class ConversionWidget(QWidget):
-    BuiltinMontagePlaceholder = "Select montage..."
-    CustomMontageLabel = "Custom montage file..."
-    DefaultBuiltinMontage = "easycap-M1"
     SourcePathRole = Qt.ItemDataRole.UserRole + 1
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        info: mne.Info | None = None,
+        *,
+        info_label: str | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.source_folder: Path | None = None
-        self.custom_montage_path: Path | None = None
-        self.channel_info_path: Path | None = None
-        self.channel_info: ChannelInfo | None = None
-        self.channel_info_dirty = False
+        self.conversion_info: mne.Info | None = None
+        self.conversion_info_label: str | None = None
 
         self._setup_ui()
         self._setup_connections()
-        self._on_montage_selection_changed()
+        self.set_conversion_info(info, label=info_label)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -72,30 +70,13 @@ class ConversionWidget(QWidget):
         settings_group = QGroupBox("Conversion Settings")
         settings_layout = QGridLayout(settings_group)
 
-        self.montage_combo = QComboBox()
-        self.montage_combo.addItem(self.BuiltinMontagePlaceholder, None)
-        for montage_name in sorted(mne.channels.get_builtin_montages()):
-            self.montage_combo.addItem(montage_name, montage_name)
-        self.montage_combo.addItem(self.CustomMontageLabel, self.CustomMontageLabel)
-        default_index = self.montage_combo.findData(self.DefaultBuiltinMontage)
-        if default_index >= 0:
-            self.montage_combo.setCurrentIndex(default_index)
+        self.info_edit = QLineEdit("No MNE info selected...")
+        self.info_edit.setReadOnly(True)
+        self.info_button = QPushButton("Select Info Source")
 
-        self.custom_montage_edit = QLineEdit("No custom montage selected...")
-        self.custom_montage_edit.setReadOnly(True)
-        self.custom_montage_button = QPushButton("Browse...")
-
-        self.channel_info_edit = QLineEdit("Optional unless .mat files are selected...")
-        self.channel_info_edit.setReadOnly(True)
-        self.channel_info_button = QPushButton("Select JSON")
-
-        settings_layout.addWidget(QLabel("Montage:"), 0, 0)
-        settings_layout.addWidget(self.montage_combo, 0, 1, 1, 2)
-        settings_layout.addWidget(self.custom_montage_edit, 1, 1)
-        settings_layout.addWidget(self.custom_montage_button, 1, 2)
-        settings_layout.addWidget(QLabel("Channel Info JSON:"), 2, 0)
-        settings_layout.addWidget(self.channel_info_edit, 2, 1)
-        settings_layout.addWidget(self.channel_info_button, 2, 2)
+        settings_layout.addWidget(QLabel("MNE Info:"), 0, 0)
+        settings_layout.addWidget(self.info_edit, 0, 1)
+        settings_layout.addWidget(self.info_button, 0, 2)
         layout.addWidget(settings_group)
 
         self.table = QTableWidget(0, 4)
@@ -116,11 +97,7 @@ class ConversionWidget(QWidget):
 
     def _setup_connections(self):
         self.source_folder_button.clicked.connect(self.select_source_folder)
-        self.montage_combo.currentIndexChanged.connect(
-            self._on_montage_selection_changed
-        )
-        self.custom_montage_button.clicked.connect(self.select_custom_montage)
-        self.channel_info_button.clicked.connect(self.select_channel_info)
+        self.info_button.clicked.connect(self.select_info_source)
         self.convert_button.clicked.connect(self.run_conversion)
 
     def select_source_folder(self):
@@ -144,41 +121,23 @@ class ConversionWidget(QWidget):
             return
         self.populate_sources(supported_files)
 
-    def select_custom_montage(self):
+    def select_info_source(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Custom Montage",
+            "Select MNE Info Source",
             "",
-            "Montage files (*.fif *.loc *.locs *.elc *.csd *.sfp *.elp *.hpts *.txt);;All files (*)",
-        )
-        if not file_path:
-            return
-
-        self.custom_montage_path = Path(file_path)
-        self.custom_montage_edit.setText(self.custom_montage_path.name)
-        self.custom_montage_edit.setToolTip(str(self.custom_montage_path))
-
-    def select_channel_info(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Channel Info JSON",
-            "",
-            "JSON files (*.json)",
+            "MNE files (*.fif *.fif.gz);;All files (*)",
         )
         if not file_path:
             return
 
         try:
-            channel_info = load_channel_info(Path(file_path))
+            info = load_conversion_info(Path(file_path))
         except ValueError as exc:
-            QMessageBox.warning(self, "Invalid Channel Info", str(exc))
+            QMessageBox.warning(self, "Invalid MNE Info", str(exc))
             return
 
-        self._set_channel_info(
-            channel_info,
-            source_path=Path(file_path),
-            dirty=False,
-        )
+        self.set_conversion_info(info, label=Path(file_path).name)
 
     def populate_sources(self, source_paths: list[Path]):
         self.table.setRowCount(0)
@@ -218,24 +177,18 @@ class ConversionWidget(QWidget):
     def run_conversion(self):
         try:
             entries = self._collect_entries()
-            builtin_montage, custom_montage_path = self._resolve_montage_selection()
+            conversion_info = self._resolve_conversion_info()
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid Conversion Settings", str(exc))
             return
 
-        if not self._ensure_montage_ready(
-            entries,
-            builtin_montage=builtin_montage,
-            custom_montage_path=custom_montage_path,
-        ):
+        if not self._ensure_info_ready(entries, conversion_info):
             return
 
         worker = Worker(
             lambda: convert_files(
                 entries,
-                builtin_montage=builtin_montage,
-                custom_montage_path=custom_montage_path,
-                channel_info=self.channel_info,
+                info=conversion_info,
             ),
             parent=self,
             add_loggers="mne",
@@ -262,7 +215,6 @@ class ConversionWidget(QWidget):
 
         entries: list[ConversionEntry] = []
         seen_outputs: set[Path] = set()
-        requires_mat_info = False
 
         for row in range(self.table.rowCount()):
             convert_item = self.table.item(row, 0)
@@ -286,9 +238,6 @@ class ConversionWidget(QWidget):
                 raise ValueError(f"Duplicate output file name detected: {output_name}")
             seen_outputs.add(output_path)
 
-            if source_path.suffix.lower() == ".mat":
-                requires_mat_info = True
-
             entries.append(
                 ConversionEntry(
                     source_path=source_path,
@@ -298,100 +247,58 @@ class ConversionWidget(QWidget):
 
         if not entries:
             raise ValueError("Select at least one file to convert.")
-        if requires_mat_info and self.channel_info is None:
-            raise ValueError(
-                "At least one selected file is a .mat file. Please provide the channel info JSON."
-            )
 
         return entries
 
-    def _resolve_montage_selection(self) -> tuple[str | None, Path | None]:
-        montage_data = self.montage_combo.currentData()
-        if not montage_data:
-            raise ValueError("Select a montage before converting files.")
-        if montage_data == self.CustomMontageLabel:
-            if self.custom_montage_path is None:
-                raise ValueError("Select a custom montage file before converting files.")
-            return None, self.custom_montage_path
-        return str(montage_data), None
+    def _resolve_conversion_info(self) -> mne.Info:
+        if self.conversion_info is None:
+            raise ValueError("Select an MNE info source before converting files.")
+        return validate_conversion_info(self.conversion_info)
 
-    def _on_montage_selection_changed(self):
-        is_custom = self.montage_combo.currentData() == self.CustomMontageLabel
-        self.custom_montage_edit.setVisible(is_custom)
-        self.custom_montage_button.setVisible(is_custom)
-
-    def _ensure_montage_ready(
+    def _ensure_info_ready(
         self,
         entries: list[ConversionEntry],
-        *,
-        builtin_montage: str | None,
-        custom_montage_path: Path | None,
+        conversion_info: mne.Info,
     ) -> bool:
-        montage = load_montage(
-            builtin_name=builtin_montage,
-            custom_path=custom_montage_path,
-        )
-        montage_label = builtin_montage or (
-            custom_montage_path.name if custom_montage_path is not None else "custom montage"
-        )
-
         for entry in entries:
-            while True:
-                try:
-                    validate_source_for_montage(
-                        entry.source_path,
-                        builtin_montage=builtin_montage,
-                        custom_montage_path=custom_montage_path,
-                        channel_info=self.channel_info,
-                    )
-                    break
-                except MontageValidationError as exc:
-                    dialog = ChannelInfoEditorDialog(
-                        source_label=entry.source_path.name,
-                        montage_label=montage_label,
-                        error_message=str(exc),
-                        channel_info=exc.channel_info,
-                        issues=exc.issues,
-                        montage=montage,
-                        parent=self,
-                    )
-                    if dialog.exec() != QDialog.DialogCode.Accepted:
-                        return False
-
-                    self._set_channel_info(
-                        dialog.get_channel_info(),
-                        source_path=dialog.saved_path,
-                        dirty=dialog.saved_path is None,
-                    )
-                except ValueError:
-                    raise
+            try:
+                validate_source_for_info(
+                    entry.source_path,
+                    info=conversion_info,
+                )
+            except ValueError as exc:
+                QMessageBox.warning(
+                    self,
+                    "Incompatible Source",
+                    f"{entry.source_path.name} cannot be converted with the selected MNE info:\n{exc}",
+                )
+                return False
 
         return True
 
-    def _set_channel_info(
+    def set_conversion_info(
         self,
-        channel_info: ChannelInfo | None,
+        info: mne.Info | None,
         *,
-        source_path: Path | None,
-        dirty: bool,
+        label: str | None = None,
     ):
-        self.channel_info = channel_info
-        self.channel_info_path = source_path
-        self.channel_info_dirty = dirty
-        if channel_info is None:
-            self.channel_info_edit.setText("Optional unless .mat files are selected...")
-            self.channel_info_edit.setToolTip("")
+        if info is None:
+            self.conversion_info = None
+            self.conversion_info_label = None
+            self.info_edit.setText("No MNE info selected...")
+            self.info_edit.setToolTip("Conversion requires an mne.Info object with a montage.")
             return
 
-        if source_path is not None and not dirty:
-            self.channel_info_edit.setText(source_path.name)
-            self.channel_info_edit.setToolTip(str(source_path))
-            return
-
-        self.channel_info_edit.setText("Edited in session (unsaved)")
-        self.channel_info_edit.setToolTip(
-            "Channel information was edited in the montage repair dialog and has not been saved yet."
+        conversion_info = info.copy()
+        validate_conversion_info(conversion_info)
+        self.conversion_info = conversion_info
+        self.conversion_info_label = label
+        info_label = label or "Provided MNE Info"
+        channel_count = len(self.conversion_info["ch_names"])
+        self.info_edit.setText(
+            f"{info_label} ({channel_count} channels, {self.conversion_info['sfreq']:g} Hz)"
         )
+        self.info_edit.setToolTip("Conversion info includes a montage.")
 
     @staticmethod
     def _check_item(*, checked: bool) -> QTableWidgetItem:
@@ -407,23 +314,40 @@ class ConversionWidget(QWidget):
         return item
 
 
-class ConversionToolDialog(QDialog):
-    def __init__(self, parent=None):
+class ConvertToolDialog(QDialog):
+    def __init__(
+        self,
+        info: mne.Info | None = None,
+        *,
+        info_label: str | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Convert or Merge EEG Data")
+        self.setWindowTitle("Convert EEG Data")
         self.setMinimumSize(980, 720)
 
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
-        self.conversion_widget = ConversionWidget(self)
+        self.conversion_widget = ConversionWidget(
+            info,
+            info_label=info_label,
+            parent=self,
+        )
+        layout.addWidget(self.conversion_widget)
+
+
+class MergeToolDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Merge FIF Data")
+        self.setMinimumSize(980, 720)
+
+        layout = QVBoxLayout(self)
         self.merge_widget = MergeToolWidget(self)
-        tabs.addTab(self.conversion_widget, "Convert")
-        tabs.addTab(self.merge_widget, "Merge FIF")
-        layout.addWidget(tabs)
+        layout.addWidget(self.merge_widget)
 
 
 if __name__ == "__main__":
     app = QApplication.instance() or QApplication([])
-    dialog = ConversionToolDialog()
+    dialog = ConvertToolDialog()
     dialog.show()
     app.exec()

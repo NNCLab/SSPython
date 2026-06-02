@@ -2,23 +2,25 @@ import unittest
 import mne
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QListWidgetItem, QTabWidget
+from PySide6.QtWidgets import QApplication, QListWidgetItem
 from main import MainWindow
 from ui.widgets.evoked_plot import EvokedPlotWidget
 from ui.widgets.preprocessing_widgets import (
     EpochingSettingsWidget,
     PreprocessingSettingsWidget,
 )
-from ui.widgets.tools.conversion_tool import ConversionToolDialog
+from ui.widgets.tools.conversion_tool import ConvertToolDialog, MergeToolDialog
 from ui.widgets.tools.object_info_widget import ObjectInfoWidget, extract_event_counts
 from ui.widgets.real_time_widget import (
     ConnectionWidget,
     RealTimeERP,
+    apply_realtime_info_to_stream,
     apply_artifact_mask,
     apply_frequency_filters,
     buffer_epoch_snapshot,
     build_live_filter_pipeline,
     build_epoch_stream_configuration,
+    channel_settings_from_info,
     channel_grid_positions,
     detect_regular_stream_event_ids,
 )
@@ -168,35 +170,106 @@ class TestUI(unittest.TestCase):
         self.assertFalse(widget.topo_widget.isHidden())
         widget.close()
 
-    def test_connection_widget_uses_compact_channel_columns(self):
+    def test_connection_widget_uses_info_summary_instead_of_channel_table(self):
         app = QApplication.instance()
         if app is None:
             app = QApplication([])
 
         widget = ConnectionWidget()
-        headers = [
-            widget.channel_table.horizontalHeaderItem(i).text()
-            for i in range(widget.channel_table.columnCount())
-        ]
-        self.assertEqual(headers, ["Enabled", "Name", "Type", ""])
-        self.assertEqual(widget.channel_table.columnCount(), 4)
+        self.assertFalse(hasattr(widget, "channel_table"))
+        self.assertTrue(hasattr(widget, "info_summary_label"))
+        self.assertEqual(widget.info_summary_label.text(), "No MNE info loaded.")
         widget.close()
 
-    def test_conversion_tool_dialog_separates_convert_and_merge_tabs(self):
+    def test_real_time_channel_settings_come_from_info_not_names(self):
+        montage = mne.channels.make_standard_montage("standard_1020")
+        info = mne.create_info(
+            ["Fz", "TRIGGER", "STI 014"],
+            sfreq=200,
+            ch_types=["eeg", "stim", "misc"],
+        )
+        info.set_montage(montage, on_missing="ignore")
+
+        settings = channel_settings_from_info(info)
+
+        self.assertEqual(
+            settings,
+            [
+                {"name": "Fz", "enabled": True, "type": "eeg"},
+                {"name": "TRIGGER", "enabled": True, "type": "stim"},
+                {"name": "STI 014", "enabled": False, "type": "bad"},
+            ],
+        )
+
+    def test_connection_widget_passes_montaged_info_to_settings(self):
         app = QApplication.instance()
         if app is None:
             app = QApplication([])
 
-        dialog = ConversionToolDialog()
-        tab_widget = dialog.findChild(QTabWidget)
-        self.assertEqual(tab_widget.count(), 2)
-        self.assertEqual(tab_widget.tabText(0), "Convert")
-        self.assertEqual(tab_widget.tabText(1), "Merge FIF")
-        self.assertEqual(
-            dialog.conversion_widget.montage_combo.currentData(),
-            "easycap-M1",
+        montage = mne.channels.make_standard_montage("standard_1020")
+        info = mne.create_info(
+            ["Fz", "TRIGGER", "STI 014"],
+            sfreq=200,
+            ch_types=["eeg", "stim", "misc"],
         )
-        dialog.close()
+        info.set_montage(montage, on_missing="ignore")
+
+        widget = ConnectionWidget()
+        widget.set_realtime_info(info, label="Live Info")
+        settings = widget.get_settings()
+
+        self.assertEqual(settings["info"]["ch_names"], ["Fz", "TRIGGER", "STI 014"])
+        self.assertEqual(settings["event_channels"], "TRIGGER")
+        self.assertEqual(settings["bads"], ["STI 014"])
+        self.assertIn("Live Info", widget.info_edit.text())
+        self.assertIn("Stim: TRIGGER", widget.info_summary_label.text())
+        widget.close()
+
+    def test_apply_realtime_info_to_stream_applies_names_types_and_montage(self):
+        montage = mne.channels.make_standard_montage("standard_1020")
+        realtime_info = mne.create_info(
+            ["Fz", "TRIGGER", "STI 014"],
+            sfreq=200,
+            ch_types=["eeg", "stim", "misc"],
+        )
+        realtime_info.set_montage(montage, on_missing="ignore")
+
+        stream_info = mne.create_info(
+            ["A", "B", "C"],
+            sfreq=200,
+            ch_types=["eeg", "eeg", "misc"],
+        )
+        stream = mne.io.RawArray(np.zeros((3, 10)), stream_info, verbose=False)
+
+        apply_realtime_info_to_stream(stream, realtime_info)
+
+        self.assertEqual(stream.ch_names, ["Fz", "TRIGGER", "STI 014"])
+        self.assertEqual(stream.get_channel_types(), ["eeg", "stim", "misc"])
+        self.assertIsNotNone(stream.get_montage())
+
+    def test_conversion_and_merge_tools_are_separate_actions(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        montage = mne.channels.make_standard_montage("standard_1020")
+        info = mne.create_info(["Fz", "Cz"], sfreq=200, ch_types="eeg")
+        info.set_montage(montage)
+
+        convert_dialog = ConvertToolDialog(info=info, info_label="Test Info")
+        merge_dialog = MergeToolDialog()
+        window = MainWindow()
+
+        self.assertEqual(convert_dialog.windowTitle(), "Convert EEG Data")
+        self.assertIn("Test Info", convert_dialog.conversion_widget.info_edit.text())
+        self.assertEqual(merge_dialog.windowTitle(), "Merge FIF Data")
+
+        action_texts = [action.text() for action in window.conversion_menu.actions()]
+        self.assertEqual(action_texts, ["Convert EEG data", "Merge FIF data"])
+
+        convert_dialog.close()
+        merge_dialog.close()
+        window.close()
 
     def test_epoching_settings_preserve_selected_event_mapping(self):
         app = QApplication.instance()

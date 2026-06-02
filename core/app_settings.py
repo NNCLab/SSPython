@@ -5,11 +5,27 @@ from typing import Any, Iterable
 
 from PySide6.QtCore import QSettings
 
-SETTINGS_SCHEMA_VERSION = 2
+SETTINGS_SCHEMA_VERSION = 3
 
 DEFAULT_THEME = "dark"
 DEFAULT_OUTPUT_ROOT = "derivatives"
-DEFAULT_PIPELINE_ID = "tms_eeg"
+DEFAULT_PIPELINE_ID = "standard"
+
+LEGACY_PIPELINE_ID_ALIASES = {
+    "tms_eeg": DEFAULT_PIPELINE_ID,
+    "continuous_eeg": DEFAULT_PIPELINE_ID,
+}
+
+PIPELINE_SETTING_LEGACY_KEYS: dict[str, tuple[str, ...]] = {
+    "preprocessing/artifact_removal": ("erp_preprocessing/artifact_removal",),
+    "preprocessing/continuous_filter": ("erp_preprocessing/continuous_filter",),
+    "preprocessing/epoching": ("erp_preprocessing/epoching",),
+    "preprocessing/re_reference": ("erp_preprocessing/re_reference",),
+    "preprocessing/apply": ("erp_preprocessing/apply_params",),
+    "ica/continuous": ("ica/continuous",),
+    "ica/epochs": ("ica/epochs",),
+    "ica/plotting": ("ica/plotting",),
+}
 
 
 class SettingsStore:
@@ -21,20 +37,46 @@ class SettingsStore:
         "workspace/output_root": ("global_settings/output_dir",),
         "appearance/plots/global": ("plot_settings/plot_params",),
         "appearance/plots/psd": ("plot_settings/psd_plot_params",),
-        "pipelines/tms_eeg/preprocessing/artifact_removal": (
+        "pipelines/standard/preprocessing/artifact_removal": (
+            "pipelines/tms_eeg/preprocessing/artifact_removal",
+            "pipelines/continuous_eeg/preprocessing/artifact_removal",
             "erp_preprocessing/artifact_removal",
         ),
-        "pipelines/tms_eeg/preprocessing/continuous_filter": (
+        "pipelines/standard/preprocessing/continuous_filter": (
+            "pipelines/tms_eeg/preprocessing/continuous_filter",
+            "pipelines/continuous_eeg/preprocessing/continuous_filter",
             "erp_preprocessing/continuous_filter",
         ),
-        "pipelines/tms_eeg/preprocessing/epoching": ("erp_preprocessing/epoching",),
-        "pipelines/tms_eeg/preprocessing/re_reference": (
+        "pipelines/standard/preprocessing/epoching": (
+            "pipelines/tms_eeg/preprocessing/epoching",
+            "pipelines/continuous_eeg/preprocessing/epoching",
+            "erp_preprocessing/epoching",
+        ),
+        "pipelines/standard/preprocessing/re_reference": (
+            "pipelines/tms_eeg/preprocessing/re_reference",
+            "pipelines/continuous_eeg/preprocessing/re_reference",
             "erp_preprocessing/re_reference",
         ),
-        "pipelines/tms_eeg/preprocessing/apply": ("erp_preprocessing/apply_params",),
-        "pipelines/tms_eeg/ica/continuous": ("ica/continuous",),
-        "pipelines/tms_eeg/ica/epochs": ("ica/epochs",),
-        "pipelines/tms_eeg/ica/plotting": ("ica/plotting",),
+        "pipelines/standard/preprocessing/apply": (
+            "pipelines/tms_eeg/preprocessing/apply",
+            "pipelines/continuous_eeg/preprocessing/apply",
+            "erp_preprocessing/apply_params",
+        ),
+        "pipelines/standard/ica/continuous": (
+            "pipelines/tms_eeg/ica/continuous",
+            "pipelines/continuous_eeg/ica/continuous",
+            "ica/continuous",
+        ),
+        "pipelines/standard/ica/epochs": (
+            "pipelines/tms_eeg/ica/epochs",
+            "pipelines/continuous_eeg/ica/epochs",
+            "ica/epochs",
+        ),
+        "pipelines/standard/ica/plotting": (
+            "pipelines/tms_eeg/ica/plotting",
+            "pipelines/continuous_eeg/ica/plotting",
+            "ica/plotting",
+        ),
         "real_time/connection": ("real_time/connection",),
         "real_time/plotting": ("real_time/plot_settings",),
     }
@@ -46,7 +88,10 @@ class SettingsStore:
     def migrate(self):
         version = self.settings.value("app/schema_version", 0, type=int)
         if version >= SETTINGS_SCHEMA_VERSION:
+            self._normalize_current_pipeline_setting()
             return
+
+        self._migrate_standard_pipeline_settings()
 
         for new_key, legacy_keys in self.LEGACY_MAPPINGS.items():
             if self.settings.contains(new_key):
@@ -60,11 +105,49 @@ class SettingsStore:
             self.settings.setValue("workspace/output_root", DEFAULT_OUTPUT_ROOT)
         if not self.settings.contains("workspace/current_pipeline"):
             self.settings.setValue("workspace/current_pipeline", DEFAULT_PIPELINE_ID)
+        else:
+            self._normalize_current_pipeline_setting()
         if not self.settings.contains("appearance/theme"):
             self.settings.setValue("appearance/theme", DEFAULT_THEME)
 
         self.settings.setValue("app/schema_version", SETTINGS_SCHEMA_VERSION)
         self.settings.sync()
+
+    def _legacy_pipeline_ids_for_migration(self) -> tuple[str, ...]:
+        current_pipeline = self.settings.value("workspace/current_pipeline", "")
+        ordered_ids: list[str] = []
+        if current_pipeline in LEGACY_PIPELINE_ID_ALIASES:
+            ordered_ids.append(current_pipeline)
+        for pipeline_id in LEGACY_PIPELINE_ID_ALIASES:
+            if pipeline_id not in ordered_ids:
+                ordered_ids.append(pipeline_id)
+        return tuple(ordered_ids)
+
+    def _migrate_standard_pipeline_settings(self):
+        legacy_pipeline_ids = self._legacy_pipeline_ids_for_migration()
+        for section, legacy_keys in PIPELINE_SETTING_LEGACY_KEYS.items():
+            standard_key = f"pipelines/{DEFAULT_PIPELINE_ID}/{section}"
+            if self.settings.contains(standard_key):
+                continue
+
+            candidate_keys = tuple(
+                f"pipelines/{pipeline_id}/{section}" for pipeline_id in legacy_pipeline_ids
+            ) + legacy_keys
+            for candidate_key in candidate_keys:
+                if self.settings.contains(candidate_key):
+                    self.settings.setValue(standard_key, self.settings.value(candidate_key))
+                    break
+
+    def _normalize_pipeline_id(self, pipeline_id: str | None) -> str:
+        if not pipeline_id:
+            return DEFAULT_PIPELINE_ID
+        return LEGACY_PIPELINE_ID_ALIASES.get(pipeline_id, pipeline_id)
+
+    def _normalize_current_pipeline_setting(self):
+        current_pipeline = self.settings.value("workspace/current_pipeline", DEFAULT_PIPELINE_ID)
+        normalized_pipeline = self._normalize_pipeline_id(str(current_pipeline) if current_pipeline else None)
+        if current_pipeline != normalized_pipeline:
+            self.settings.setValue("workspace/current_pipeline", normalized_pipeline)
 
     def get(
         self,
@@ -130,10 +213,14 @@ class SettingsStore:
         return self.get("workspace/output_root", DEFAULT_OUTPUT_ROOT)
 
     def current_pipeline_id(self) -> str:
-        return self.get("workspace/current_pipeline", DEFAULT_PIPELINE_ID)
+        pipeline_id = self.get("workspace/current_pipeline", DEFAULT_PIPELINE_ID)
+        normalized_pipeline_id = self._normalize_pipeline_id(str(pipeline_id) if pipeline_id else None)
+        if pipeline_id != normalized_pipeline_id:
+            self.set("workspace/current_pipeline", normalized_pipeline_id)
+        return normalized_pipeline_id
 
     def set_current_pipeline_id(self, pipeline_id: str):
-        self.set("workspace/current_pipeline", pipeline_id)
+        self.set("workspace/current_pipeline", self._normalize_pipeline_id(pipeline_id))
 
     def current_folder(self) -> Path | None:
         return self.get_path(
@@ -148,7 +235,7 @@ class SettingsStore:
         self.set("workspace/current_folder", str(folder_path))
 
     def pipeline_path(self, section: str, pipeline_id: str | None = None) -> str:
-        active_pipeline_id = pipeline_id or self.current_pipeline_id()
+        active_pipeline_id = self._normalize_pipeline_id(pipeline_id) if pipeline_id else self.current_pipeline_id()
         return f"pipelines/{active_pipeline_id}/{section}"
 
 

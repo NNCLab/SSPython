@@ -10,10 +10,7 @@ from scipy.io import loadmat
 from core.channel_info import (
     ChannelInfo,
     MontageValidationError,
-    apply_channel_info,
-    channel_info_from_raw,
     identify_montage_issues,
-    resolve_channel_info,
 )
 
 try:
@@ -79,83 +76,135 @@ def discover_convertible_files(folder: Path) -> list[Path]:
     return supported_files
 
 
-def load_montage(*, builtin_name: str | None = None, custom_path: Path | None = None):
-    if builtin_name:
-        return mne.channels.make_standard_montage(builtin_name)
-    if custom_path is not None:
-        custom_path = Path(custom_path)
-        if custom_path.suffix.lower() == ".fif":
-            return mne.channels.read_dig_fif(custom_path)
-        return mne.channels.read_custom_montage(custom_path)
-    raise ValueError("A montage must be selected before converting files.")
+def validate_conversion_info(info: mne.Info) -> mne.Info:
+    if info is None:
+        raise ValueError("An MNE Info object is required before converting files.")
+    if not isinstance(info, mne.Info):
+        raise TypeError("Conversion info must be an mne.Info object.")
+    if len(info["ch_names"]) == 0:
+        raise ValueError("Conversion info must define at least one channel.")
 
+    montage = info.get_montage()
+    if montage is None:
+        raise ValueError("Conversion info must include a montage.")
 
-def apply_montage(
-    raw: mne.io.BaseRaw,
-    *,
-    builtin_montage: str | None = None,
-    custom_montage_path: Path | None = None,
-    source_label: str | None = None,
-) -> mne.io.BaseRaw:
-    montage = load_montage(
-        builtin_name=builtin_montage,
-        custom_path=custom_montage_path,
-    )
-    try:
-        raw.set_montage(montage, on_missing="raise", match_case=False)
-    except Exception as exc:
-        channel_info = channel_info_from_raw(raw)
-        issues = identify_montage_issues(channel_info, montage)
-        label = source_label or "the selected recording"
+    channel_info = _channel_info_from_info(info)
+    issues = identify_montage_issues(channel_info, montage)
+    if issues:
         raise MontageValidationError(
-            f"Could not apply the selected montage to {label}: {exc}",
+            "Conversion info montage does not cover all required channels.",
             channel_info=channel_info,
             issues=issues,
+        )
+
+    return info
+
+
+def load_conversion_info(source_path: Path) -> mne.Info:
+    source_path = Path(source_path)
+    raw = None
+    try:
+        raw = mne.io.read_raw(source_path, preload=False, verbose="error")
+        return validate_conversion_info(raw.info.copy())
+    except Exception as exc:
+        raise ValueError(
+            f"Could not load an MNE Info object with montage from {source_path.name}."
         ) from exc
+    finally:
+        if raw is not None and hasattr(raw, "close"):
+            raw.close()
+
+
+def apply_info_to_raw(raw: mne.io.BaseRaw, info: mne.Info) -> mne.io.BaseRaw:
+    conversion_info = validate_conversion_info(info)
+    _validate_channel_count(
+        actual_count=len(raw.ch_names),
+        expected_count=len(conversion_info["ch_names"]),
+        source_label="recording",
+    )
+    _validate_sfreq(
+        actual=float(raw.info["sfreq"]),
+        expected=float(conversion_info["sfreq"]),
+    )
+
+    desired_names = list(conversion_info["ch_names"])
+    rename_map = {
+        old_name: new_name
+        for old_name, new_name in zip(raw.ch_names, desired_names, strict=False)
+        if old_name != new_name
+    }
+    if rename_map:
+        raw.rename_channels(rename_map)
+
+    desired_types = conversion_info.get_channel_types()
+    current_types = raw.get_channel_types()
+    channel_type_map = {
+        channel_name: desired_type
+        for channel_name, current_type, desired_type in zip(
+            raw.ch_names,
+            current_types,
+            desired_types,
+            strict=False,
+        )
+        if current_type != desired_type
+    }
+    if channel_type_map:
+        raw.set_channel_types(channel_type_map)
+
+    raw.info["bads"] = [
+        channel_name
+        for channel_name in conversion_info["bads"]
+        if channel_name in raw.ch_names
+    ]
+    raw.set_montage(
+        conversion_info.get_montage(),
+        on_missing="raise",
+        match_case=False,
+    )
     return raw
 
 
 def load_raw_from_source(
     source_path: Path,
     *,
-    channel_info: ChannelInfo | Path | str | None = None,
+    info: mne.Info,
     preload: bool = True,
 ) -> mne.io.BaseRaw:
     source_path = Path(source_path)
-    resolved_channel_info = resolve_channel_info(channel_info)
+    conversion_info = validate_conversion_info(info)
     if source_path.suffix.lower() == ".mat":
-        return load_raw_from_mat(source_path, channel_info=resolved_channel_info)
+        return load_raw_from_mat(source_path, info=conversion_info)
     raw = mne.io.read_raw(source_path, preload=preload, verbose="error")
-    if resolved_channel_info is not None:
-        apply_channel_info(raw, resolved_channel_info)
-    return raw
+    return apply_info_to_raw(raw, conversion_info)
 
 
 def load_raw_from_mat(
     mat_path: Path,
     *,
-    channel_info: ChannelInfo | Path | str | None,
+    info: mne.Info,
 ) -> mne.io.RawArray:
-    resolved_channel_info = resolve_channel_info(channel_info)
-    if resolved_channel_info is None:
-        raise ValueError(
-            f"MAT conversion requires a channel info JSON file: {mat_path.name}"
+    conversion_info = validate_conversion_info(info)
+    data = _load_mat_file(mat_path)
+    mat_sfreq = _extract_optional_scalar(data, MAT_SFREQ_KEYS)
+    if mat_sfreq is not None:
+        _validate_sfreq(
+            actual=mat_sfreq,
+            expected=float(conversion_info["sfreq"]),
         )
 
-    data = _load_mat_file(mat_path)
-    sfreq = _extract_scalar(data, MAT_SFREQ_KEYS, "sampling frequency")
     raw_array = _extract_array(data, MAT_DATA_KEYS, "data matrix")
-    ch_names = resolved_channel_info.ch_names
-    ch_types = resolved_channel_info.ch_types
+    ch_names = list(conversion_info["ch_names"])
+    ch_types = conversion_info.get_channel_types()
 
     if raw_array.ndim != 2:
         raise ValueError(f"MAT file must contain a 2D array: {mat_path.name}")
     if raw_array.shape[0] != len(ch_names) and raw_array.shape[1] == len(ch_names):
         raw_array = raw_array.T
     if raw_array.shape[0] != len(ch_names):
-        raise ValueError(
-            f"MAT data shape {raw_array.shape} does not match "
-            f"{len(ch_names)} channels in the selected channel info."
+        _validate_channel_count(
+            actual_count=int(raw_array.shape[0]),
+            expected_count=len(ch_names),
+            source_label=f"MAT data matrix {raw_array.shape}",
         )
 
     raw_array = raw_array.astype(float, copy=True)
@@ -165,8 +214,7 @@ def load_raw_from_mat(
     if volt_indices:
         raw_array[volt_indices, :] *= 1e-6
 
-    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
-    raw = mne.io.RawArray(raw_array, info, verbose=False)
+    raw = mne.io.RawArray(raw_array, conversion_info.copy(), verbose=False)
     _maybe_add_event_annotations(raw)
     return raw
 
@@ -174,13 +222,12 @@ def load_raw_from_mat(
 def convert_files(
     entries: list[ConversionEntry],
     *,
-    builtin_montage: str | None = None,
-    custom_montage_path: Path | None = None,
-    channel_info: ChannelInfo | Path | str | None = None,
+    info: mne.Info,
 ) -> dict[str, list[Path]]:
     if not entries:
         raise ValueError("No files were selected for conversion.")
 
+    conversion_info = validate_conversion_info(info)
     converted_paths: list[Path] = []
     managed_raws: list[mne.io.BaseRaw] = []
 
@@ -188,16 +235,10 @@ def convert_files(
         for entry in entries:
             raw = load_raw_from_source(
                 entry.source_path,
-                channel_info=channel_info,
+                info=conversion_info,
                 preload=True,
             )
             managed_raws.append(raw)
-            apply_montage(
-                raw,
-                builtin_montage=builtin_montage,
-                custom_montage_path=custom_montage_path,
-                source_label=entry.source_path.name,
-            )
 
             entry.output_path.parent.mkdir(parents=True, exist_ok=True)
             raw.save(entry.output_path, overwrite=True, verbose="error")
@@ -210,25 +251,18 @@ def convert_files(
                 raw.close()
 
 
-def validate_source_for_montage(
+def validate_source_for_info(
     source_path: Path,
     *,
-    builtin_montage: str | None = None,
-    custom_montage_path: Path | None = None,
-    channel_info: ChannelInfo | Path | str | None = None,
+    info: mne.Info,
 ) -> None:
     raw = load_raw_from_source(
         source_path,
-        channel_info=channel_info,
+        info=info,
         preload=False,
     )
     try:
-        apply_montage(
-            raw,
-            builtin_montage=builtin_montage,
-            custom_montage_path=custom_montage_path,
-            source_label=Path(source_path).name,
-        )
+        validate_conversion_info(raw.info)
     finally:
         if hasattr(raw, "close"):
             raw.close()
@@ -250,7 +284,7 @@ def _load_mat_file(mat_path: Path) -> dict:
     return mat73.loadmat(mat_path)
 
 
-def _extract_scalar(data: dict, keys: tuple[str, ...], label: str) -> float:
+def _extract_optional_scalar(data: dict, keys: tuple[str, ...]) -> float | None:
     for key in keys:
         if key not in data:
             continue
@@ -258,7 +292,7 @@ def _extract_scalar(data: dict, keys: tuple[str, ...], label: str) -> float:
         if value.size != 1:
             continue
         return float(value)
-    raise ValueError(f"MAT file is missing a valid {label}.")
+    return None
 
 
 def _extract_array(data: dict, keys: tuple[str, ...], label: str) -> np.ndarray:
@@ -283,3 +317,33 @@ def _maybe_add_event_annotations(raw: mne.io.BaseRaw) -> None:
         event_desc=lambda event_id: f"STIM {event_id}",
     )
     raw.set_annotations(annotations)
+
+
+def _channel_info_from_info(info: mne.Info) -> ChannelInfo:
+    return ChannelInfo(
+        ch_names=[str(name) for name in info["ch_names"]],
+        ch_types=[str(kind).strip().lower() for kind in info.get_channel_types()],
+    )
+
+
+def _validate_channel_count(
+    *,
+    actual_count: int,
+    expected_count: int,
+    source_label: str,
+) -> None:
+    if actual_count == expected_count:
+        return
+    raise ValueError(
+        f"{source_label} contains {actual_count} channels, "
+        f"but conversion info defines {expected_count} channels."
+    )
+
+
+def _validate_sfreq(*, actual: float, expected: float) -> None:
+    if np.isclose(actual, expected):
+        return
+    raise ValueError(
+        f"Source sampling frequency {actual:g} Hz does not match "
+        f"conversion info sampling frequency {expected:g} Hz."
+    )

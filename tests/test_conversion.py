@@ -13,12 +13,13 @@ from core.conversion import (
     ConversionEntry,
     convert_files,
     discover_convertible_files,
+    load_conversion_info,
     load_raw_from_mat,
     load_raw_from_source,
     normalize_output_filename,
 )
 from core.merge import MergeEntry, merge_fif_files, validate_merge_entries
-from ui.widgets.tools.conversion_tool import ConversionToolDialog
+from ui.widgets.tools.conversion_tool import ConvertToolDialog
 
 
 class TestConversion(unittest.TestCase):
@@ -62,33 +63,30 @@ class TestConversion(unittest.TestCase):
         generic_raw.save(self.generic_raw_path, overwrite=True, verbose="error")
 
         self.mat_path = self.test_dir / "gtec_export.mat"
-        self.channel_info_path = self.test_dir / "channels.json"
-        self.generic_channel_info_path = self.test_dir / "generic_channels.json"
+        self.info_source_path = self.test_dir / "info_source_raw.fif"
         self.list_channel_info_path = self.test_dir / "list_channels.json"
+
+        montage = mne.channels.make_standard_montage("standard_1020")
+        self.conversion_info = mne.create_info(["Fz", "Cz"], sfreq=200, ch_types="eeg")
+        self.conversion_info.set_montage(montage)
+        self.mat_info = mne.create_info(
+            ["Fz", "Cz", "STI 014"],
+            sfreq=200,
+            ch_types=["eeg", "eeg", "stim"],
+        )
+        self.mat_info.set_montage(montage, on_missing="ignore")
+        info_source = mne.io.RawArray(
+            np.random.randn(2, 50),
+            self.conversion_info.copy(),
+            verbose=False,
+        )
+        info_source.save(self.info_source_path, overwrite=True, verbose="error")
 
         mat_data = np.zeros((3, 60), dtype=float)
         mat_data[0, :] = 20.0
         mat_data[1, :] = 10.0
         mat_data[2, 10] = 1.0
         savemat(self.mat_path, {"y": mat_data, "SR": np.array([[200.0]])})
-
-        with self.channel_info_path.open("w", encoding="utf-8") as stream:
-            json.dump(
-                {
-                    "ch_names": ["Fz", "Cz", "STI 014"],
-                    "ch_types": ["eeg", "eeg", "stim"],
-                },
-                stream,
-            )
-
-        with self.generic_channel_info_path.open("w", encoding="utf-8") as stream:
-            json.dump(
-                {
-                    "ch_names": ["Fz", "Cz"],
-                    "ch_types": ["eeg", "eeg"],
-                },
-                stream,
-            )
 
         with self.list_channel_info_path.open("w", encoding="utf-8") as stream:
             json.dump(
@@ -128,23 +126,31 @@ class TestConversion(unittest.TestCase):
     def test_load_raw_from_mat_builds_raw_and_annotations(self):
         raw = load_raw_from_mat(
             self.mat_path,
-            channel_info=self.channel_info_path,
+            info=self.mat_info,
         )
 
         self.assertEqual(raw.ch_names, ["Fz", "Cz", "STI 014"])
         self.assertAlmostEqual(raw.info["sfreq"], 200.0)
+        self.assertIsNotNone(raw.get_montage())
         self.assertEqual(len(raw.annotations), 1)
         self.assertEqual(raw.annotations.description[0], "STIM 1")
 
-    def test_load_raw_from_source_applies_optional_channel_info_to_other_formats(self):
+    def test_load_conversion_info_reads_montaged_info(self):
+        info = load_conversion_info(self.info_source_path)
+
+        self.assertEqual(info["ch_names"], ["Fz", "Cz"])
+        self.assertIsNotNone(info.get_montage())
+
+    def test_load_raw_from_source_applies_conversion_info_to_other_formats(self):
         raw = load_raw_from_source(
             self.generic_raw_path,
-            channel_info=self.generic_channel_info_path,
+            info=self.conversion_info,
             preload=False,
         )
 
         self.assertEqual(raw.ch_names, ["Fz", "Cz"])
         self.assertEqual(raw.get_channel_types(), ["eeg", "eeg"])
+        self.assertIsNotNone(raw.get_montage())
         raw.close()
 
     def test_convert_files_converts_selected_outputs(self):
@@ -156,26 +162,36 @@ class TestConversion(unittest.TestCase):
                 ConversionEntry(self.raw_a_path, output_a),
                 ConversionEntry(self.raw_b_path, output_b),
             ],
-            builtin_montage="standard_1020",
+            info=self.conversion_info,
         )
 
         self.assertEqual(result["converted"], [output_a, output_b])
         self.assertTrue(output_a.exists())
         self.assertTrue(output_b.exists())
 
-    def test_convert_files_accepts_optional_channel_info_for_non_mat_sources(self):
+    def test_convert_files_applies_conversion_info_for_non_mat_sources(self):
         output_path = self.test_dir / "generic_recording_raw.fif"
 
         result = convert_files(
             [ConversionEntry(self.generic_raw_path, output_path)],
-            builtin_montage="standard_1020",
-            channel_info=self.generic_channel_info_path,
+            info=self.conversion_info,
         )
 
         self.assertEqual(result["converted"], [output_path])
         converted_raw = mne.io.read_raw_fif(output_path, preload=False, verbose="error")
         self.assertEqual(converted_raw.ch_names, ["Fz", "Cz"])
+        self.assertIsNotNone(converted_raw.get_montage())
         converted_raw.close()
+
+    def test_convert_files_requires_info_with_montage(self):
+        output_path = self.test_dir / "recording_without_montage_raw.fif"
+        info_without_montage = mne.create_info(["Fz", "Cz"], sfreq=200, ch_types="eeg")
+
+        with self.assertRaisesRegex(ValueError, "montage"):
+            convert_files(
+                [ConversionEntry(self.raw_a_path, output_path)],
+                info=info_without_montage,
+            )
 
     def test_validate_merge_entries_rejects_annotation_name_collisions(self):
         with self.assertRaisesRegex(ValueError, "Rename 'TMS' before merging"):
@@ -202,18 +218,17 @@ class TestConversion(unittest.TestCase):
         self.assertIn("TMS B", merged_raw.annotations.description.tolist())
         merged_raw.close()
 
-    def test_conversion_dialog_requires_mat_info_for_selected_mat_files(self):
+    def test_convert_dialog_requires_conversion_info(self):
         app = QApplication.instance()
         if app is None:
             app = QApplication([])
 
-        dialog = ConversionToolDialog()
+        dialog = ConvertToolDialog()
         dialog.conversion_widget.source_folder = self.test_dir
         dialog.conversion_widget.populate_sources([self.mat_path])
-        dialog.conversion_widget.montage_combo.setCurrentText("standard_1020")
 
-        with self.assertRaisesRegex(ValueError, "channel info JSON"):
-            dialog.conversion_widget._collect_entries()
+        with self.assertRaisesRegex(ValueError, "MNE info"):
+            dialog.conversion_widget._resolve_conversion_info()
 
         dialog.close()
 

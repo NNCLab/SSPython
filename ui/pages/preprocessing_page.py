@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime
 
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Slot
 from PySide6.QtWidgets import (
     QDialog,
     QGroupBox,
@@ -10,9 +10,11 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QVBoxLayout,
+    QWidget,
 )
 
 from core.processing import Preprocessor
+from core.pipelines import get_pipeline
 from ui.widgets.evoked_plot import EvokedPlotWidget
 from ui.widgets.ica_widget import run_ica_viewer
 from ui.widgets.preprocessing_widgets import (
@@ -40,15 +42,12 @@ class ProcessingPage(BasePage):
         self.preprocessor: Preprocessor | None = None
         self._needs_reload = False
 
-        self.raw_info_widget = ObjectInfoWidget()
-        self.continuous_ica_info_widget = ObjectInfoWidget()
-        self.epochs_info_widget = ObjectInfoWidget()
-        self.epochs_ica_info_widget = ObjectInfoWidget()
-        self.preprocessed_info_widget = ObjectInfoWidget()
+        self.action_buttons: dict[str, QPushButton] = {}
+        self._workflow_button_specs = {}
+        self.info_widgets_by_stage: dict[str, ObjectInfoWidget] = {}
+        self.plot_widgets_by_stage: dict[str, EvokedPlotWidget] = {}
 
         self._setup_ui()
-        self._setup_connections()
-        self._configure_workflow_buttons()
         self._connect_to_main_window()
         self.update_ui_state()
 
@@ -58,173 +57,128 @@ class ProcessingPage(BasePage):
         self.context_label.setWordWrap(True)
         self.add_content(self.context_label)
 
-        self.plot_widget = EvokedPlotWidget()
-        self.plot_widget.scrolled.connect(
+        self.raw_evoked_plot_widget = EvokedPlotWidget()
+        self.workflow_container = QWidget()
+        self.workflow_layout = QVBoxLayout(self.workflow_container)
+        self.workflow_layout.setContentsMargins(0, 0, 0, 0)
+        self.workflow_layout.setSpacing(16)
+        self.add_content(self.workflow_container)
+        self._build_pipeline_workflow()
+
+    def _current_pipeline(self):
+        if self.main_window is not None:
+            return self.main_window.current_pipeline
+        return get_pipeline(None)
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            child_layout = item.layout()
+            widget = item.widget()
+            if child_layout is not None:
+                self._clear_layout(child_layout)
+                child_layout.deleteLater()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _build_pipeline_workflow(self):
+        self._clear_layout(self.workflow_layout)
+        self.action_buttons = {}
+        self._workflow_button_specs = {}
+        self.info_widgets_by_stage = {}
+        self.plot_widgets_by_stage = {}
+
+        pipeline = self._current_pipeline()
+        if pipeline is None:
+            return
+
+        for section in pipeline.workflow_sections:
+            title_widget = QLabel(f"<h2>{section.title}</h2>")
+            self.workflow_layout.addWidget(title_widget)
+
+            group = QGroupBox()
+            group_layout = QVBoxLayout(group)
+
+            for panel in section.panels:
+                if panel.info_stage_id is None:
+                    for action in panel.actions:
+                        group_layout.addWidget(self._create_workflow_button(action))
+                else:
+                    row = QHBoxLayout()
+                    info_widget = ObjectInfoWidget()
+                    self.info_widgets_by_stage[panel.info_stage_id] = info_widget
+                    setattr(self, f"{panel.info_stage_id}_info_widget", info_widget)
+                    row.addWidget(info_widget, 1)
+
+                    actions_layout = QVBoxLayout()
+                    for action in panel.actions:
+                        actions_layout.addWidget(self._create_workflow_button(action))
+                    row.addLayout(actions_layout, 1)
+                    group_layout.addLayout(row)
+
+                if panel.plot_stage_id is not None:
+                    plot_widget = EvokedPlotWidget()
+                    self._connect_plot_scrolling(plot_widget)
+                    plot_widget.setVisible(False)
+                    self.plot_widgets_by_stage[panel.plot_stage_id] = plot_widget
+                    if panel.plot_stage_id == "preprocessed":
+                        self.plot_widget = plot_widget
+                    group_layout.addWidget(plot_widget)
+
+            self.workflow_layout.addWidget(group)
+
+        self.workflow_layout.addStretch()
+        self._configure_workflow_buttons()
+
+    def _create_workflow_button(self, action) -> QPushButton:
+        button = QPushButton(action.label)
+        handler = getattr(self, action.handler, None)
+        if handler is not None:
+            button.clicked.connect(handler)
+        else:
+            button.setEnabled(False)
+            button.setToolTip(f"No handler is available for `{action.handler}`.")
+        self.action_buttons[action.id] = button
+        self._workflow_button_specs[button] = action
+        setattr(self, f"{action.id}_button", button)
+        return button
+
+    def _connect_plot_scrolling(self, plot_widget: EvokedPlotWidget):
+        plot_widget.scrolled.connect(
             lambda direction: self.scroll_area.verticalScrollBar().setValue(
                 self.scroll_area.verticalScrollBar().value() - 50
                 if direction == "up"
                 else self.scroll_area.verticalScrollBar().value() + 50
             )
         )
-        self.plot_widget.setVisible(False)
-        self.raw_evoked_plot_widget = EvokedPlotWidget()
-
-        self.continuous_group = self._create_continuous_group()
-        self.epochs_group = self._create_epochs_group()
-        self.preprocessed_group = self._create_preprocessed_group()
-
-        for title, widget in (
-            ("Continuous Processing", self.continuous_group),
-            ("Epoching and ICA", self.epochs_group),
-            ("Preprocessed Output", self.preprocessed_group),
-        ):
-            title_widget = QLabel(f"<h2>{title}</h2>")
-            self.add_content(title_widget)
-            self.add_content(widget)
-
-    def _create_continuous_group(self) -> QGroupBox:
-        group = QGroupBox()
-        layout = QVBoxLayout(group)
-
-        first_row = QHBoxLayout()
-        first_row.addWidget(self.raw_info_widget, 1)
-
-        first_actions = QVBoxLayout()
-        self.inspect_raw_button = QPushButton("Inspect Raw Data")
-        self.artifact_removal_button = QPushButton("Remove Stimulation Artifact")
-        self.filter_continuous_button = QPushButton("Filter and Resample")
-        for button in (
-            self.inspect_raw_button,
-            self.artifact_removal_button,
-            self.filter_continuous_button,
-        ):
-            first_actions.addWidget(button)
-        first_row.addLayout(first_actions, 1)
-        layout.addLayout(first_row)
-
-        second_row = QHBoxLayout()
-        second_row.addWidget(self.continuous_ica_info_widget, 1)
-
-        second_actions = QVBoxLayout()
-        self.run_continuous_ica_button = QPushButton("Run Continuous ICA")
-        self.inspect_continuous_ica_button = QPushButton("Inspect Continuous ICA")
-        for button in (
-            self.run_continuous_ica_button,
-            self.inspect_continuous_ica_button,
-        ):
-            second_actions.addWidget(button)
-        second_row.addLayout(second_actions, 1)
-        layout.addLayout(second_row)
-
-        self.segment_button = QPushButton("Segment into Epochs")
-        layout.addWidget(self.segment_button)
-        return group
-
-    def _create_epochs_group(self) -> QGroupBox:
-        group = QGroupBox()
-        layout = QVBoxLayout(group)
-
-        first_row = QHBoxLayout()
-        first_row.addWidget(self.epochs_info_widget, 1)
-
-        first_actions = QVBoxLayout()
-        self.plot_raw_evoked_button = QPushButton("Plot Raw Evoked")
-        self.inspect_epochs_button = QPushButton("Inspect Epochs")
-        self.rereference_epochs_button = QPushButton("Re-reference Epochs")
-        for button in (
-            self.plot_raw_evoked_button,
-            self.inspect_epochs_button,
-            self.rereference_epochs_button,
-        ):
-            first_actions.addWidget(button)
-        first_row.addLayout(first_actions, 1)
-        layout.addLayout(first_row)
-
-        second_row = QHBoxLayout()
-        second_row.addWidget(self.epochs_ica_info_widget, 1)
-
-        second_actions = QVBoxLayout()
-        self.run_epochs_ica_button = QPushButton("Run Epoch ICA")
-        self.inspect_epochs_ica_button = QPushButton("Inspect Epoch ICA")
-        second_actions.addWidget(self.run_epochs_ica_button)
-        second_actions.addWidget(self.inspect_epochs_ica_button)
-        second_row.addLayout(second_actions, 1)
-        layout.addLayout(second_row)
-        return group
-
-    def _create_preprocessed_group(self) -> QGroupBox:
-        group = QGroupBox()
-        layout = QVBoxLayout(group)
-
-        row = QHBoxLayout()
-        row.addWidget(self.preprocessed_info_widget, 1)
-
-        actions = QVBoxLayout()
-        self.apply_filters_button = QPushButton("Apply ICA and Final Filters")
-        actions.addWidget(self.apply_filters_button)
-        row.addLayout(actions)
-
-        layout.addLayout(row)
-        layout.addWidget(self.plot_widget)
-        return group
-
-    def _setup_connections(self):
-        self.inspect_raw_button.clicked.connect(self.inspect_raw_data)
-        self.artifact_removal_button.clicked.connect(self.artifact_removal)
-        self.filter_continuous_button.clicked.connect(self.filter_continuous)
-        self.run_continuous_ica_button.clicked.connect(self.run_continuous_ica)
-        self.inspect_continuous_ica_button.clicked.connect(self.inspect_continuous_ica)
-        self.segment_button.clicked.connect(self.segment_epochs)
-
-        self.plot_raw_evoked_button.clicked.connect(self.plot_raw_evoked)
-        self.inspect_epochs_button.clicked.connect(self.inspect_epochs)
-        self.rereference_epochs_button.clicked.connect(self.rereference_epochs)
-        self.run_epochs_ica_button.clicked.connect(self.run_epochs_ica)
-        self.inspect_epochs_ica_button.clicked.connect(self.inspect_epochs_ica)
-        self.apply_filters_button.clicked.connect(self.apply_filters)
 
     def _configure_workflow_buttons(self):
-        self._workflow_button_specs = {
-            self.inspect_raw_button: {"stage_id": "raw", "role": "inspect"},
-            self.artifact_removal_button: {"stage_id": "filtered_raw", "role": "process"},
-            self.filter_continuous_button: {"stage_id": "filtered_raw", "role": "process"},
-            self.run_continuous_ica_button: {"stage_id": "continuous_ica", "role": "process"},
-            self.inspect_continuous_ica_button: {"stage_id": "continuous_ica", "role": "inspect"},
-            self.segment_button: {"stage_id": "epochs", "role": "process"},
-            self.plot_raw_evoked_button: {"stage_id": "epochs", "role": "inspect"},
-            self.inspect_epochs_button: {"stage_id": "epochs", "role": "inspect"},
-            self.rereference_epochs_button: {"stage_id": "epochs", "role": "process"},
-            self.run_epochs_ica_button: {"stage_id": "epochs_ica", "role": "process"},
-            self.inspect_epochs_ica_button: {"stage_id": "epochs_ica", "role": "inspect"},
-            self.apply_filters_button: {"stage_id": "preprocessed", "role": "process"},
-        }
-
         stage_lookup = {}
         if self.main_window is not None:
             stage_lookup = {
                 stage.id: stage for stage in self.main_window.current_pipeline.stages
             }
 
-        for button, spec in self._workflow_button_specs.items():
-            stage = stage_lookup.get(spec["stage_id"])
+        for button, action in self._workflow_button_specs.items():
+            stage = stage_lookup.get(action.stage_id)
             button.setProperty("workflowButton", True)
-            button.setProperty("workflowRole", spec["role"])
+            button.setProperty("workflowRole", action.role)
             button.setProperty("stepState", "locked")
             button.setProperty("optionalStep", bool(stage and stage.optional))
             if stage is not None:
-                tooltip = f"{stage.label}\n{stage.description}"
+                tooltip = f"{action.label}\n{stage.label}: {stage.description}"
                 if stage.optional:
                     tooltip += "\nOptional step."
                 button.setToolTip(tooltip)
 
     def _refresh_workflow_button_states(self, availability: dict[QPushButton, bool]):
-        for button, spec in self._workflow_button_specs.items():
+        for button, action in self._workflow_button_specs.items():
             is_available = availability.get(button, False)
             if self.current_dataset is None:
                 step_state = "locked"
             else:
-                stage_state = self.current_dataset.stage_status(spec["stage_id"])
-                if spec["role"] == "inspect":
+                stage_state = self.current_dataset.stage_status(action.stage_id)
+                if action.role == "inspect":
                     step_state = "complete" if is_available else "locked"
                 elif stage_state == "complete":
                     step_state = "complete"
@@ -258,7 +212,7 @@ class ProcessingPage(BasePage):
     @Slot(object)
     def on_pipeline_changed(self, pipeline):
         self._needs_reload = True
-        self._configure_workflow_buttons()
+        self._build_pipeline_workflow()
         if self.isVisible():
             self.update_ui_state()
 
@@ -307,6 +261,60 @@ class ProcessingPage(BasePage):
         )
         worker.exec_with_dialog("Please wait", "Saving ICA...")
 
+    def _has_stage(self, stage_id: str | None) -> bool:
+        return bool(self.preprocessor and stage_id and self.preprocessor.has(stage_id))
+
+    def _is_action_available(self, action) -> bool:
+        if not self.preprocessor:
+            return False
+
+        is_available = self._has_stage(action.requires_stage_id)
+        if action.id == "rereference_epochs" and is_available:
+            return not self.preprocessor.epochs.proj
+        return is_available
+
+    def _stage_object_for_info(self, stage_id: str):
+        if not self.preprocessor:
+            return None, ""
+
+        try:
+            if stage_id == "raw" and self.preprocessor.has("raw"):
+                return self.preprocessor._get_last_continuous(), "Recording summary"
+            if stage_id == "filtered_raw" and self.preprocessor.has("filtered_raw"):
+                return self.preprocessor.filtered_raw, "Filtered recording"
+            if stage_id == "continuous_ica" and self.preprocessor.has("continuous_ica"):
+                return self.preprocessor.continuous_ica, "ICA summary"
+            if stage_id == "epochs" and self.preprocessor.has("epochs"):
+                return self.preprocessor.epochs, "Epoch summary"
+            if stage_id == "epochs_ica" and self.preprocessor.has("epochs_ica"):
+                return self.preprocessor.epochs_ica, "Epoch ICA summary"
+            if stage_id == "preprocessed" and self.preprocessor.has("preprocessed"):
+                return self.preprocessor.preprocessed, "Ready output"
+        except FileNotFoundError:
+            return None, ""
+
+        return None, ""
+
+    def _refresh_info_widgets(self):
+        for stage_id, info_widget in self.info_widgets_by_stage.items():
+            stage_object, label = self._stage_object_for_info(stage_id)
+            if stage_object is None:
+                info_widget.clear_info()
+            else:
+                info_widget.update_info(stage_object, label)
+
+    def _refresh_plot_widgets(self):
+        for stage_id, plot_widget in self.plot_widgets_by_stage.items():
+            stage_object, _ = self._stage_object_for_info(stage_id)
+            plot_widget.setVisible(stage_object is not None)
+            if stage_object is None:
+                plot_widget.update_plot(None)
+            else:
+                plot_widget.update_plot(
+                    stage_object,
+                    label=self.preprocessor.label if self.preprocessor else None,
+                )
+
     def update_ui_state(self):
         pipeline_name = self.main_window.current_pipeline.name if self.main_window else "Pipeline"
         if self.current_dataset:
@@ -320,63 +328,17 @@ class ProcessingPage(BasePage):
 
         self._ensure_preprocessor_loaded()
 
-        has_raw = bool(self.preprocessor and self.preprocessor.has("raw"))
-        has_continuous_ica = bool(self.preprocessor and self.preprocessor.has("continuous_ica"))
-        has_epochs = bool(self.preprocessor and self.preprocessor.has("epochs"))
-        has_epochs_ica = bool(self.preprocessor and self.preprocessor.has("epochs_ica"))
-        has_preprocessed = bool(self.preprocessor and self.preprocessor.has("preprocessed"))
-
-        if has_raw:
-            self.raw_info_widget.update_info(self.preprocessor._get_last_continuous(), "Recording summary")
-        else:
-            self.raw_info_widget.clear_info()
-
-        if has_continuous_ica:
-            self.continuous_ica_info_widget.update_info(self.preprocessor.continuous_ica, "ICA summary")
-        else:
-            self.continuous_ica_info_widget.clear_info()
-
-        if has_epochs:
-            self.epochs_info_widget.update_info(self.preprocessor.epochs, "Epoch summary")
-        else:
-            self.epochs_info_widget.clear_info()
-
-        if has_epochs_ica:
-            self.epochs_ica_info_widget.update_info(self.preprocessor.epochs_ica, "Epoch ICA summary")
-        else:
-            self.epochs_ica_info_widget.clear_info()
-
-        if has_preprocessed:
-            self.preprocessed_info_widget.update_info(self.preprocessor.preprocessed, "Ready output")
-        else:
-            self.preprocessed_info_widget.clear_info()
+        self._refresh_info_widgets()
 
         button_availability = {
-            self.inspect_raw_button: has_raw,
-            self.artifact_removal_button: has_raw,
-            self.filter_continuous_button: has_raw,
-            self.segment_button: has_raw,
-            self.run_continuous_ica_button: has_raw,
-            self.inspect_continuous_ica_button: has_continuous_ica,
-            self.plot_raw_evoked_button: has_epochs,
-            self.inspect_epochs_button: has_epochs,
-            self.rereference_epochs_button: has_epochs and not self.preprocessor.epochs.proj if has_epochs else False,
-            self.run_epochs_ica_button: has_epochs,
-            self.inspect_epochs_ica_button: has_epochs_ica,
-            self.apply_filters_button: has_epochs,
+            button: self._is_action_available(action)
+            for button, action in self._workflow_button_specs.items()
         }
         for button, is_enabled in button_availability.items():
             button.setEnabled(is_enabled)
         self._refresh_workflow_button_states(button_availability)
 
-        self.plot_widget.setVisible(has_preprocessed)
-        if has_preprocessed and self.preprocessor.preprocessed is not None:
-            self.plot_widget.update_plot(
-                self.preprocessor.preprocessed,
-                label=self.preprocessor.label,
-            )
-        else:
-            self.plot_widget.update_plot(None)
+        self._refresh_plot_widgets()
 
     @Slot()
     def on_settings_updated(self):

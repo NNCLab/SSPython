@@ -17,16 +17,48 @@ class PipelineStage:
 
 
 @dataclass(frozen=True)
+class PipelineAction:
+    id: str
+    label: str
+    stage_id: str
+    role: str
+    handler: str
+    requires_stage_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PipelinePanel:
+    id: str
+    info_stage_id: str | None
+    actions: tuple[PipelineAction, ...] = ()
+    plot_stage_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PipelineSection:
+    id: str
+    title: str
+    panels: tuple[PipelinePanel, ...]
+
+
+@dataclass(frozen=True)
 class PipelineDefinition:
     id: str
     name: str
     summary: str
     accent_color: str
     stages: tuple[PipelineStage, ...]
+    workflow_sections: tuple[PipelineSection, ...]
     analysis_ready_stage: str = "preprocessed"
+    legacy_ids: tuple[str, ...] = ()
 
     def derivative_root(self, workspace_root: Path, output_root: str) -> Path:
         return workspace_root / output_root / self.id
+
+    def derivative_roots(self, workspace_root: Path, output_root: str) -> tuple[Path, ...]:
+        return (self.derivative_root(workspace_root, output_root),) + tuple(
+            workspace_root / output_root / legacy_id for legacy_id in self.legacy_ids
+        )
 
     def stage_ids(self) -> tuple[str, ...]:
         return tuple(stage.id for stage in self.stages)
@@ -73,32 +105,203 @@ PROCESSING_STAGES = (
 )
 
 
+STANDARD_WORKFLOW_SECTIONS = (
+    PipelineSection(
+        id="continuous_processing",
+        title="Continuous Processing",
+        panels=(
+            PipelinePanel(
+                id="recording",
+                info_stage_id="raw",
+                actions=(
+                    PipelineAction(
+                        id="inspect_raw",
+                        label="Inspect Raw Data",
+                        stage_id="raw",
+                        role="inspect",
+                        handler="inspect_raw_data",
+                        requires_stage_id="raw",
+                    ),
+                    PipelineAction(
+                        id="artifact_removal",
+                        label="Remove Stimulation Artifact",
+                        stage_id="filtered_raw",
+                        role="process",
+                        handler="artifact_removal",
+                        requires_stage_id="raw",
+                    ),
+                    PipelineAction(
+                        id="filter_continuous",
+                        label="Filter and Resample",
+                        stage_id="filtered_raw",
+                        role="process",
+                        handler="filter_continuous",
+                        requires_stage_id="raw",
+                    ),
+                ),
+            ),
+            PipelinePanel(
+                id="continuous_ica",
+                info_stage_id="continuous_ica",
+                actions=(
+                    PipelineAction(
+                        id="run_continuous_ica",
+                        label="Run Continuous ICA",
+                        stage_id="continuous_ica",
+                        role="process",
+                        handler="run_continuous_ica",
+                        requires_stage_id="raw",
+                    ),
+                    PipelineAction(
+                        id="inspect_continuous_ica",
+                        label="Inspect Continuous ICA",
+                        stage_id="continuous_ica",
+                        role="inspect",
+                        handler="inspect_continuous_ica",
+                        requires_stage_id="continuous_ica",
+                    ),
+                ),
+            ),
+            PipelinePanel(
+                id="epoch_segmentation",
+                info_stage_id=None,
+                actions=(
+                    PipelineAction(
+                        id="segment",
+                        label="Segment into Epochs",
+                        stage_id="epochs",
+                        role="process",
+                        handler="segment_epochs",
+                        requires_stage_id="raw",
+                    ),
+                ),
+            ),
+        ),
+    ),
+    PipelineSection(
+        id="epoching_and_ica",
+        title="Epoching and ICA",
+        panels=(
+            PipelinePanel(
+                id="epochs",
+                info_stage_id="epochs",
+                actions=(
+                    PipelineAction(
+                        id="plot_raw_evoked",
+                        label="Plot Raw Evoked",
+                        stage_id="epochs",
+                        role="inspect",
+                        handler="plot_raw_evoked",
+                        requires_stage_id="epochs",
+                    ),
+                    PipelineAction(
+                        id="inspect_epochs",
+                        label="Inspect Epochs",
+                        stage_id="epochs",
+                        role="inspect",
+                        handler="inspect_epochs",
+                        requires_stage_id="epochs",
+                    ),
+                    PipelineAction(
+                        id="rereference_epochs",
+                        label="Re-reference Epochs",
+                        stage_id="epochs",
+                        role="process",
+                        handler="rereference_epochs",
+                        requires_stage_id="epochs",
+                    ),
+                ),
+            ),
+            PipelinePanel(
+                id="epochs_ica",
+                info_stage_id="epochs_ica",
+                actions=(
+                    PipelineAction(
+                        id="run_epochs_ica",
+                        label="Run Epoch ICA",
+                        stage_id="epochs_ica",
+                        role="process",
+                        handler="run_epochs_ica",
+                        requires_stage_id="epochs",
+                    ),
+                    PipelineAction(
+                        id="inspect_epochs_ica",
+                        label="Inspect Epoch ICA",
+                        stage_id="epochs_ica",
+                        role="inspect",
+                        handler="inspect_epochs_ica",
+                        requires_stage_id="epochs_ica",
+                    ),
+                ),
+            ),
+        ),
+    ),
+    PipelineSection(
+        id="preprocessed_output",
+        title="Preprocessed Output",
+        panels=(
+            PipelinePanel(
+                id="preprocessed",
+                info_stage_id="preprocessed",
+                actions=(
+                    PipelineAction(
+                        id="apply_filters",
+                        label="Apply ICA and Final Filters",
+                        stage_id="preprocessed",
+                        role="process",
+                        handler="apply_filters",
+                        requires_stage_id="epochs",
+                    ),
+                ),
+                plot_stage_id="preprocessed",
+            ),
+        ),
+    ),
+)
+
+
 PIPELINES: dict[str, PipelineDefinition] = {
-    "tms_eeg": PipelineDefinition(
-        id="tms_eeg",
-        name="TMS-EEG",
-        summary="Artifact-aware preprocessing and ERP/TEP analysis.",
+    "standard": PipelineDefinition(
+        id="standard",
+        name="Standard",
+        summary=(
+            "Shared preprocessing workflow with event-based and fixed-length "
+            "epoch segmentation options."
+        ),
         accent_color="#0f7a82",
         stages=PROCESSING_STAGES,
-    ),
-    "continuous_eeg": PipelineDefinition(
-        id="continuous_eeg",
-        name="Continuous EEG",
-        summary="Continuous inspection, filtering, PSD, and fixed-length epochs.",
-        accent_color="#8a5a2b",
-        stages=PROCESSING_STAGES,
+        workflow_sections=STANDARD_WORKFLOW_SECTIONS,
+        legacy_ids=("tms_eeg", "continuous_eeg"),
     ),
 }
 
+PIPELINE_ID_ALIASES = {
+    "tms_eeg": DEFAULT_PIPELINE_ID,
+    "continuous_eeg": DEFAULT_PIPELINE_ID,
+}
+
+
+def normalize_pipeline_id(pipeline_id: str | None) -> str:
+    if not pipeline_id:
+        return DEFAULT_PIPELINE_ID
+    return PIPELINE_ID_ALIASES.get(pipeline_id, pipeline_id)
+
 
 def get_pipeline(pipeline_id: str | None) -> PipelineDefinition:
-    if pipeline_id and pipeline_id in PIPELINES:
-        return PIPELINES[pipeline_id]
+    normalized_id = normalize_pipeline_id(pipeline_id)
+    if normalized_id in PIPELINES:
+        return PIPELINES[normalized_id]
     return PIPELINES[DEFAULT_PIPELINE_ID]
 
 
 def all_pipelines() -> list[PipelineDefinition]:
     return list(PIPELINES.values())
+
+
+def register_pipeline(pipeline: PipelineDefinition):
+    if pipeline.id in PIPELINES or pipeline.id in PIPELINE_ID_ALIASES:
+        raise ValueError(f"Pipeline id already registered: {pipeline.id}")
+    PIPELINES[pipeline.id] = pipeline
 
 
 def strip_extensions(file_path: Path) -> str:
@@ -276,7 +479,6 @@ def discover_datasets(
 
     workspace_root = Path(workspace_root)
     output_root_path = workspace_root / output_root
-    derivative_root = pipeline.derivative_root(workspace_root, output_root)
 
     datasets: list[DatasetRecord] = []
     for raw_path in sorted(workspace_root.rglob("*_raw.fif")):
@@ -286,7 +488,12 @@ def discover_datasets(
         except ValueError:
             pass
 
-        paths = build_processing_paths(raw_path, derivative_root, create_dirs=False)
+        derivative_root, paths = select_processing_paths(
+            raw_path,
+            pipeline,
+            workspace_root,
+            output_root,
+        )
         datasets.append(
             DatasetRecord(
                 raw_path=raw_path,
@@ -297,3 +504,39 @@ def discover_datasets(
         )
 
     return datasets
+
+
+def derivative_progress_count(
+    paths: dict[str, Path],
+    pipeline: PipelineDefinition,
+) -> int:
+    return sum(
+        1
+        for stage in pipeline.stages
+        if stage.id != "raw" and paths.get(stage.id) and paths[stage.id].exists()
+    )
+
+
+def select_processing_paths(
+    raw_path: Path,
+    pipeline: PipelineDefinition,
+    workspace_root: Path,
+    output_root: str,
+) -> tuple[Path, dict[str, Path]]:
+    candidates: list[tuple[int, Path, dict[str, Path]]] = []
+    for derivative_root in pipeline.derivative_roots(workspace_root, output_root):
+        paths = build_processing_paths(raw_path, derivative_root, create_dirs=False)
+        progress_count = derivative_progress_count(paths, pipeline)
+        candidates.append((progress_count, derivative_root, paths))
+
+    best_progress, best_root, best_paths = max(
+        candidates,
+        key=lambda candidate: candidate[0],
+    )
+    if best_progress == 0:
+        return pipeline.derivative_root(workspace_root, output_root), build_processing_paths(
+            raw_path,
+            pipeline.derivative_root(workspace_root, output_root),
+            create_dirs=False,
+        )
+    return best_root, best_paths
