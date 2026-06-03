@@ -1,4 +1,5 @@
 import logging
+from collections import Counter
 from datetime import datetime
 
 from PySide6.QtCore import Slot
@@ -26,12 +27,41 @@ from ui.widgets.preprocessing_widgets import (
 )
 from ui.widgets.run_ica_widget import RunICADialog
 from ui.widgets.tools.object_info_widget import ObjectInfoWidget
+from ui.widgets.tools.stage_io import load_stage_object
 from utils import Worker
 
 from .base_page import BasePage
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _annotation_entries(annotations) -> list[tuple[float, float, str, tuple[str, ...]]]:
+    ch_names = getattr(annotations, "ch_names", None)
+    if ch_names is None:
+        ch_names = [()] * len(annotations)
+
+    entries = []
+    for onset, duration, description, annotation_channels in zip(
+        annotations.onset,
+        annotations.duration,
+        annotations.description,
+        ch_names,
+    ):
+        if isinstance(annotation_channels, str):
+            channels = (annotation_channels,)
+        else:
+            channels = tuple(str(channel) for channel in annotation_channels)
+        entries.append((float(onset), float(duration), str(description), channels))
+    return entries
+
+
+def _annotation_counter(annotations) -> Counter:
+    return Counter(_annotation_entries(annotations))
+
+
+def _is_bad_annotation(entry: tuple[float, float, str, tuple[str, ...]]) -> bool:
+    return entry[2].lower().startswith("bad")
 
 
 class ProcessingPage(BasePage):
@@ -46,17 +76,14 @@ class ProcessingPage(BasePage):
         self._workflow_button_specs = {}
         self.info_widgets_by_stage: dict[str, ObjectInfoWidget] = {}
         self.plot_widgets_by_stage: dict[str, EvokedPlotWidget] = {}
+        self._raw_review_pending = False
+        self._raw_review_figure = None
 
         self._setup_ui()
         self._connect_to_main_window()
         self.update_ui_state()
 
     def _setup_ui(self):
-        self.context_label = QLabel("Choose a dataset from the workspace panel.")
-        self.context_label.setObjectName("contextCard")
-        self.context_label.setWordWrap(True)
-        self.add_content(self.context_label)
-
         self.raw_evoked_plot_widget = EvokedPlotWidget()
         self.workflow_container = QWidget()
         self.workflow_layout = QVBoxLayout(self.workflow_container)
@@ -177,7 +204,7 @@ class ProcessingPage(BasePage):
             if self.current_dataset is None:
                 step_state = "locked"
             else:
-                stage_state = self.current_dataset.stage_status(action.stage_id)
+                stage_state = self._stage_status(action.stage_id)
                 if action.role == "inspect":
                     step_state = "complete" if is_available else "locked"
                 elif stage_state == "complete":
@@ -262,7 +289,11 @@ class ProcessingPage(BasePage):
         worker.exec_with_dialog("Please wait", "Saving ICA...")
 
     def _has_stage(self, stage_id: str | None) -> bool:
-        return bool(self.preprocessor and stage_id and self.preprocessor.has(stage_id))
+        if not self.preprocessor or not stage_id:
+            return False
+        if self.preprocessor.has(stage_id):
+            return True
+        return bool(self.current_dataset and self.current_dataset.stage_exists(stage_id))
 
     def _is_action_available(self, action) -> bool:
         if not self.preprocessor:
@@ -273,24 +304,47 @@ class ProcessingPage(BasePage):
             return not self.preprocessor.epochs.proj
         return is_available
 
+    def _stage_definition(self, stage_id: str | None):
+        if stage_id is None:
+            return None
+        pipeline = self._current_pipeline()
+        return next((stage for stage in pipeline.stages if stage.id == stage_id), None)
+
+    def _stage_status(self, stage_id: str) -> str:
+        if self.current_dataset is None:
+            return "pending"
+        try:
+            return self.current_dataset.stage_status(stage_id)
+        except (StopIteration, ValueError):
+            return "pending"
+
     def _stage_object_for_info(self, stage_id: str):
         if not self.preprocessor:
             return None, ""
 
+        stage = self._stage_definition(stage_id)
+        label = f"{stage.label} summary" if stage is not None else "Stage summary"
+
         try:
             if stage_id == "raw" and self.preprocessor.has("raw"):
-                return self.preprocessor._get_last_continuous(), "Recording summary"
+                return self.preprocessor._get_last_continuous(), "Current continuous file"
             if stage_id == "filtered_raw" and self.preprocessor.has("filtered_raw"):
-                return self.preprocessor.filtered_raw, "Filtered recording"
+                return self.preprocessor.filtered_raw, label
             if stage_id == "continuous_ica" and self.preprocessor.has("continuous_ica"):
-                return self.preprocessor.continuous_ica, "ICA summary"
+                return self.preprocessor.continuous_ica, label
             if stage_id == "epochs" and self.preprocessor.has("epochs"):
-                return self.preprocessor.epochs, "Epoch summary"
+                return self.preprocessor.epochs, label
             if stage_id == "epochs_ica" and self.preprocessor.has("epochs_ica"):
-                return self.preprocessor.epochs_ica, "Epoch ICA summary"
+                return self.preprocessor.epochs_ica, label
             if stage_id == "preprocessed" and self.preprocessor.has("preprocessed"):
-                return self.preprocessor.preprocessed, "Ready output"
-        except FileNotFoundError:
+                return self.preprocessor.preprocessed, label
+
+            if self.current_dataset is None or stage is None:
+                return None, ""
+            if not self.current_dataset.stage_exists(stage_id):
+                return None, ""
+            return load_stage_object(stage_id, self.current_dataset.paths[stage_id], stage.data_kind), label
+        except (FileNotFoundError, ValueError):
             return None, ""
 
         return None, ""
@@ -306,8 +360,10 @@ class ProcessingPage(BasePage):
     def _refresh_plot_widgets(self):
         for stage_id, plot_widget in self.plot_widgets_by_stage.items():
             stage_object, _ = self._stage_object_for_info(stage_id)
-            plot_widget.setVisible(stage_object is not None)
-            if stage_object is None:
+            stage = self._stage_definition(stage_id)
+            can_plot = stage is not None and stage.data_kind == "epochs"
+            plot_widget.setVisible(stage_object is not None and can_plot)
+            if stage_object is None or not can_plot:
                 plot_widget.update_plot(None)
             else:
                 plot_widget.update_plot(
@@ -319,12 +375,8 @@ class ProcessingPage(BasePage):
         pipeline_name = self.main_window.current_pipeline.name if self.main_window else "Pipeline"
         if self.current_dataset:
             self.set_page_subtitle(f"{pipeline_name} pipeline · {self.current_dataset.display_name}")
-            self.context_label.hide()
         else:
             self.set_page_subtitle("Select a dataset in the workspace panel to start preprocessing.")
-            self.context_label.setText("Choose a dataset from the workspace panel.")
-            self.context_label.setToolTip("")
-            self.context_label.show()
 
         self._ensure_preprocessor_loaded()
 
@@ -349,15 +401,117 @@ class ProcessingPage(BasePage):
     def inspect_raw_data(self):
         if not self.preprocessor:
             return
-        n_channels = len(self.preprocessor.raw.ch_names)
-        self.preprocessor.raw.plot(
-            n_channels=n_channels,
-            duration=10,
-            use_opengl=None,
-            splash=False,
-            block=True,
-        )
-        self.update_ui_state()
+        if self._raw_review_pending:
+            if self._raw_review_figure is not None and hasattr(self._raw_review_figure, "activateWindow"):
+                self._raw_review_figure.activateWindow()
+            return
+        try:
+            self.viz_raw = self.preprocessor._get_last_continuous().copy()
+            self.original_raw_bads = self.viz_raw.info["bads"].copy()
+            self.original_raw_annotations = self.viz_raw.annotations.copy()
+            self._raw_review_pending = True
+
+            figure = self.viz_raw.plot(
+                n_channels=len(self.viz_raw.ch_names),
+                duration=10,
+                use_opengl=None,
+                splash=False,
+                block=False,
+            )
+            self._raw_review_figure = figure
+            if hasattr(figure, "gotClosed"):
+                figure.gotClosed.connect(self._after_raw_inspected)
+            elif hasattr(figure, "canvas") and hasattr(figure.canvas, "mpl_connect"):
+                figure.canvas.mpl_connect("close_event", lambda event: self._after_raw_inspected())
+            else:
+                self._raw_review_pending = False
+                self._raw_review_figure = None
+                QMessageBox.warning(
+                    self,
+                    "Unable to Track Inspection",
+                    "The raw inspection window does not expose a close event, so changes cannot be saved from this viewer.",
+                )
+        except Exception as exc:
+            self._raw_review_pending = False
+            self._raw_review_figure = None
+            QMessageBox.critical(self, "Error", f"Failed to inspect raw data: {exc}")
+
+    @Slot()
+    def _after_raw_inspected(self):
+        if not self._raw_review_pending:
+            return
+        self._raw_review_pending = False
+        self._raw_review_figure = None
+        did_save = False
+        try:
+            newly_marked_bads = [
+                channel
+                for channel in self.viz_raw.info["bads"]
+                if channel not in self.original_raw_bads
+            ]
+            newly_unmarked_bads = [
+                channel
+                for channel in self.viz_raw.ch_names
+                if channel in self.original_raw_bads and channel not in self.viz_raw.info["bads"]
+            ]
+
+            original_annotations = _annotation_counter(self.original_raw_annotations)
+            reviewed_annotations = _annotation_counter(self.viz_raw.annotations)
+            added_annotations = reviewed_annotations - original_annotations
+            removed_annotations = original_annotations - reviewed_annotations
+            added_annotation_count = sum(added_annotations.values())
+            removed_annotation_count = sum(removed_annotations.values())
+            added_bad_annotation_count = sum(
+                count for entry, count in added_annotations.items() if _is_bad_annotation(entry)
+            )
+            removed_bad_annotation_count = sum(
+                count for entry, count in removed_annotations.items() if _is_bad_annotation(entry)
+            )
+
+            if (
+                not newly_marked_bads
+                and not newly_unmarked_bads
+                and added_annotation_count == 0
+                and removed_annotation_count == 0
+            ):
+                QMessageBox.information(self, "No Changes", "No channels or annotations were modified.")
+                return
+
+            message = "The following changes were made:\n\n"
+            if newly_unmarked_bads:
+                message += f" - Restored bad channels: {', '.join(newly_unmarked_bads)}\n"
+            if newly_marked_bads:
+                message += f" - New bad channels: {', '.join(newly_marked_bads)}\n"
+            if added_annotation_count:
+                message += f" - Annotations added: {added_annotation_count}\n"
+            if removed_annotation_count:
+                message += f" - Annotations removed: {removed_annotation_count}\n"
+            if added_bad_annotation_count or removed_bad_annotation_count:
+                message += (
+                    " - Bad annotation changes: "
+                    f"+{added_bad_annotation_count}/-{removed_bad_annotation_count}\n"
+                )
+            message += "\nSave these changes to the filtered raw derivative?"
+            message += "\nThe source raw file will not be modified."
+
+            reply = QMessageBox.question(
+                self,
+                "Apply Changes?",
+                message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.preprocessor.update_raw_review(self.viz_raw)
+                did_save = True
+                QMessageBox.information(self, "Success", "Changes have been saved.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"An error occurred while updating raw data: {exc}")
+        finally:
+            if did_save:
+                self._refresh_after_step()
+            elif self.isVisible():
+                self.update_ui_state()
 
     def artifact_removal(self):
         if not self.preprocessor:

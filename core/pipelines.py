@@ -14,6 +14,10 @@ class PipelineStage:
     short_label: str
     description: str
     optional: bool = False
+    data_kind: str | None = None
+    derivative_desc: str | None = None
+    derivative_suffix: str | None = None
+    derivative_extension: str = ".fif"
 
 
 @dataclass(frozen=True)
@@ -68,13 +72,16 @@ class PipelineDefinition:
 
 
 PROCESSING_STAGES = (
-    PipelineStage("raw", "Raw Import", "Raw", "Source recording available."),
+    PipelineStage("raw", "Raw Import", "Raw", "Source recording available.", data_kind="raw"),
     PipelineStage(
         "filtered_raw",
         "Continuous Cleanup",
         "Filter",
         "Artifact interpolation, filtering, or resampling saved.",
         optional=True,
+        data_kind="raw",
+        derivative_desc="filtered",
+        derivative_suffix="raw",
     ),
     PipelineStage(
         "continuous_ica",
@@ -82,12 +89,18 @@ PROCESSING_STAGES = (
         "ICA-C",
         "ICA fitted on the continuous recording.",
         optional=True,
+        data_kind="ica",
+        derivative_desc="continuousica",
+        derivative_suffix="ica",
     ),
     PipelineStage(
         "epochs",
         "Epoch Extraction",
         "Epochs",
         "Epoched data available for review.",
+        data_kind="epochs",
+        derivative_desc="epoched",
+        derivative_suffix="epo",
     ),
     PipelineStage(
         "epochs_ica",
@@ -95,12 +108,18 @@ PROCESSING_STAGES = (
         "ICA-E",
         "ICA fitted on epoched data.",
         optional=True,
+        data_kind="ica",
+        derivative_desc="epochsica",
+        derivative_suffix="ica",
     ),
     PipelineStage(
         "preprocessed",
         "Preprocessed Output",
         "Ready",
         "Final preprocessed epochs are available.",
+        data_kind="epochs",
+        derivative_desc="preprocessed",
+        derivative_suffix="epo",
     ),
 )
 
@@ -347,6 +366,7 @@ def build_processing_paths(
     raw_path: Path,
     derivative_root: Path,
     *,
+    pipeline: PipelineDefinition | None = None,
     create_dirs: bool = True,
 ) -> dict[str, Path]:
     source_stem = source_stem_from_raw(raw_path)
@@ -360,6 +380,17 @@ def build_processing_paths(
         "epochs_ica": base_dir / derivative_filename(source_stem, "epochsica", "ica", ".fif"),
         "preprocessed": base_dir / derivative_filename(source_stem, "preprocessed", "epo", ".fif"),
     }
+    if pipeline is not None:
+        for stage in pipeline.stages:
+            if stage.id == "raw":
+                paths["raw"] = raw_path
+            elif stage.derivative_desc and stage.derivative_suffix:
+                paths[stage.id] = base_dir / derivative_filename(
+                    source_stem,
+                    stage.derivative_desc,
+                    stage.derivative_suffix,
+                    stage.derivative_extension,
+                )
     if create_dirs:
         for path in paths.values():
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -525,7 +556,12 @@ def select_processing_paths(
 ) -> tuple[Path, dict[str, Path]]:
     candidates: list[tuple[int, Path, dict[str, Path]]] = []
     for derivative_root in pipeline.derivative_roots(workspace_root, output_root):
-        paths = build_processing_paths(raw_path, derivative_root, create_dirs=False)
+        paths = build_processing_paths(
+            raw_path,
+            derivative_root,
+            pipeline=pipeline,
+            create_dirs=False,
+        )
         progress_count = derivative_progress_count(paths, pipeline)
         candidates.append((progress_count, derivative_root, paths))
 
@@ -537,6 +573,7 @@ def select_processing_paths(
         return pipeline.derivative_root(workspace_root, output_root), build_processing_paths(
             raw_path,
             pipeline.derivative_root(workspace_root, output_root),
+            pipeline=pipeline,
             create_dirs=False,
         )
     return best_root, best_paths

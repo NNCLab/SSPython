@@ -667,6 +667,7 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         }
 
     def set_params(self, params: dict):
+        defaults = self.get_defaults()
         mode = params.get("mode", "event")
         display_mode = next(
             (
@@ -678,9 +679,23 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         )
         self.mode_combobox.setCurrentText(display_mode)
         self.resample_edit.setText(to_display_string(params.get("resample")))
-        self.tlim_edit.setValue(params.get("tlim"))
-        self.fixed_dur_edit.setText(to_display_string(params.get("fixed_duration")))
-        self.fixed_overlap_edit.setText(to_display_string(params.get("fixed_overlap")))
+        tlim = params.get("tlim")
+        if (
+            not isinstance(tlim, (list, tuple))
+            or len(tlim) != 2
+            or tlim[0] is None
+            or tlim[1] is None
+        ):
+            tlim = defaults["tlim"]
+        fixed_duration = params.get("fixed_duration")
+        if fixed_duration is None:
+            fixed_duration = defaults["fixed_duration"]
+        fixed_overlap = params.get("fixed_overlap")
+        if fixed_overlap is None:
+            fixed_overlap = defaults["fixed_overlap"]
+        self.tlim_edit.setValue(tlim)
+        self.fixed_dur_edit.setText(to_display_string(fixed_duration))
+        self.fixed_overlap_edit.setText(to_display_string(fixed_overlap))
 
         detrend_val = params.get("detrend")
         # Reverse lookup for detrend combobox
@@ -750,6 +765,22 @@ class EpochingDialog(BaseProcessingDialog):
             if params["mode"] == "fixed":
                 if not params["fixed_duration"] or params["fixed_duration"] <= 0:
                     raise ValueError("Duration must be a positive number.")
+            else:
+                tlim = params.get("tlim")
+                if (
+                    tlim is None
+                    or not isinstance(tlim, (list, tuple))
+                    or len(tlim) != 2
+                    or tlim[0] is None
+                    or tlim[1] is None
+                ):
+                    raise ValueError(
+                        "Time limits must include both start and stop values for event-based epoching."
+                    )
+                if tlim[0] >= tlim[1]:
+                    raise ValueError(
+                        "Time limits start must be before stop for event-based epoching."
+                    )
 
             self.settings_widget.save_settings()  # Save for next time
             logger.info(f"Running epoching: {params}")

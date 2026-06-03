@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-
-import mne
 from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt, Signal, QSize
 from PySide6.QtGui import QFontMetrics, QPainter
 from PySide6.QtWidgets import (
@@ -24,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from core.pipelines import DatasetRecord, PipelineDefinition, discover_datasets
 from ui.widgets.tools.object_info_widget import ObjectDetailsDialog
+from ui.widgets.tools.stage_io import load_stage_object
 from utils import Worker, themed_svg_icon
 
 
@@ -36,16 +35,6 @@ def display_name_for_path(path: Path | None, *, strip_extensions: bool = True) -
     if strip_extensions and suffixes and path.is_file():
         return label[: -len(suffixes)]
     return label
-
-
-def load_stage_object(stage_id: str, file_path: Path):
-    if stage_id in {"raw", "filtered_raw"}:
-        return mne.io.read_raw_fif(file_path, preload=False)
-    if stage_id in {"epochs", "preprocessed"}:
-        return mne.read_epochs(file_path, preload=False)
-    if stage_id in {"continuous_ica", "epochs_ica"}:
-        return mne.preprocessing.read_ica(file_path)
-    raise ValueError(f"Unsupported stage: {stage_id}")
 
 
 class DatasetProgressBar(QProgressBar):
@@ -224,7 +213,7 @@ class StageStatusList(QFrame):
         for stage in dataset.pipeline.stages:
             status = dataset.stage_status(stage.id)
             if status == "complete":
-                detail_text = "Source available" if stage.id == "raw" else "Saved derivative"
+                detail_text = dataset.display_file_name(stage.id)
                 detail_tooltip = str(dataset.paths[stage.id])
             elif status == "skipped":
                 detail_text = "Skipped"
@@ -527,7 +516,7 @@ class DatasetInspectorPanel(QFrame):
         stage_path = self.current_dataset.paths[stage_id]
         try:
             worker = Worker(
-                lambda: load_stage_object(stage_id, stage_path),
+                lambda: load_stage_object(stage_id, stage_path, stage.data_kind),
                 parent=self,
                 add_loggers="mne",
             )

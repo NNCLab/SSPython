@@ -35,6 +35,7 @@ class OptionalRangeWidget(QWidget):
         """
         super().__init__(parent)
         self.scale = scale
+        self.required = (bool(required[0]), bool(required[1]))
 
         # --- Create UI Components ---
         self.low_check = QCheckBox(labels[0])
@@ -77,11 +78,11 @@ class OptionalRangeWidget(QWidget):
         self.high_check.setChecked(False)
 
         # --- Required? ---
-        if required[0]:
+        if self.required[0]:
             self.low_check.setChecked(True)
             self.low_check.setDisabled(True)
 
-        if required[1]:
+        if self.required[1]:
             self.high_check.setChecked(True)
             self.high_check.setDisabled(True)
 
@@ -108,11 +109,21 @@ class OptionalRangeWidget(QWidget):
         """
         low, high = values if values else (None, None)
 
-        self.low_check.setChecked(low is not None)
-        self.high_check.setChecked(high is not None)
+        self.low_check.setChecked(self.required[0] or low is not None)
+        self.high_check.setChecked(self.required[1] or high is not None)
 
-        self.low_input.setValue(low / self.scale if low is not None else 0)
-        self.high_input.setValue(high / self.scale if high is not None else 0)
+        if low is not None:
+            self.low_input.setValue(low / self.scale)
+        elif not self.required[0]:
+            self.low_input.setValue(0)
+
+        if high is not None:
+            self.high_input.setValue(high / self.scale)
+        elif not self.required[1]:
+            self.high_input.setValue(0)
+
+        self.low_input.setEnabled(self.low_check.isChecked())
+        self.high_input.setEnabled(self.high_check.isChecked())
 
     def _emit_value_changed(self):
         """Internal helper to emit the valueChanged Signal."""

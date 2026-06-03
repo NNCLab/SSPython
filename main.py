@@ -53,6 +53,7 @@ class MainWindow(QMainWindow):
     current_pipeline_changed = Signal(object)
     current_dataset_changed = Signal(object)
 
+
     GEOMETRY_SETTING = "ui/main_window/geometry"
     SIDEBAR_COLLAPSED_SETTING = "ui/main_window/sidebar_collapsed"
     INSPECTOR_COLLAPSED_SETTING = "ui/main_window/inspector_collapsed"

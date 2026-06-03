@@ -11,18 +11,22 @@ from ui.widgets.preprocessing_widgets import (
 )
 from ui.widgets.tools.conversion_tool import ConvertToolDialog, MergeToolDialog
 from ui.widgets.tools.object_info_widget import ObjectInfoWidget, extract_event_counts
+from ui.widgets.tools.optional_range_widget import OptionalRangeWidget
 from ui.widgets.real_time_widget import (
     ConnectionWidget,
+    DataProcessingWorker,
     RealTimeERP,
     apply_realtime_info_to_stream,
     apply_artifact_mask,
     apply_frequency_filters,
+    append_limited_history,
     buffer_epoch_snapshot,
     build_live_filter_pipeline,
     build_epoch_stream_configuration,
     channel_settings_from_info,
     channel_grid_positions,
     detect_regular_stream_event_ids,
+    raw_artifact_segments,
 )
 
 class TestUI(unittest.TestCase):
@@ -143,6 +147,69 @@ class TestUI(unittest.TestCase):
 
         expected = np.concatenate((epoch_buffer[2:], epoch_buffer[:2]), axis=0)[-2:]
         np.testing.assert_array_equal(snapshot, expected)
+
+    def test_append_limited_history_keeps_recent_samples(self):
+        history = np.arange(2 * 4, dtype=float).reshape(2, 4)
+        chunk = np.arange(100, 110, dtype=float).reshape(2, 5)
+
+        limited, dropped = append_limited_history(history, chunk, max_samples=6)
+
+        expected = np.concatenate((history[:, -1:], chunk), axis=1)
+        np.testing.assert_array_equal(limited, expected)
+        self.assertEqual(dropped, 3)
+
+    def test_raw_artifact_segments_are_merged_and_clipped(self):
+        stim_data = np.array([[0, 0, 1, 1, 0, 2]], dtype=float)
+
+        segments = raw_artifact_segments(stim_data, 1000.0, (0.0, 0.001))
+
+        self.assertEqual(segments, [(2, 4), (5, 6)])
+
+    def test_data_processing_worker_reuses_processed_epoch_cache(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(["Cz"], sfreq=1000.0, ch_types=["eeg"])
+
+        class FakeStream:
+            def __init__(self, stream_info):
+                self.info = stream_info
+                self.n_new_samples = 0
+
+        worker = DataProcessingWorker(
+            FakeStream(info),
+            {
+                "tlim": (-0.01, 0.01),
+                "decimate": 1,
+                "max_epochs": 4,
+                "art_rem": (None, None),
+                "reference": "none",
+            },
+        )
+        process_calls = []
+        original_process_epoch_batch = worker._process_epoch_batch
+
+        def counting_process(epoch_batch):
+            process_calls.append(epoch_batch.shape[0])
+            return original_process_epoch_batch(epoch_batch)
+
+        worker._process_epoch_batch = counting_process
+        epoch_batch = np.ones((2, 1, worker.original_times.size), dtype=float)
+
+        worker._store_epoch_batch(epoch_batch)
+        first_snapshot = worker._build_snapshot(include_raw=False, include_epoch=True)
+        second_snapshot = worker._build_snapshot(include_raw=False, include_epoch=True)
+
+        self.assertEqual(process_calls, [2])
+        self.assertEqual(first_snapshot["epoch_data"]["n_epochs"], 2)
+        self.assertEqual(second_snapshot["epoch_data"]["n_epochs"], 2)
+
+        worker.update_params({"bads": ["Cz"]})
+        self.assertEqual(process_calls, [2])
+
+        worker.update_params({"apply_notch": True, "notch_freqs": [50.0]})
+        self.assertEqual(process_calls, [2, 2])
 
     def test_apply_frequency_filters_preserves_shape(self):
         params = {
@@ -288,6 +355,47 @@ class TestUI(unittest.TestCase):
         app.processEvents()
         widget.events_list.item(1).setCheckState(Qt.CheckState.Unchecked)
         self.assertEqual(widget.get_event_selection(), {"Pulse": 7})
+        widget.close()
+
+    def test_optional_range_widget_keeps_required_bounds_enabled_without_value(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = OptionalRangeWidget(required=(True, True))
+        widget.setValue(None)
+
+        self.assertTrue(widget.low_check.isChecked())
+        self.assertTrue(widget.high_check.isChecked())
+        self.assertTrue(widget.low_input.isEnabled())
+        self.assertTrue(widget.high_input.isEnabled())
+        widget.close()
+
+    def test_epoching_settings_restore_time_limits_after_fixed_mode(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = EpochingSettingsWidget(show_events_list=True)
+        params = widget.get_defaults()
+        params.update(
+            {
+                "mode": "fixed",
+                "tlim": (None, None),
+                "fixed_duration": 3.0,
+                "fixed_overlap": 0.0,
+            }
+        )
+        widget.set_params(params)
+
+        widget.mode_combobox.setCurrentText("Event-based")
+        app.processEvents()
+
+        self.assertTrue(widget.tlim_edit.low_check.isChecked())
+        self.assertTrue(widget.tlim_edit.high_check.isChecked())
+        self.assertTrue(widget.tlim_edit.low_input.isEnabled())
+        self.assertTrue(widget.tlim_edit.high_input.isEnabled())
+        self.assertEqual(widget.get_params()["tlim"], (-0.8, 0.8))
         widget.close()
 
     def test_evoked_plot_widget_rebuilds_axes_cleanly_on_update(self):

@@ -48,6 +48,77 @@ class TestCore(unittest.TestCase):
         preprocessor.run_artifact_removal()
         self.assertTrue(preprocessor.has("filtered_raw"))
 
+    def test_raw_review_saves_to_filtered_derivative_without_touching_source(self):
+        """Test raw inspection edits are persisted only to the derivative raw."""
+        output_dir = self.test_dir / "derivatives"
+        preprocessor = Preprocessor(self.raw_filepath, output_dir)
+
+        reviewed_raw = preprocessor.raw.copy()
+        reviewed_raw.info["bads"] = ["EEG 002"]
+        reviewed_raw.set_annotations(
+            mne.Annotations(
+                onset=[0.5],
+                duration=[0.25],
+                description=["BAD_manual"],
+            )
+        )
+        preprocessor.paths["epochs"].touch()
+
+        preprocessor.update_raw_review(reviewed_raw)
+
+        self.assertTrue(preprocessor.has("filtered_raw"))
+        self.assertFalse(preprocessor.paths["epochs"].exists())
+
+        filtered = mne.io.read_raw_fif(
+            preprocessor.paths["filtered_raw"],
+            preload=False,
+            verbose="error",
+        )
+        self.assertEqual(filtered.info["bads"], ["EEG 002"])
+        self.assertEqual(len(filtered.annotations), 1)
+        self.assertEqual(filtered.annotations.description[0], "BAD_manual")
+        if hasattr(filtered, "close"):
+            filtered.close()
+
+        source = mne.io.read_raw_fif(self.raw_filepath, preload=False, verbose="error")
+        self.assertEqual(source.info["bads"], [])
+        self.assertEqual(len(source.annotations), 0)
+        if hasattr(source, "close"):
+            source.close()
+
+    def test_raw_review_can_update_existing_filtered_derivative(self):
+        """Test raw inspection edits can overwrite an existing filtered raw."""
+        output_dir = self.test_dir / "derivatives"
+        preprocessor = Preprocessor(self.raw_filepath, output_dir)
+
+        first_review = preprocessor.raw.copy()
+        first_review.info["bads"] = ["EEG 001"]
+        preprocessor.update_raw_review(first_review)
+
+        reloaded_preprocessor = Preprocessor(self.raw_filepath, output_dir)
+        second_review = reloaded_preprocessor.filtered_raw.copy()
+        second_review.info["bads"] = ["EEG 003"]
+        second_review.set_annotations(
+            mne.Annotations(
+                onset=[1.0],
+                duration=[0.1],
+                description=["BAD_review"],
+            )
+        )
+
+        reloaded_preprocessor.update_raw_review(second_review)
+
+        updated = mne.io.read_raw_fif(
+            reloaded_preprocessor.paths["filtered_raw"],
+            preload=False,
+            verbose="error",
+        )
+        self.assertEqual(updated.info["bads"], ["EEG 003"])
+        self.assertEqual(len(updated.annotations), 1)
+        self.assertEqual(updated.annotations.description[0], "BAD_review")
+        if hasattr(updated, "close"):
+            updated.close()
+
     def test_epoching(self):
         """Test the epoching method."""
         output_dir = self.test_dir / "derivatives"

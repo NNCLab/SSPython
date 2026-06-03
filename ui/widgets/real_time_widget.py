@@ -430,23 +430,10 @@ def apply_raw_artifact_mask(
     art_rem: tuple[float | None, float | None],
 ) -> np.ndarray:
     """Mask raw samples around positive stim onsets so the monitor skips artifact bursts."""
-    masked = np.array(raw_chunk, copy=True, dtype=float)
-    art_rem_start, art_rem_end = art_rem
-    if stim_chunk.size == 0 or art_rem_start is None or art_rem_end is None or art_rem_end <= art_rem_start:
-        return masked
-
-    event_samples, _ = detect_stim_onsets(stim_chunk)
-    if event_samples.size == 0:
-        return masked
-
-    start_offset = int(np.floor(float(art_rem_start) * float(sfreq)))
-    end_offset = int(np.ceil(float(art_rem_end) * float(sfreq)))
-    for event_sample in event_samples:
-        start_idx = max(0, int(event_sample + start_offset))
-        end_idx = min(masked.shape[-1], int(event_sample + end_offset + 1))
-        if end_idx > start_idx:
-            masked[:, start_idx:end_idx] = np.nan
-    return masked
+    segments = raw_artifact_segments(stim_chunk, sfreq, art_rem)
+    if not segments:
+        return np.array(raw_chunk, copy=True, dtype=float)
+    return _mask_segments_2d(raw_chunk, segments)
 
 
 def normalize_live_event_values(
@@ -479,6 +466,38 @@ def detect_stim_onsets(
         event_samples = event_samples[np.isin(combined[event_samples], list(allowed_event_values))]
     last_value = int(combined[-1]) if combined.size > 0 else int(previous_value)
     return event_samples.astype(int, copy=False), last_value
+
+
+def raw_artifact_segments(
+    stim_chunk: np.ndarray,
+    sfreq: float,
+    art_rem: tuple[float | None, float | None],
+) -> list[tuple[int, int]]:
+    """Return sample spans affected by raw artifact removal."""
+    stim_values = np.asarray(stim_chunk)
+    if stim_values.ndim == 1:
+        stim_values = stim_values[np.newaxis, :]
+    art_rem_start, art_rem_end = art_rem
+    if (
+        stim_values.size == 0
+        or stim_values.shape[-1] == 0
+        or art_rem_start is None
+        or art_rem_end is None
+        or art_rem_end <= art_rem_start
+    ):
+        return []
+
+    event_samples, _ = detect_stim_onsets(stim_values)
+    if event_samples.size == 0:
+        return []
+
+    start_offset = int(np.floor(float(art_rem_start) * float(sfreq)))
+    end_offset = int(np.ceil(float(art_rem_end) * float(sfreq))) + 1
+    segments = [
+        (int(event_sample + start_offset), int(event_sample + end_offset))
+        for event_sample in event_samples
+    ]
+    return _merge_sample_segments(segments, stim_values.shape[-1])
 
 
 def _merge_sample_segments(
@@ -531,6 +550,16 @@ def _interpolate_segments_2d(data: np.ndarray, segments: list[tuple[int, int]]) 
     return filled
 
 
+def _mask_segments_2d(data: np.ndarray, segments: list[tuple[int, int]]) -> np.ndarray:
+    masked = np.array(data, copy=True, dtype=float)
+    if masked.ndim != 2 or masked.shape[-1] == 0:
+        return masked
+
+    for start_idx, end_idx in _merge_sample_segments(segments, masked.shape[-1]):
+        masked[:, start_idx:end_idx] = np.nan
+    return masked
+
+
 def _interpolate_segments_3d(data: np.ndarray, segments: list[tuple[int, int]]) -> np.ndarray:
     filled = np.array(data, copy=True, dtype=float)
     if filled.ndim != 3 or filled.shape[-1] == 0:
@@ -562,20 +591,10 @@ def fill_raw_artifact_window(
     sfreq: float,
     art_rem: tuple[float | None, float | None],
 ) -> np.ndarray:
-    art_rem_start, art_rem_end = art_rem
-    if stim_chunk.size == 0 or art_rem_start is None or art_rem_end is None or art_rem_end <= art_rem_start:
+    segments = raw_artifact_segments(stim_chunk, sfreq, art_rem)
+    if not segments:
         return np.array(raw_chunk, copy=True, dtype=float)
 
-    event_samples, _ = detect_stim_onsets(stim_chunk)
-    if event_samples.size == 0:
-        return np.array(raw_chunk, copy=True, dtype=float)
-
-    start_offset = int(np.floor(float(art_rem_start) * float(sfreq)))
-    end_offset = int(np.ceil(float(art_rem_end) * float(sfreq))) + 1
-    segments = [
-        (int(event_sample + start_offset), int(event_sample + end_offset))
-        for event_sample in event_samples
-    ]
     return _interpolate_segments_2d(raw_chunk, segments)
 
 
@@ -657,6 +676,40 @@ def buffer_epoch_snapshot(
         ordered = ordered[-min(display_epoch_count, ordered.shape[0]) :]
 
     return ordered.copy()
+
+
+def append_limited_history(
+    history: np.ndarray,
+    chunk: np.ndarray,
+    max_samples: int,
+) -> tuple[np.ndarray, int]:
+    """Append samples while keeping only the most recent max_samples columns."""
+    history = np.asarray(history, dtype=float)
+    chunk = np.asarray(chunk, dtype=float)
+    max_samples = max(0, int(max_samples))
+
+    if chunk.ndim != 2:
+        raise ValueError("chunk must be a 2D array")
+    if history.ndim != 2:
+        raise ValueError("history must be a 2D array")
+    if history.shape[0] != chunk.shape[0]:
+        raise ValueError("history and chunk must have the same channel count")
+    if max_samples == 0:
+        return np.empty((chunk.shape[0], 0), dtype=float), history.shape[1] + chunk.shape[1]
+    if chunk.shape[1] == 0:
+        return history[:, -max_samples:].copy(), max(0, history.shape[1] - max_samples)
+
+    total_samples = history.shape[1] + chunk.shape[1]
+    dropped_samples = max(0, total_samples - max_samples)
+    if chunk.shape[1] >= max_samples:
+        return chunk[:, -max_samples:].copy(), dropped_samples
+
+    history_keep = max_samples - chunk.shape[1]
+    if history.shape[1] == 0:
+        return chunk.copy(), dropped_samples
+
+    history_tail = history[:, -history_keep:]
+    return np.concatenate((history_tail, chunk), axis=1), dropped_samples
 
 
 def compute_epoch_mean_std(epoch_batch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -766,6 +819,13 @@ def apply_frequency_filters(
             filtered = signal.lfilter(b, a, filtered, axis=-1)
 
     return filtered
+
+
+def frequency_filters_enabled(
+    bandpass_sos: np.ndarray | None,
+    notch_filters: list[tuple[np.ndarray, np.ndarray]],
+) -> bool:
+    return bandpass_sos is not None or bool(notch_filters)
 
 class PlayerWidget(QWidget):
     """A widget to play a file as an LSL stream."""
@@ -1397,6 +1457,9 @@ class DataProcessingWorker(QObject):
 
     data_ready = Signal(dict)
     finished = Signal()
+    FILTER_PARAM_KEYS = frozenset({"apply_bandpass", "bandpass_range", "apply_notch", "notch_freqs"})
+    EPOCH_PROCESSING_PARAM_KEYS = FILTER_PARAM_KEYS | frozenset({"art_rem", "reference"})
+    EPOCH_REPROCESS_BATCH_SIZE = 16
 
     def __init__(self, stream, params, parent=None):
         super().__init__(parent)
@@ -1443,6 +1506,10 @@ class DataProcessingWorker(QObject):
 
         n_times = self.original_times.size
         self.epoch_buffer = np.full((self.max_epochs, self.epoch_channel_count, n_times), np.nan)
+        self.processed_epoch_buffer = np.full(
+            (self.max_epochs, self.epoch_channel_count, self.times.size),
+            np.nan,
+        )
         self.buffer_idx = 0
         self.n_valid_epochs = 0
         self.total_epochs_seen = 0
@@ -1464,6 +1531,7 @@ class DataProcessingWorker(QObject):
         self.bandpass_sos = None
         self.notch_filters: list[tuple[np.ndarray, np.ndarray]] = []
         self._rebuild_filter_pipeline()
+        self._update_epoch_good_mask()
 
     def run(self):
         """Starts the data processing loop."""
@@ -1521,7 +1589,8 @@ class DataProcessingWorker(QObject):
             self.original_times,
             self.params.get("art_rem", (0, 0)),
         )
-        plot_data = self._apply_live_filters(plot_data)
+        if self._frequency_filters_enabled():
+            plot_data = self._apply_live_filters(plot_data)
         plot_data = apply_artifact_mask(
             plot_data,
             self.original_times,
@@ -1533,20 +1602,29 @@ class DataProcessingWorker(QObject):
 
         return plot_data
 
+    def _process_epoch_batch_for_display(self, epoch_batch: np.ndarray) -> np.ndarray:
+        return self._process_epoch_batch(epoch_batch)[:, :, :: self.decimate]
+
     @Slot(dict)
     def update_params(self, new_params):
         """Update processing parameters."""
+        changed_keys = set(new_params)
         self.params.update(new_params)
         if "ch_names" in new_params:
             self.ch_names = list(new_params["ch_names"])
             self.epoch_channel_count = len(self.ch_names)
         if "bads" in new_params:
             self.bads = list(new_params["bads"])
+        if {"ch_names", "bads"} & changed_keys:
+            self._update_epoch_good_mask()
         if "display_epoch_count" in new_params:
             self.display_epoch_count = int(new_params["display_epoch_count"] or 0)
         if "event_id" in new_params:
             self.allowed_event_values = normalize_live_event_values(new_params["event_id"])
-        self._rebuild_filter_pipeline()
+        if changed_keys & self.FILTER_PARAM_KEYS:
+            self._rebuild_filter_pipeline()
+        if changed_keys & self.EPOCH_PROCESSING_PARAM_KEYS:
+            self._reprocess_epoch_buffer()
         if hasattr(self, "timer"):
             self.timer.setInterval(max(1, int(round(1000 / self.params.get("refresh_rate", 24)))))
         self._force_raw_emit = True
@@ -1559,6 +1637,7 @@ class DataProcessingWorker(QObject):
     def clear_epochs(self):
         """Reset the circular epoch buffer and counters."""
         self.epoch_buffer.fill(np.nan)
+        self.processed_epoch_buffer.fill(np.nan)
         self.buffer_idx = 0
         self.n_valid_epochs = 0
         self.total_epochs_seen = 0
@@ -1569,8 +1648,30 @@ class DataProcessingWorker(QObject):
             self.params,
         )
 
+    def _frequency_filters_enabled(self) -> bool:
+        return frequency_filters_enabled(self.bandpass_sos, self.notch_filters)
+
     def _apply_live_filters(self, data: np.ndarray) -> np.ndarray:
         return apply_frequency_filters(data, self.bandpass_sos, self.notch_filters)
+
+    def _update_epoch_good_mask(self):
+        bads = set(self.bads)
+        self._epoch_good_mask = np.asarray(
+            [channel_name not in bads for channel_name in self.ch_names],
+            dtype=bool,
+        )
+
+    def _reprocess_epoch_buffer(self):
+        self.processed_epoch_buffer.fill(np.nan)
+        if self.n_valid_epochs <= 0:
+            return
+
+        valid_count = self.max_epochs if self.n_valid_epochs >= self.max_epochs else self.n_valid_epochs
+        for start_idx in range(0, valid_count, self.EPOCH_REPROCESS_BATCH_SIZE):
+            end_idx = min(valid_count, start_idx + self.EPOCH_REPROCESS_BATCH_SIZE)
+            self.processed_epoch_buffer[start_idx:end_idx] = self._process_epoch_batch_for_display(
+                self.epoch_buffer[start_idx:end_idx]
+            )
 
     def _append_history(self, raw_chunk: np.ndarray, stim_chunk: np.ndarray):
         if raw_chunk.ndim != 2 or raw_chunk.shape[1] == 0:
@@ -1578,31 +1679,23 @@ class DataProcessingWorker(QObject):
 
         raw_chunk = np.asarray(raw_chunk, dtype=float)
         stim_chunk = np.asarray(stim_chunk, dtype=float)
-        self.raw_history = (
-            raw_chunk.copy()
-            if self.raw_history.size == 0
-            else np.concatenate((self.raw_history, raw_chunk), axis=1)
+        self.raw_history, dropped_samples = append_limited_history(
+            self.raw_history,
+            raw_chunk,
+            self.max_history_samples,
         )
 
         if self.raw_event_picks.size > 0:
             if stim_chunk.size == 0:
                 stim_chunk = np.zeros((len(self.raw_event_picks), raw_chunk.shape[1]), dtype=float)
-            self.stim_history = (
-                stim_chunk.copy()
-                if self.stim_history.size == 0
-                else np.concatenate((self.stim_history, stim_chunk), axis=1)
+            self.stim_history, _ = append_limited_history(
+                self.stim_history,
+                stim_chunk,
+                self.max_history_samples,
             )
 
         self.total_samples_seen += raw_chunk.shape[1]
-
-        excess = self.raw_history.shape[1] - self.max_history_samples
-        if excess <= 0:
-            return
-
-        self.raw_history = self.raw_history[:, excess:]
-        if self.stim_history.size > 0:
-            self.stim_history = self.stim_history[:, excess:]
-        self.history_start_sample += excess
+        self.history_start_sample += dropped_samples
 
     def _queue_pending_events(self, stim_chunk: np.ndarray):
         stim_chunk = np.asarray(stim_chunk, dtype=float)
@@ -1655,19 +1748,25 @@ class DataProcessingWorker(QObject):
 
         if n_new >= self.max_epochs:
             epoch_batch = epoch_batch[-self.max_epochs :]
+            processed_batch = self._process_epoch_batch_for_display(epoch_batch)
             self.epoch_buffer[:] = epoch_batch
+            self.processed_epoch_buffer[:] = processed_batch
             self.buffer_idx = 0
             self.n_valid_epochs = self.max_epochs
             return
 
+        processed_batch = self._process_epoch_batch_for_display(epoch_batch)
         start_idx = self.buffer_idx
         end_idx = start_idx + n_new
         if end_idx <= self.max_epochs:
             self.epoch_buffer[start_idx:end_idx] = epoch_batch
+            self.processed_epoch_buffer[start_idx:end_idx] = processed_batch
         else:
             part1_n = self.max_epochs - start_idx
             self.epoch_buffer[start_idx:] = epoch_batch[:part1_n]
             self.epoch_buffer[: n_new - part1_n] = epoch_batch[part1_n:]
+            self.processed_epoch_buffer[start_idx:] = processed_batch[:part1_n]
+            self.processed_epoch_buffer[: n_new - part1_n] = processed_batch[part1_n:]
 
         self.buffer_idx = end_idx % self.max_epochs
         self.n_valid_epochs = min(self.max_epochs, self.n_valid_epochs + n_new)
@@ -1683,19 +1782,17 @@ class DataProcessingWorker(QObject):
                 if self.stim_history.size > 0
                 else np.empty((0, sample_count), dtype=float)
             )
-            raw_chunk = fill_raw_artifact_window(
-                raw_chunk,
+            artifact_segments = raw_artifact_segments(
                 stim_chunk,
                 self.original_sfreq,
                 self.params.get("art_rem", (0, 0)),
             )
-            raw_chunk = self._apply_live_filters(raw_chunk)
-            raw_chunk = apply_raw_artifact_mask(
-                raw_chunk,
-                stim_chunk,
-                self.original_sfreq,
-                self.params.get("art_rem", (0, 0)),
-            )
+            if artifact_segments:
+                raw_chunk = _interpolate_segments_2d(raw_chunk, artifact_segments)
+            if self._frequency_filters_enabled():
+                raw_chunk = self._apply_live_filters(raw_chunk)
+            if artifact_segments:
+                raw_chunk = _mask_segments_2d(raw_chunk, artifact_segments)
             time_axis, scaled_chunk = self._scale_raw_chunk(raw_chunk)
             emit_dict["raw_data"] = {
                 "time_axis": time_axis,
@@ -1704,7 +1801,7 @@ class DataProcessingWorker(QObject):
 
         if include_epoch:
             plot_data = buffer_epoch_snapshot(
-                self.epoch_buffer,
+                self.processed_epoch_buffer,
                 self.buffer_idx,
                 self.n_valid_epochs,
                 self.display_epoch_count,
@@ -1712,19 +1809,18 @@ class DataProcessingWorker(QObject):
             displayed_epochs = plot_data.shape[0]
 
             if displayed_epochs > 0:
-                processed_data = self._process_epoch_batch(plot_data)[:, :, :: self.decimate]
-                mean_data, std_data = compute_epoch_mean_std(processed_data)
-                valid_data = [
-                    mean_data[index]
-                    for index in range(len(self.ch_names))
-                    if self.ch_names[index] not in self.bads
-                ]
+                mean_data, std_data = compute_epoch_mean_std(plot_data)
+                good_mask = self._epoch_good_mask
+                if good_mask.shape[0] != mean_data.shape[0]:
+                    bads = set(self.bads)
+                    good_mask = np.ones(mean_data.shape[0], dtype=bool)
+                    for index, channel_name in enumerate(self.ch_names[: mean_data.shape[0]]):
+                        good_mask[index] = channel_name not in bads
+                valid_data = mean_data[good_mask] if np.any(good_mask) else np.empty((0, mean_data.shape[1]))
                 global_min, global_max = -10.0, 10.0
-                if valid_data:
-                    arr = np.array(valid_data)
-                    if np.any(np.isfinite(arr)):
-                        global_min = np.nanmin(arr) * 1e6
-                        global_max = np.nanmax(arr) * 1e6
+                if valid_data.size > 0 and np.any(np.isfinite(valid_data)):
+                    global_min = np.nanmin(valid_data) * 1e6
+                    global_max = np.nanmax(valid_data) * 1e6
                 if global_min >= global_max:
                     global_min -= 1.0
                     global_max += 1.0
@@ -1747,7 +1843,7 @@ class DataProcessingWorker(QObject):
 
     def _scale_raw_chunk(self, raw_chunk: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         n_samples = raw_chunk.shape[1]
-        time_axis = np.linspace(-n_samples / self.original_sfreq, 0, n_samples, dtype=float)
+        time_axis = (np.arange(n_samples, dtype=float) - (n_samples - 1)) / self.original_sfreq
 
         finite_mask = np.isfinite(raw_chunk)
         counts = np.sum(finite_mask, axis=1, keepdims=True)

@@ -5,7 +5,13 @@ from pathlib import Path
 from PySide6.QtCore import QSettings
 
 from core.app_settings import SettingsStore
-from core.pipelines import all_pipelines, discover_datasets, get_pipeline
+from core.pipelines import (
+    PipelineDefinition,
+    PipelineStage,
+    all_pipelines,
+    discover_datasets,
+    get_pipeline,
+)
 
 
 class TestPipelines(unittest.TestCase):
@@ -44,6 +50,89 @@ class TestPipelines(unittest.TestCase):
             self.assertEqual(len(datasets), 1)
             self.assertEqual(datasets[0].derivative_root, workspace_root / "derivatives" / "tms_eeg")
             self.assertEqual(datasets[0].paths["epochs"], legacy_derivative)
+
+    def test_custom_pipeline_stage_can_define_derivative_path(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace_root = Path(tmp_dir)
+            raw_dir = workspace_root / "sub-01" / "eeg"
+            raw_dir.mkdir(parents=True)
+            raw_path = raw_dir / "sub-01_task-rest_raw.fif"
+            raw_path.touch()
+
+            pipeline = PipelineDefinition(
+                id="custom",
+                name="Custom",
+                summary="Custom workflow",
+                accent_color="#123456",
+                stages=(
+                    PipelineStage("raw", "Raw", "Raw", "Source", data_kind="raw"),
+                    PipelineStage(
+                        "clean_epochs",
+                        "Clean Epochs",
+                        "Clean",
+                        "Custom cleaned epochs.",
+                        data_kind="epochs",
+                        derivative_desc="clean",
+                        derivative_suffix="epo",
+                    ),
+                ),
+                workflow_sections=(),
+                analysis_ready_stage="clean_epochs",
+            )
+
+            datasets = discover_datasets(workspace_root, pipeline, "derivatives")
+
+            self.assertEqual(len(datasets), 1)
+            self.assertEqual(
+                datasets[0].paths["clean_epochs"],
+                workspace_root
+                / "derivatives"
+                / "custom"
+                / "sub-01"
+                / "eeg"
+                / "sub-01_task-rest_desc-clean_epo.fif",
+            )
+
+    def test_custom_pipeline_can_override_standard_stage_path(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace_root = Path(tmp_dir)
+            raw_dir = workspace_root / "sub-01" / "eeg"
+            raw_dir.mkdir(parents=True)
+            raw_path = raw_dir / "sub-01_task-rest_raw.fif"
+            raw_path.touch()
+
+            pipeline = PipelineDefinition(
+                id="custom",
+                name="Custom",
+                summary="Custom workflow",
+                accent_color="#123456",
+                stages=(
+                    PipelineStage("raw", "Raw", "Raw", "Source", data_kind="raw"),
+                    PipelineStage(
+                        "epochs",
+                        "Custom Epochs",
+                        "Epochs",
+                        "Custom epoch output.",
+                        data_kind="epochs",
+                        derivative_desc="custom",
+                        derivative_suffix="epo",
+                    ),
+                ),
+                workflow_sections=(),
+                analysis_ready_stage="epochs",
+            )
+
+            datasets = discover_datasets(workspace_root, pipeline, "derivatives")
+
+            self.assertEqual(
+                datasets[0].paths["epochs"],
+                workspace_root
+                / "derivatives"
+                / "custom"
+                / "sub-01"
+                / "eeg"
+                / "sub-01_task-rest_desc-custom_epo.fif",
+            )
 
     def test_settings_migrate_active_legacy_pipeline_to_standard(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

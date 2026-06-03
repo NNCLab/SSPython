@@ -689,6 +689,40 @@ class Preprocessor:
         epochs.save(self.paths["epochs"], overwrite=True, verbose=False)
         self._epochs = epochs
 
+    def update_raw_review(self, raw: mne.io.BaseRaw):
+        target_path = self.paths["filtered_raw"]
+        if target_path == self.paths["raw"]:
+            raise RuntimeError("Refusing to overwrite the source raw file.")
+
+        reviewed_raw = raw.copy()
+        if not reviewed_raw.preload:
+            reviewed_raw.load_data()
+
+        if hasattr(self, "_filtered_raw"):
+            cached_raw = self._filtered_raw
+            if cached_raw is not raw and hasattr(cached_raw, "close"):
+                cached_raw.close()
+            delattr(self, "_filtered_raw")
+
+        self._clear_downstream_files("filtered_raw")
+        bad_annotation_count = sum(
+            str(description).lower().startswith("bad")
+            for description in reviewed_raw.annotations.description
+        )
+        self.add_description(
+            reviewed_raw,
+            {
+                "raw_review": {
+                    "bad_channels": reviewed_raw.info.get("bads", []),
+                    "bad_annotation_count": bad_annotation_count,
+                    "total_annotations": len(reviewed_raw.annotations),
+                    "date": datetime.now().isoformat(),
+                }
+            },
+        )
+        reviewed_raw.save(target_path, overwrite=True, verbose=False)
+        self._filtered_raw = reviewed_raw
+
     def run_rereferencing(
         self,
         reference: list[str] | str | None = None,
