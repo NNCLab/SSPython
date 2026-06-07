@@ -21,13 +21,18 @@ from ui.widgets.real_time_widget import (
     apply_frequency_filters,
     append_limited_history,
     buffer_epoch_snapshot,
+    build_trace_colors,
+    build_mep_trace_uV,
     build_live_filter_pipeline,
     build_epoch_stream_configuration,
     channel_settings_from_info,
     channel_grid_positions,
+    compute_mep_peak_to_peak_uV,
     detect_regular_stream_event_ids,
     raw_artifact_segments,
+    realtime_info_has_montage,
 )
+from ui.widgets.real_time_plot_docks import RawMonitorDock
 
 class TestUI(unittest.TestCase):
 
@@ -211,6 +216,60 @@ class TestUI(unittest.TestCase):
         worker.update_params({"apply_notch": True, "notch_freqs": [50.0]})
         self.assertEqual(process_calls, [2, 2])
 
+    def test_data_processing_worker_emits_mep_data_for_emg_channels(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(
+            ["Cz", "EMG Active", "EMG Ref"],
+            sfreq=1000.0,
+            ch_types=["eeg", "emg", "emg"],
+        )
+
+        class FakeStream:
+            def __init__(self, stream_info):
+                self.info = stream_info
+                self.n_new_samples = 0
+
+        worker = DataProcessingWorker(
+            FakeStream(info),
+            {
+                "tlim": (-0.01, 0.06),
+                "decimate": 1,
+                "max_epochs": 4,
+                "art_rem": (None, None),
+                "reference": "none",
+            },
+        )
+        eeg_batch = np.ones((2, 1, worker.original_times.size), dtype=float)
+        emg_batch = np.zeros((2, 2, worker.original_times.size), dtype=float)
+        emg_batch[:, 0, :] = 40e-6
+        emg_batch[:, 1, :] = 5e-6
+
+        worker._store_epoch_batch(eeg_batch, emg_batch)
+        snapshot = worker._build_snapshot(include_raw=False, include_epoch=True)
+
+        self.assertIn("mep_data", snapshot)
+        self.assertEqual(snapshot["mep_data"]["emg_names"], ["EMG Active", "EMG Ref"])
+        self.assertEqual(snapshot["mep_data"]["mean_data"].shape, (2, worker.times.size))
+        self.assertEqual(snapshot["mep_data"]["n_epochs"], 2)
+
+    def test_mep_trace_and_peak_to_peak_threshold_helpers(self):
+        times_ms = np.array([0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+        mean_emg_data = np.array(
+            [
+                [0.0, 0.0, 10e-6, 60e-6, -5e-6, 0.0, 0.0],
+                [0.0, 0.0, 5e-6, 5e-6, 5e-6, 0.0, 0.0],
+            ]
+        )
+
+        trace_uV = build_mep_trace_uV(mean_emg_data, ["Active", "Ref"], "Active", "Ref")
+        p2p_uV, mask = compute_mep_peak_to_peak_uV(trace_uV, times_ms)
+
+        self.assertTrue(mask[2:6].all())
+        self.assertGreaterEqual(p2p_uV, 50.0)
+
     def test_apply_frequency_filters_preserves_shape(self):
         params = {
             "apply_bandpass": True,
@@ -226,7 +285,7 @@ class TestUI(unittest.TestCase):
         self.assertEqual(filtered.shape, data.shape)
         self.assertTrue(np.isfinite(filtered).all())
 
-    def test_real_time_erp_keeps_top_panels_available_on_init(self):
+    def test_real_time_erp_hides_topology_without_montage_on_init(self):
         app = QApplication.instance()
         if app is None:
             app = QApplication([])
@@ -234,7 +293,82 @@ class TestUI(unittest.TestCase):
         widget = RealTimeERP({})
         self.assertFalse(widget.top_splitter.isHidden())
         self.assertFalse(widget.raw_widget.isHidden())
-        self.assertFalse(widget.topo_widget.isHidden())
+        self.assertTrue(widget.topo_widget.isHidden())
+        self.assertFalse(widget.topo_toggle_action.isEnabled())
+        widget.close()
+
+    def test_realtime_info_montage_detection_requires_channel_positions(self):
+        info = mne.create_info(["Cz", "Pz"], sfreq=1000.0, ch_types="eeg")
+        self.assertFalse(realtime_info_has_montage(info))
+
+        montage = mne.channels.make_standard_montage("standard_1020")
+        info.set_montage(montage, on_missing="ignore")
+        self.assertTrue(realtime_info_has_montage(info))
+
+    def test_trace_colors_only_vary_when_montage_positions_are_used(self):
+        no_montage_colors = build_trace_colors(4, np.zeros((4, 3)), prefer_position_colors=False)
+        self.assertEqual(len(set(no_montage_colors)), 1)
+
+        positions = np.array(
+            [
+                [-0.04, 0.02, 0.08],
+                [0.04, 0.02, 0.08],
+                [-0.03, -0.03, 0.08],
+                [0.03, -0.03, 0.08],
+            ]
+        )
+        montage_colors = build_trace_colors(4, positions, prefer_position_colors=True)
+        self.assertGreater(len(set(montage_colors)), 1)
+
+    def test_topomap_payload_requires_montage(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = RealTimeERP({})
+        info = mne.create_info(["Cz", "Pz"], sfreq=1000.0, ch_types="eeg")
+        widget.info = info
+        widget.ch_names = info["ch_names"]
+        widget.times = np.linspace(-0.01, 0.02, 20)
+        widget.mean_data = np.ones((2, widget.times.size), dtype=float)
+        widget.evoked_dock.roi_region = (0.0, 10.0)
+        widget.has_visual_montage = False
+
+        self.assertIsNone(widget._build_topomap_payload())
+        widget.close()
+
+    def test_raw_monitor_downsamples_to_visible_pixels(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        dock = RawMonitorDock()
+        dock.resize(320, 180)
+        dock.configure(["Cz", "Pz"], [(0.1, 0.2, 0.3, 1.0), (0.1, 0.2, 0.3, 1.0)], 5.0)
+        dock.set_visible_channels(1)
+
+        time_axis = np.linspace(-5.0, 0.0, 20000)
+        scaled_data = np.vstack((np.sin(time_axis * 80.0), np.cos(time_axis * 80.0)))
+        dock.update_data(time_axis, scaled_data)
+        app.processEvents()
+
+        self.assertLessEqual(len(dock.curves[0].xData), dock.DISPLAY_MAX_POINTS)
+        hidden_x = dock.curves[1].xData
+        self.assertEqual(0 if hidden_x is None else len(hidden_x), 0)
+        dock.close()
+
+    def test_real_time_erp_enables_mep_controls_for_emg_channels(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = RealTimeERP({})
+        widget.emg_names = ["EMG Active", "EMG Ref"]
+        widget._configure_mep_controls()
+
+        self.assertTrue(widget.mep_toggle_action.isEnabled())
+        self.assertEqual(widget.mep_active_combo.currentText(), "EMG Active")
+        self.assertEqual(widget.mep_reference_combo.currentText(), "EMG Ref")
         widget.close()
 
     def test_connection_widget_uses_info_summary_instead_of_channel_table(self):
@@ -246,6 +380,26 @@ class TestUI(unittest.TestCase):
         self.assertFalse(hasattr(widget, "channel_table"))
         self.assertTrue(hasattr(widget, "info_summary_label"))
         self.assertEqual(widget.info_summary_label.text(), "No MNE info loaded.")
+        widget.close()
+
+    def test_connection_widget_accepts_info_without_montage(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(
+            ["Cz", "TRIGGER"],
+            sfreq=1000.0,
+            ch_types=["eeg", "stim"],
+        )
+
+        widget = ConnectionWidget()
+        widget.set_realtime_info(info, label="No Montage Info")
+        settings = widget.get_settings()
+
+        self.assertEqual(settings["info"]["ch_names"], ["Cz", "TRIGGER"])
+        self.assertEqual(settings["event_channels"], "TRIGGER")
+        self.assertIn("Montage: No", widget.info_summary_label.text())
         widget.close()
 
     def test_real_time_channel_settings_come_from_info_not_names(self):
@@ -267,6 +421,17 @@ class TestUI(unittest.TestCase):
                 {"name": "STI 014", "enabled": False, "type": "bad"},
             ],
         )
+
+    def test_real_time_channel_settings_keep_emg_channels_enabled(self):
+        info = mne.create_info(
+            ["Cz", "EMG Active", "TRIGGER"],
+            sfreq=1000,
+            ch_types=["eeg", "emg", "stim"],
+        )
+
+        settings = channel_settings_from_info(info)
+
+        self.assertEqual(settings[1], {"name": "EMG Active", "enabled": True, "type": "emg"})
 
     def test_connection_widget_passes_montaged_info_to_settings(self):
         app = QApplication.instance()

@@ -92,6 +92,10 @@ class BasePlotDock(QDockWidget):
 
 
 class RawMonitorDock(QDockWidget):
+    DISPLAY_POINTS_PER_PIXEL = 2.0
+    DISPLAY_MIN_POINTS = 320
+    DISPLAY_MAX_POINTS = 5000
+
     def __init__(self, parent=None):
         super().__init__("Raw Data Monitor", parent)
         self.setObjectName("RawDataMonitorDock")
@@ -130,6 +134,10 @@ class RawMonitorDock(QDockWidget):
         self.latest_time_axis = np.array([], dtype=float)
         self.latest_scaled_data = np.empty((0, 0), dtype=float)
         self._visible_count = 0
+        self._resize_refresh_timer = QTimer(self)
+        self._resize_refresh_timer.setSingleShot(True)
+        self._resize_refresh_timer.setInterval(40)
+        self._resize_refresh_timer.timeout.connect(self._rerender_cached_data)
 
     def minimumSizeHint(self):
         return QSize(0, 0)
@@ -176,16 +184,76 @@ class RawMonitorDock(QDockWidget):
             return
         self._visible_count = max(1, min(int(n_show), len(self.ch_names)))
         self._update_y_axis()
+        self._rerender_cached_data()
 
     def update_data(self, time_axis: np.ndarray, scaled_data: np.ndarray):
         self.latest_time_axis = np.asarray(time_axis, dtype=float)
         self.latest_scaled_data = np.asarray(scaled_data, dtype=float)
+        self._rerender_cached_data()
+
+    def _max_display_points(self) -> int:
+        logical_width = max(1, int(self.plot_widget.width()))
+        dpr = float(self.plot_widget.devicePixelRatioF()) if hasattr(self.plot_widget, "devicePixelRatioF") else 1.0
+        pixel_width = max(1, int(round(logical_width * max(1.0, dpr))))
+        return int(
+            np.clip(
+                np.ceil(pixel_width * self.DISPLAY_POINTS_PER_PIXEL),
+                self.DISPLAY_MIN_POINTS,
+                self.DISPLAY_MAX_POINTS,
+            )
+        )
+
+    def _downsample_curve(
+        self,
+        time_axis: np.ndarray,
+        values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sample_count = int(time_axis.size)
+        max_points = self._max_display_points()
+        if sample_count <= max_points:
+            return time_axis, values
+
+        bucket_count = max(1, max_points // 2)
+        edges = np.linspace(0, sample_count, bucket_count + 1, dtype=int)
+        indices: list[int] = []
+        for start_idx, end_idx in zip(edges[:-1], edges[1:], strict=False):
+            if end_idx <= start_idx:
+                continue
+            segment = values[start_idx:end_idx]
+            finite = np.flatnonzero(np.isfinite(segment))
+            if finite.size == 0:
+                indices.append(start_idx)
+                continue
+            finite_values = segment[finite]
+            local_min = int(finite[np.argmin(finite_values)]) + start_idx
+            local_max = int(finite[np.argmax(finite_values)]) + start_idx
+            if local_min <= local_max:
+                indices.extend((local_min, local_max))
+            else:
+                indices.extend((local_max, local_min))
+
+        if not indices or indices[-1] != sample_count - 1:
+            indices.append(sample_count - 1)
+        display_indices = np.unique(np.asarray(indices, dtype=int))
+        return time_axis[display_indices], values[display_indices]
+
+    def _rerender_cached_data(self):
         if self.latest_scaled_data.size == 0 or self.latest_time_axis.size == 0:
             return
         if self.latest_scaled_data.shape[0] != len(self.curves):
             return
+        visible_count = self._visible_count or len(self.curves)
         for index, curve in enumerate(self.curves):
-            curve.setData(self.latest_time_axis, self.latest_scaled_data[index, :] + self.raw_offsets[index], connect="finite")
+            if index >= visible_count:
+                curve.setData(np.array([], dtype=float), np.array([], dtype=float))
+                continue
+            y_values = self.latest_scaled_data[index, :] + self.raw_offsets[index]
+            display_time, display_values = self._downsample_curve(self.latest_time_axis, y_values)
+            curve.setData(display_time, display_values, connect="finite")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_refresh_timer.start()
 
     def refresh_theme(self, tokens: dict[str, str], colors: list[tuple[float, float, float, float]]):
         self.colors = list(colors)
@@ -437,6 +505,159 @@ class EvokedButterflyDock(BasePlotDock):
         if self._drag_span is not None:
             self._drag_span.set_facecolor(tokens["roi"])
             self._drag_span.set_alpha(0.22)
+        self.request_draw()
+
+
+class MEPDock(BasePlotDock):
+    def __init__(self, parent=None):
+        super().__init__("MEP Monitor", parent)
+        self.figure.subplots_adjust(left=0.1, right=0.98, bottom=0.16, top=0.86)
+        self.ax = self.figure.add_subplot(111)
+        self.times_ms = np.array([], dtype=float)
+        self.latest_trace_uV = np.array([], dtype=float)
+        self.latest_window_mask = np.array([], dtype=bool)
+        self.latest_threshold_uV = 50.0
+        self.latest_p2p_uV = np.nan
+        self.latest_crosses_threshold = False
+        self.active_channel = ""
+        self.reference_channel = ""
+        self.n_epochs = 0
+        self.tokens: dict[str, str] = {}
+        self.trace_line = None
+        self.zero_line = None
+        self.window_patch = None
+        self.min_line = None
+        self.max_line = None
+
+    def configure(self, times_ms: np.ndarray):
+        self.times_ms = np.asarray(times_ms, dtype=float)
+        self.ax.clear()
+        self.trace_line, = self.ax.plot([], [], linewidth=1.6)
+        self.zero_line = self.ax.axvline(0.0, linestyle="--", linewidth=1.0)
+        self.window_patch = self.ax.axvspan(0.0, 0.0, alpha=0.16, visible=False, zorder=0.1)
+        self.min_line = self.ax.axhline(0.0, linestyle="--", linewidth=1.0, visible=False)
+        self.max_line = self.ax.axhline(0.0, linestyle="--", linewidth=1.0, visible=False)
+        if self.times_ms.size > 0:
+            self.ax.set_xlim(float(self.times_ms[0]), float(self.times_ms[-1]))
+        self.ax.set_ylim(-75.0, 75.0)
+        self.ax.set_xlabel("Time (ms)")
+        self.ax.set_ylabel("EMG (uV)")
+        self.ax.grid(True)
+        self.refresh_theme(self.tokens)
+
+    def update_data(
+        self,
+        trace_uV: np.ndarray,
+        window_mask: np.ndarray,
+        *,
+        p2p_uV: float,
+        threshold_uV: float,
+        active_channel: str,
+        reference_channel: str | None,
+        n_epochs: int,
+    ):
+        self.latest_trace_uV = np.asarray(trace_uV, dtype=float)
+        self.latest_window_mask = np.asarray(window_mask, dtype=bool)
+        self.latest_p2p_uV = float(p2p_uV) if np.isfinite(p2p_uV) else np.nan
+        self.latest_threshold_uV = float(threshold_uV)
+        self.latest_crosses_threshold = bool(np.isfinite(self.latest_p2p_uV) and self.latest_p2p_uV >= self.latest_threshold_uV)
+        self.active_channel = str(active_channel or "")
+        self.reference_channel = str(reference_channel or "")
+        self.n_epochs = int(n_epochs)
+        self._rerender_cached_data()
+
+    def _status_color(self) -> str:
+        if self.latest_crosses_threshold:
+            return self.tokens.get("success", "#248a3d")
+        return self.tokens.get("danger", "#b3261e")
+
+    def _rerender_cached_data(self):
+        if self.trace_line is None or self.times_ms.size == 0:
+            return
+        if self.latest_trace_uV.size != self.times_ms.size:
+            self.trace_line.set_data([], [])
+            self.request_draw()
+            return
+
+        indices = self._display_indices(self.times_ms.size)
+        self.trace_line.set_data(self.times_ms[indices], self.latest_trace_uV[indices])
+
+        finite_values = self.latest_trace_uV[np.isfinite(self.latest_trace_uV)]
+        if finite_values.size > 0:
+            y_min = float(np.min(finite_values))
+            y_max = float(np.max(finite_values))
+            padding = max(10.0, (y_max - y_min) * 0.18, self.latest_threshold_uV * 0.35)
+            if y_min >= y_max:
+                y_min -= padding
+                y_max += padding
+            else:
+                y_min -= padding
+                y_max += padding
+            self.ax.set_ylim(y_min, y_max)
+
+        if self.window_patch is not None:
+            mask = self.latest_window_mask
+            if mask.size == self.times_ms.size and np.any(mask):
+                window_times = self.times_ms[mask]
+                self.window_patch.set_x(float(window_times[0]))
+                self.window_patch.set_width(float(window_times[-1] - window_times[0]))
+                self.window_patch.set_visible(True)
+            else:
+                self.window_patch.set_visible(False)
+
+        if self.min_line is not None and self.max_line is not None:
+            mask = self.latest_window_mask
+            if mask.size == self.latest_trace_uV.size and np.any(mask):
+                window_values = self.latest_trace_uV[mask]
+                finite_window_values = window_values[np.isfinite(window_values)]
+                if finite_window_values.size > 0:
+                    self.min_line.set_ydata([float(np.min(finite_window_values))] * 2)
+                    self.max_line.set_ydata([float(np.max(finite_window_values))] * 2)
+                    self.min_line.set_visible(True)
+                    self.max_line.set_visible(True)
+                else:
+                    self.min_line.set_visible(False)
+                    self.max_line.set_visible(False)
+
+        ref_text = self.reference_channel or "None"
+        p2p_text = "n/a" if not np.isfinite(self.latest_p2p_uV) else f"{self.latest_p2p_uV:.1f} uV"
+        status = ">=" if self.latest_crosses_threshold else "<"
+        self.ax.set_title(
+            f"{self.active_channel} - {ref_text} | P-P {p2p_text} {status} {self.latest_threshold_uV:.0f} uV | n={self.n_epochs}"
+        )
+        self.ax.title.set_color(self._status_color())
+        self.request_draw()
+
+    def refresh_theme(self, tokens: dict[str, str]):
+        self.tokens = dict(tokens or self.tokens)
+        if not hasattr(self, "ax"):
+            return
+        plot_background = self.tokens.get("plot_background", "#ffffff")
+        text = self.tokens.get("text", "#222222")
+        border = self.tokens.get("border", "#cccccc")
+        grid = self.tokens.get("grid", "#cccccc")
+        accent = self.tokens.get("accent_soft", "#2f7e8d")
+        threshold = self._status_color()
+
+        self.figure.patch.set_facecolor(self.tokens.get("panel", "#ffffff"))
+        self.ax.set_facecolor(plot_background)
+        self.ax.tick_params(colors=text)
+        self.ax.xaxis.label.set_color(text)
+        self.ax.yaxis.label.set_color(text)
+        for spine in self.ax.spines.values():
+            spine.set_color(border)
+        self.ax.grid(True, color=grid, alpha=0.28, linewidth=0.7)
+        if self.trace_line is not None:
+            self.trace_line.set_color(accent)
+        if self.zero_line is not None:
+            self.zero_line.set_color(self.tokens.get("muted", text))
+        if self.window_patch is not None:
+            self.window_patch.set_facecolor(self.tokens.get("accent_fill", accent))
+            self.window_patch.set_edgecolor("none")
+        for line in (self.min_line, self.max_line):
+            if line is not None:
+                line.set_color(threshold)
+        self.ax.title.set_color(threshold)
         self.request_draw()
 
 

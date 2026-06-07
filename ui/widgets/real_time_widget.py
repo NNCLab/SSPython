@@ -40,16 +40,17 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 from matplotlib.figure import Figure
 from shiboken6 import isValid
 from .tools.optional_range_widget import OptionalRangeWidget
-from .real_time_plot_docks import ChannelLayoutDock, EvokedButterflyDock, RawMonitorDock
+from .real_time_plot_docks import ChannelLayoutDock, EvokedButterflyDock, MEPDock, RawMonitorDock
 from scipy import signal
 from scipy.spatial import distance
 
 from core.app_settings import get_settings_store
-from core.conversion import load_conversion_info, validate_conversion_info
 from utils import apply_theme, current_theme_name, theme_tokens
 
 
 DEFAULT_LIVE_EVENT_ID_MAX = 65535
+MEP_THRESHOLD_UV = 50.0
+DEFAULT_MEP_WINDOW_MS = (15.0, 50.0)
 
 
 @dataclass(slots=True)
@@ -69,9 +70,17 @@ class EpochRenderPayload:
     global_max: float
 
 
+@dataclass(slots=True)
+class MEPRenderPayload:
+    mean_data: np.ndarray
+    std_data: np.ndarray
+    emg_names: list[str]
+    n_epochs: int
+
+
 def normalize_live_channel_type(channel_type: str | None) -> str:
     normalized = str(channel_type or "eeg").strip().lower()
-    if normalized in {"eeg", "stim", "bad"}:
+    if normalized in {"eeg", "emg", "stim", "bad"}:
         return normalized
     return "bad"
 
@@ -134,17 +143,115 @@ def normalize_event_channels(event_channels: str | list[str] | None) -> list[str
     return [channel for channel in event_channels if channel]
 
 
+def build_mep_trace_uV(
+    mean_emg_data: np.ndarray,
+    emg_names: list[str],
+    active_channel: str,
+    reference_channel: str | None,
+) -> np.ndarray:
+    data = np.asarray(mean_emg_data, dtype=float)
+    if data.ndim != 2 or not emg_names or active_channel not in emg_names:
+        return np.array([], dtype=float)
+
+    active_idx = emg_names.index(active_channel)
+    trace = data[active_idx].copy()
+    if reference_channel and reference_channel in emg_names and reference_channel != active_channel:
+        trace = trace - data[emg_names.index(reference_channel)]
+    return trace * 1e6
+
+
+def mep_measurement_mask(
+    times_ms: np.ndarray,
+    window_ms: tuple[float, float] = DEFAULT_MEP_WINDOW_MS,
+) -> np.ndarray:
+    times = np.asarray(times_ms, dtype=float)
+    if times.size == 0:
+        return np.array([], dtype=bool)
+
+    start_ms, end_ms = sorted((float(window_ms[0]), float(window_ms[1])))
+    mask = (times >= start_ms) & (times <= end_ms)
+    if np.any(mask):
+        return mask
+
+    post_stim_mask = times >= 0.0
+    if np.any(post_stim_mask):
+        return post_stim_mask
+    return np.ones(times.shape, dtype=bool)
+
+
+def compute_mep_peak_to_peak_uV(
+    trace_uV: np.ndarray,
+    times_ms: np.ndarray,
+    window_ms: tuple[float, float] = DEFAULT_MEP_WINDOW_MS,
+) -> tuple[float, np.ndarray]:
+    trace = np.asarray(trace_uV, dtype=float)
+    mask = mep_measurement_mask(times_ms, window_ms)
+    if trace.size == 0 or mask.size != trace.size:
+        return np.nan, mask
+
+    window_values = trace[mask]
+    finite_values = window_values[np.isfinite(window_values)]
+    if finite_values.size == 0:
+        return np.nan, mask
+    return float(np.max(finite_values) - np.min(finite_values)), mask
+
+
 def validate_realtime_info(info: mne.Info) -> mne.Info:
-    validated = validate_conversion_info(info)
-    eeg_picks = mne.pick_types(validated, eeg=True, exclude=())
+    if info is None:
+        raise ValueError("Real-time info requires an MNE Info object.")
+    if not isinstance(info, mne.Info):
+        raise TypeError("Real-time info must be an mne.Info object.")
+    if len(info["ch_names"]) == 0:
+        raise ValueError("Real-time info must define at least one channel.")
+
+    eeg_picks = mne.pick_types(info, eeg=True, exclude=())
     if len(eeg_picks) == 0:
         raise ValueError("Real-time info must include at least one EEG channel.")
-    return validated
+    return info
+
+
+def load_realtime_info(source_path: Path) -> mne.Info:
+    source_path = Path(source_path)
+    raw = None
+    try:
+        info = mne.io.read_info(source_path, verbose="error")
+        return validate_realtime_info(info)
+    except Exception:
+        pass
+
+    try:
+        raw = mne.io.read_raw(source_path, preload=False, verbose="error")
+        return validate_realtime_info(raw.info.copy())
+    except Exception as exc:
+        raise ValueError(f"Could not load an MNE Info object from {source_path.name}.") from exc
+    finally:
+        if raw is not None and hasattr(raw, "close"):
+            raw.close()
+
+def realtime_info_has_montage(info: mne.Info | None) -> bool:
+    if info is None or info.get_montage() is None:
+        return False
+
+    eeg_picks = mne.pick_types(info, eeg=True, exclude=())
+    if len(eeg_picks) == 0:
+        return False
+
+    positions = []
+    for pick in eeg_picks:
+        loc = info["chs"][pick].get("loc", np.zeros(12))
+        if loc is not None and len(loc) >= 3:
+            positions.append(loc[:3])
+    if not positions:
+        return False
+
+    positions = np.asarray(positions, dtype=float)
+    valid_positions = np.isfinite(positions).all(axis=1) & np.any(np.abs(positions) > 1e-9, axis=1)
+    return bool(np.any(valid_positions))
 
 
 def live_channel_type_from_info(channel_type: str) -> str:
     normalized = str(channel_type or "").strip().lower()
-    if normalized in {"eeg", "stim"}:
+    if normalized in {"eeg", "emg", "stim"}:
         return normalized
     return "bad"
 
@@ -206,14 +313,16 @@ def apply_realtime_info_to_stream(stream, info: mne.Info):
         for channel_name in realtime_info["bads"]
         if channel_name in stream.info["ch_names"]
     ]
-    try:
-        stream.set_montage(
-            realtime_info.get_montage(),
-            on_missing="raise",
-            match_case=False,
-        )
-    except TypeError:
-        stream.set_montage(realtime_info.get_montage())
+    montage = realtime_info.get_montage()
+    if montage is not None:
+        try:
+            stream.set_montage(
+                montage,
+                on_missing="ignore",
+                match_case=False,
+            )
+        except TypeError:
+            stream.set_montage(montage)
     return stream
 
 
@@ -287,21 +396,8 @@ def _default_trace_colors(count: int) -> list[tuple[float, float, float, float]]
     if count <= 0:
         return []
 
-    theme_name = current_theme_name()
-    hue_values = np.linspace(165 / 360.0, 245 / 360.0, count, endpoint=False)
-
-    if theme_name == "dark":
-        saturation = 0.70
-        value_values = np.linspace(0.82, 0.98, count)
-    else:
-        saturation = 0.58
-        value_values = np.linspace(0.56, 0.78, count)
-
-    colors: list[tuple[float, float, float, float]] = []
-    for hue, value in zip(hue_values, value_values):
-        rgb = mcolors.hsv_to_rgb((hue, saturation, value))
-        colors.append((float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0))
-    return colors
+    color = mcolors.to_rgba(theme_tokens().get("accent_soft", "#2f7e8d"))
+    return [(float(color[0]), float(color[1]), float(color[2]), float(color[3])) for _ in range(count)]
 
 
 def build_trace_colors(
@@ -1017,7 +1113,7 @@ class ConnectionWidget(QWidget):
             return
 
         try:
-            info = load_conversion_info(file_path)
+            info = load_realtime_info(file_path)
             self.set_realtime_info(
                 info,
                 label=Path(file_path).name,
@@ -1051,7 +1147,7 @@ class ConnectionWidget(QWidget):
         try:
             self.set_realtime_info(info, label="Stream info")
         except ValueError as exc:
-            QMessageBox.warning(self, "Stream Info Missing Montage", str(exc))
+            QMessageBox.warning(self, "Invalid Stream Info", str(exc))
         self.find_channels_button.setEnabled(True)
         self.find_channels_button.setText("Find Info from Stream")
 
@@ -1075,12 +1171,15 @@ class ConnectionWidget(QWidget):
 
         settings = self._info_channel_settings()
         eeg_count = sum(1 for channel in settings if channel["type"] == "eeg")
+        emg_count = sum(1 for channel in settings if channel["type"] == "emg")
         stim_channels = [channel["name"] for channel in settings if channel["type"] == "stim"]
         bad_channels = [channel["name"] for channel in settings if not channel["enabled"]]
         stim_text = ", ".join(stim_channels) if stim_channels else "None"
         bad_text = ", ".join(bad_channels) if bad_channels else "None"
+        montage_text = "Yes" if realtime_info_has_montage(self.realtime_info) else "No"
         self.info_summary_label.setText(
-            f"{len(settings)} channels | EEG: {eeg_count} | Stim: {stim_text} | Excluded: {bad_text}"
+            f"{len(settings)} channels | EEG: {eeg_count} | EMG: {emg_count} | Stim: {stim_text} | "
+            f"Excluded: {bad_text} | Montage: {montage_text}"
         )
 
     def set_realtime_info(
@@ -1097,7 +1196,8 @@ class ConnectionWidget(QWidget):
         self.info_edit.setText(
             f"{self.info_label} ({len(realtime_info['ch_names'])} channels, {realtime_info['sfreq']:g} Hz)"
         )
-        self.info_edit.setToolTip("Real-time info includes a montage.")
+        montage_text = "includes a montage" if realtime_info_has_montage(realtime_info) else "has no montage"
+        self.info_edit.setToolTip(f"Real-time info {montage_text}.")
         self._update_info_summary()
 
     def get_settings(self) -> dict:
@@ -1156,7 +1256,7 @@ class ConnectionWidget(QWidget):
         if info_source_path:
             try:
                 self.set_realtime_info(
-                    load_conversion_info(info_source_path),
+                    load_realtime_info(info_source_path),
                     label=Path(info_source_path).name,
                     source_path=info_source_path,
                 )
@@ -1184,7 +1284,7 @@ class ConnectionManager:
             event_channel_list = normalize_event_channels(event_channels)
             realtime_info = self.params.get("info")
             if realtime_info is None:
-                raise ValueError("Real-time visualization requires an mne.Info object with a montage.")
+                raise ValueError("Real-time visualization requires an mne.Info object.")
 
             self.raw = mne_lsl.stream.StreamLSL(stream_duration, name=stream_name)
             self.raw.connect(
@@ -1469,13 +1569,18 @@ class DataProcessingWorker(QObject):
         self.max_epochs = int(self.params.get("max_epochs", 200) or 200)
         self.display_epoch_count = int(self.params.get("display_epoch_count", 0) or 0)
         self.raw_picks = np.asarray(mne.pick_types(self.stream.info, eeg=True, exclude=()), dtype=int)
+        self.emg_picks = np.asarray(mne.pick_types(self.stream.info, emg=True, exclude=()), dtype=int)
+        self.emg_names = [self.stream.info["ch_names"][pick] for pick in self.emg_picks]
         self.raw_event_channels = normalize_event_channels(self.params.get("event_channels"))
         self.raw_event_picks = np.asarray(
             mne.pick_channels(self.stream.info["ch_names"], include=self.raw_event_channels, ordered=True),
             dtype=int,
         )
+        used_signal_picks = set(self.raw_picks) | set(self.emg_picks)
         self.raw_monitor_picks = np.asarray(
-            list(self.raw_picks) + [pick for pick in self.raw_event_picks if pick not in set(self.raw_picks)],
+            list(self.raw_picks)
+            + list(self.emg_picks)
+            + [pick for pick in self.raw_event_picks if pick not in used_signal_picks],
             dtype=int,
         )
 
@@ -1510,6 +1615,11 @@ class DataProcessingWorker(QObject):
             (self.max_epochs, self.epoch_channel_count, self.times.size),
             np.nan,
         )
+        self.emg_epoch_buffer = np.full((self.max_epochs, len(self.emg_picks), n_times), np.nan)
+        self.processed_emg_epoch_buffer = np.full(
+            (self.max_epochs, len(self.emg_picks), self.times.size),
+            np.nan,
+        )
         self.buffer_idx = 0
         self.n_valid_epochs = 0
         self.total_epochs_seen = 0
@@ -1519,6 +1629,7 @@ class DataProcessingWorker(QObject):
         self.max_history_samples = max(8, int(np.ceil(history_seconds * self.original_sfreq)))
         self.raw_display_samples = max(1, int(np.ceil(self.raw_display_seconds * self.original_sfreq)))
         self.raw_history = np.empty((len(self.raw_picks), 0), dtype=float)
+        self.emg_history = np.empty((len(self.emg_picks), 0), dtype=float)
         self.stim_history = np.empty((len(self.raw_event_picks), 0), dtype=float)
         self.history_start_sample = 0
         self.total_samples_seen = 0
@@ -1561,13 +1672,15 @@ class DataProcessingWorker(QObject):
                 )
                 if raw_chunk_all is not None and raw_chunk_all.ndim == 2 and raw_chunk_all.shape[1] > 0:
                     eeg_count = len(self.raw_picks)
+                    emg_count = len(self.emg_picks)
                     raw_chunk = np.asarray(raw_chunk_all[:eeg_count], dtype=float)
+                    emg_chunk = np.asarray(raw_chunk_all[eeg_count : eeg_count + emg_count], dtype=float)
                     stim_chunk = (
-                        np.asarray(raw_chunk_all[eeg_count:], dtype=float)
-                        if raw_chunk_all.shape[0] > eeg_count
+                        np.asarray(raw_chunk_all[eeg_count + emg_count :], dtype=float)
+                        if raw_chunk_all.shape[0] > eeg_count + emg_count
                         else np.empty((0, raw_chunk_all.shape[1]), dtype=float)
                     )
-                    self._append_history(raw_chunk, stim_chunk)
+                    self._append_history(raw_chunk, emg_chunk, stim_chunk)
                     self._queue_pending_events(stim_chunk)
                     epoch_updated = self._consume_pending_events()
             except Exception:
@@ -1605,6 +1718,25 @@ class DataProcessingWorker(QObject):
     def _process_epoch_batch_for_display(self, epoch_batch: np.ndarray) -> np.ndarray:
         return self._process_epoch_batch(epoch_batch)[:, :, :: self.decimate]
 
+    def _process_emg_epoch_batch(self, epoch_batch: np.ndarray) -> np.ndarray:
+        plot_data = apply_baseline_correction(epoch_batch, self.original_times, baseline=(None, 0.0))
+        plot_data = fill_epoch_artifact_window(
+            plot_data,
+            self.original_times,
+            self.params.get("art_rem", (0, 0)),
+        )
+        if self._frequency_filters_enabled():
+            plot_data = self._apply_live_filters(plot_data)
+        plot_data = apply_artifact_mask(
+            plot_data,
+            self.original_times,
+            self.params.get("art_rem", (0, 0)),
+        )
+        return plot_data
+
+    def _process_emg_epoch_batch_for_display(self, epoch_batch: np.ndarray) -> np.ndarray:
+        return self._process_emg_epoch_batch(epoch_batch)[:, :, :: self.decimate]
+
     @Slot(dict)
     def update_params(self, new_params):
         """Update processing parameters."""
@@ -1638,6 +1770,8 @@ class DataProcessingWorker(QObject):
         """Reset the circular epoch buffer and counters."""
         self.epoch_buffer.fill(np.nan)
         self.processed_epoch_buffer.fill(np.nan)
+        self.emg_epoch_buffer.fill(np.nan)
+        self.processed_emg_epoch_buffer.fill(np.nan)
         self.buffer_idx = 0
         self.n_valid_epochs = 0
         self.total_epochs_seen = 0
@@ -1672,18 +1806,30 @@ class DataProcessingWorker(QObject):
             self.processed_epoch_buffer[start_idx:end_idx] = self._process_epoch_batch_for_display(
                 self.epoch_buffer[start_idx:end_idx]
             )
+            if self.emg_picks.size > 0:
+                self.processed_emg_epoch_buffer[start_idx:end_idx] = self._process_emg_epoch_batch_for_display(
+                    self.emg_epoch_buffer[start_idx:end_idx]
+                )
 
-    def _append_history(self, raw_chunk: np.ndarray, stim_chunk: np.ndarray):
+    def _append_history(self, raw_chunk: np.ndarray, emg_chunk: np.ndarray, stim_chunk: np.ndarray):
         if raw_chunk.ndim != 2 or raw_chunk.shape[1] == 0:
             return
 
         raw_chunk = np.asarray(raw_chunk, dtype=float)
+        emg_chunk = np.asarray(emg_chunk, dtype=float)
         stim_chunk = np.asarray(stim_chunk, dtype=float)
         self.raw_history, dropped_samples = append_limited_history(
             self.raw_history,
             raw_chunk,
             self.max_history_samples,
         )
+
+        if self.emg_picks.size > 0:
+            self.emg_history, _ = append_limited_history(
+                self.emg_history,
+                emg_chunk,
+                self.max_history_samples,
+            )
 
         if self.raw_event_picks.size > 0:
             if stim_chunk.size == 0:
@@ -1715,11 +1861,12 @@ class DataProcessingWorker(QObject):
             self.pending_events.append(int(chunk_start_sample + event_sample))
 
     def _consume_pending_events(self) -> bool:
-        if self.raw_history.size == 0:
+        if self.raw_history.size == 0 and self.emg_history.size == 0:
             return False
 
         updated = False
-        history_end_sample = self.history_start_sample + self.raw_history.shape[1]
+        history_sample_count = max(self.raw_history.shape[1], self.emg_history.shape[1])
+        history_end_sample = self.history_start_sample + history_sample_count
         while self.pending_events:
             event_sample = self.pending_events[0]
             epoch_start_sample = event_sample + self.epoch_start_offset
@@ -1736,11 +1883,16 @@ class DataProcessingWorker(QObject):
             epoch = self.raw_history[:, history_start_idx:history_end_idx]
             if epoch.shape != (self.epoch_channel_count, self.original_times.size):
                 continue
-            self._store_epoch_batch(epoch[np.newaxis, :, :])
+            emg_epoch = None
+            if self.emg_picks.size > 0 and self.emg_history.size > 0:
+                candidate = self.emg_history[:, history_start_idx:history_end_idx]
+                if candidate.shape == (len(self.emg_picks), self.original_times.size):
+                    emg_epoch = candidate
+            self._store_epoch_batch(epoch[np.newaxis, :, :], None if emg_epoch is None else emg_epoch[np.newaxis, :, :])
             updated = True
         return updated
 
-    def _store_epoch_batch(self, epoch_batch: np.ndarray):
+    def _store_epoch_batch(self, epoch_batch: np.ndarray, emg_epoch_batch: np.ndarray | None = None):
         n_new = int(epoch_batch.shape[0])
         if n_new <= 0:
             return
@@ -1751,22 +1903,37 @@ class DataProcessingWorker(QObject):
             processed_batch = self._process_epoch_batch_for_display(epoch_batch)
             self.epoch_buffer[:] = epoch_batch
             self.processed_epoch_buffer[:] = processed_batch
+            if emg_epoch_batch is not None and self.emg_picks.size > 0:
+                emg_epoch_batch = emg_epoch_batch[-self.max_epochs :]
+                self.emg_epoch_buffer[:] = emg_epoch_batch
+                self.processed_emg_epoch_buffer[:] = self._process_emg_epoch_batch_for_display(emg_epoch_batch)
             self.buffer_idx = 0
             self.n_valid_epochs = self.max_epochs
             return
 
         processed_batch = self._process_epoch_batch_for_display(epoch_batch)
+        processed_emg_batch = None
+        if emg_epoch_batch is not None and self.emg_picks.size > 0:
+            processed_emg_batch = self._process_emg_epoch_batch_for_display(emg_epoch_batch)
         start_idx = self.buffer_idx
         end_idx = start_idx + n_new
         if end_idx <= self.max_epochs:
             self.epoch_buffer[start_idx:end_idx] = epoch_batch
             self.processed_epoch_buffer[start_idx:end_idx] = processed_batch
+            if emg_epoch_batch is not None and processed_emg_batch is not None:
+                self.emg_epoch_buffer[start_idx:end_idx] = emg_epoch_batch
+                self.processed_emg_epoch_buffer[start_idx:end_idx] = processed_emg_batch
         else:
             part1_n = self.max_epochs - start_idx
             self.epoch_buffer[start_idx:] = epoch_batch[:part1_n]
             self.epoch_buffer[: n_new - part1_n] = epoch_batch[part1_n:]
             self.processed_epoch_buffer[start_idx:] = processed_batch[:part1_n]
             self.processed_epoch_buffer[: n_new - part1_n] = processed_batch[part1_n:]
+            if emg_epoch_batch is not None and processed_emg_batch is not None:
+                self.emg_epoch_buffer[start_idx:] = emg_epoch_batch[:part1_n]
+                self.emg_epoch_buffer[: n_new - part1_n] = emg_epoch_batch[part1_n:]
+                self.processed_emg_epoch_buffer[start_idx:] = processed_emg_batch[:part1_n]
+                self.processed_emg_epoch_buffer[: n_new - part1_n] = processed_emg_batch[part1_n:]
 
         self.buffer_idx = end_idx % self.max_epochs
         self.n_valid_epochs = min(self.max_epochs, self.n_valid_epochs + n_new)
@@ -1838,6 +2005,28 @@ class DataProcessingWorker(QObject):
                 "global_min": global_min,
                 "global_max": global_max,
             }
+
+            if self.emg_picks.size > 0:
+                emg_plot_data = buffer_epoch_snapshot(
+                    self.processed_emg_epoch_buffer,
+                    self.buffer_idx,
+                    self.n_valid_epochs,
+                    self.display_epoch_count,
+                )
+                if emg_plot_data.shape[0] > 0:
+                    emg_mean_data, emg_std_data = compute_epoch_mean_std(emg_plot_data)
+                    mep_epochs = emg_plot_data.shape[0]
+                else:
+                    emg_mean_data = np.full((len(self.emg_names), len(self.times)), np.nan)
+                    emg_std_data = np.full_like(emg_mean_data, np.nan)
+                    mep_epochs = 0
+
+                emit_dict["mep_data"] = {
+                    "mean_data": emg_mean_data,
+                    "std_data": emg_std_data,
+                    "emg_names": self.emg_names,
+                    "n_epochs": mep_epochs,
+                }
 
         return emit_dict
 
@@ -2168,6 +2357,7 @@ class RealTimeERP(QMainWindow):
         self.buffered_epochs = 0
         self.total_epochs = 0
         self.ch_names = []
+        self.emg_names = []
         self.channel_indices = {}
         self.coords_3d = np.empty((0, 3), dtype=float)
         self.coords_2d = np.empty((0, 2), dtype=float)
@@ -2189,6 +2379,8 @@ class RealTimeERP(QMainWindow):
         self.latest_raw_payload = None
         self.pending_epoch_payload = None
         self.latest_epoch_payload = None
+        self.pending_mep_payload = None
+        self.latest_mep_payload = None
         self.raw_render_timer = QTimer(self)
         self.raw_render_timer.setSingleShot(True)
         self.raw_render_timer.setInterval(0)
@@ -2202,6 +2394,7 @@ class RealTimeERP(QMainWindow):
         self.topomap_refresh_timer.setInterval(140)
         self.topomap_refresh_timer.timeout.connect(self._flush_topomap_update)
         self.active_montage_name = None
+        self.has_visual_montage = False
         self.theme_name = current_theme_name()
         self.tokens = theme_tokens(self.theme_name)
         self._shutting_down = False
@@ -2223,6 +2416,7 @@ class RealTimeERP(QMainWindow):
         self.raw_dock = RawMonitorDock(self)
         self.topo_dock = ChannelLayoutDock(self)
         self.evoked_dock = EvokedButterflyDock(self)
+        self.mep_dock = MEPDock(self)
         self.top_splitter = self.raw_dock
         self.raw_widget = self.raw_dock
         self.topo_widget = self.topo_dock
@@ -2230,6 +2424,7 @@ class RealTimeERP(QMainWindow):
             "raw": self.raw_dock,
             "topo": self.topo_dock,
             "evoked": self.evoked_dock,
+            "mep": self.mep_dock,
         }
         self.topo_dock.channel_left_clicked.connect(self.on_topo_pick)
         self.topo_dock.channel_right_clicked.connect(self._toggle_bad_channel)
@@ -2254,11 +2449,12 @@ class RealTimeERP(QMainWindow):
             self.colors = build_trace_colors(
                 len(self.ch_names),
                 self.coords_3d,
-                prefer_position_colors=bool(self.active_montage_name),
+                prefer_position_colors=self._has_visual_montage(),
             )
 
         self.raw_dock.refresh_theme(self.tokens, self.colors)
         self.evoked_dock.refresh_theme(self.tokens, self.colors)
+        self.mep_dock.refresh_theme(self.tokens)
         self.topo_dock.refresh_theme(self.tokens, self.colors, self.bads)
 
         if self.topomap_dialog is not None:
@@ -2266,18 +2462,62 @@ class RealTimeERP(QMainWindow):
         for dialog in self.opened_single_channels.values():
             dialog.refresh_theme()
 
+    def _has_visual_montage(self) -> bool:
+        return bool(self.has_visual_montage)
+
+    def _update_montage_dependent_ui(self):
+        has_montage = self._has_visual_montage()
+        self.topo_dock.setVisible(has_montage)
+        if hasattr(self, "topo_toggle_action"):
+            self.topo_toggle_action.setEnabled(has_montage)
+            self.topo_toggle_action.setVisible(has_montage)
+        if not has_montage and self.topomap_dialog is not None:
+            self.topomap_dialog.close()
+
+    def _has_mep_channels(self) -> bool:
+        return bool(self.emg_names)
+
+    def _update_mep_dependent_ui(self):
+        has_mep = self._has_mep_channels()
+        self.mep_dock.setVisible(has_mep)
+        if hasattr(self, "mep_toggle_action"):
+            self.mep_toggle_action.setEnabled(has_mep)
+            self.mep_toggle_action.setVisible(has_mep)
+        for attr_name in ("mep_active_label", "mep_active_combo", "mep_reference_label", "mep_reference_combo"):
+            if hasattr(self, attr_name):
+                getattr(self, attr_name).setVisible(has_mep)
+
     def _restore_default_dock_layout(self):
-        for dock in (self.raw_dock, self.topo_dock, self.evoked_dock):
+        for dock in (self.raw_dock, self.evoked_dock):
             dock.show()
             if dock.isFloating():
                 dock.setFloating(False)
+        if self.topo_dock.isFloating():
+            self.topo_dock.setFloating(False)
+        if self.mep_dock.isFloating():
+            self.mep_dock.setFloating(False)
 
         self.addDockWidget(Qt.LeftDockWidgetArea, self.raw_dock)
-        self.addDockWidget(Qt.LeftDockWidgetArea, self.topo_dock)
-        self.splitDockWidget(self.raw_dock, self.topo_dock, Qt.Orientation.Horizontal)
+        if self._has_visual_montage():
+            self.topo_dock.show()
+            self.addDockWidget(Qt.LeftDockWidgetArea, self.topo_dock)
+            self.splitDockWidget(self.raw_dock, self.topo_dock, Qt.Orientation.Horizontal)
+        else:
+            self.topo_dock.hide()
         self.addDockWidget(Qt.BottomDockWidgetArea, self.evoked_dock)
-        self.resizeDocks([self.raw_dock, self.topo_dock], [640, 640], Qt.Orientation.Horizontal)
+        if self._has_mep_channels():
+            self.mep_dock.show()
+            self.addDockWidget(Qt.BottomDockWidgetArea, self.mep_dock)
+            self.splitDockWidget(self.evoked_dock, self.mep_dock, Qt.Orientation.Horizontal)
+        else:
+            self.mep_dock.hide()
+        if self._has_visual_montage():
+            self.resizeDocks([self.raw_dock, self.topo_dock], [640, 640], Qt.Orientation.Horizontal)
+        if self._has_mep_channels():
+            self.resizeDocks([self.evoked_dock, self.mep_dock], [760, 420], Qt.Orientation.Horizontal)
         self.resizeDocks([self.raw_dock, self.evoked_dock], [620, 320], Qt.Orientation.Vertical)
+        self._update_montage_dependent_ui()
+        self._update_mep_dependent_ui()
         self._render_latest_visible_docks(force=True)
 
     def _on_plot_dock_visibility_changed(self, dock_name: str, visible: bool):
@@ -2286,10 +2526,16 @@ class RealTimeERP(QMainWindow):
         if dock_name == "raw":
             self._render_raw_payload(self.latest_raw_payload, force=True)
             return
+        if dock_name == "topo" and not self._has_visual_montage():
+            return
+        if dock_name == "mep":
+            self._render_mep_payload(self.latest_mep_payload, force=True)
+            return
         self._render_epoch_payload(self.latest_epoch_payload, force=True)
 
     def _render_latest_visible_docks(self, *, force: bool):
         self._render_epoch_payload(self.latest_epoch_payload, force=force)
+        self._render_mep_payload(self.latest_mep_payload, force=force)
         self._render_raw_payload(self.latest_raw_payload, force=force)
 
     def _create_toolbar(self):
@@ -2308,6 +2554,10 @@ class RealTimeERP(QMainWindow):
         self.evoked_toggle_action = self.evoked_dock.toggleViewAction()
         self.evoked_toggle_action.setText("Butterfly")
         toolbar.addAction(self.evoked_toggle_action)
+
+        self.mep_toggle_action = self.mep_dock.toggleViewAction()
+        self.mep_toggle_action.setText("MEP")
+        toolbar.addAction(self.mep_toggle_action)
 
         toolbar.addSeparator()
         toolbar.addAction("Reset Layout").triggered.connect(self._restore_default_dock_layout)
@@ -2345,7 +2595,22 @@ class RealTimeERP(QMainWindow):
         toolbar.addWidget(self.epoch_count_label)
 
         toolbar.addSeparator()
+        self.mep_active_label = QLabel(" MEP Active: ")
+        self.mep_active_combo = QComboBox()
+        self.mep_active_combo.setMinimumWidth(120)
+        self.mep_active_combo.currentTextChanged.connect(self._on_mep_channel_changed)
+        self.mep_reference_label = QLabel(" Ref: ")
+        self.mep_reference_combo = QComboBox()
+        self.mep_reference_combo.setMinimumWidth(120)
+        self.mep_reference_combo.currentTextChanged.connect(self._on_mep_channel_changed)
+        toolbar.addWidget(self.mep_active_label)
+        toolbar.addWidget(self.mep_active_combo)
+        toolbar.addWidget(self.mep_reference_label)
+        toolbar.addWidget(self.mep_reference_combo)
+
+        toolbar.addSeparator()
         toolbar.addAction("Settings").triggered.connect(self.update_settings)
+        self._update_mep_dependent_ui()
         return toolbar
 
     def _update_epoch_count_label(self):
@@ -2619,6 +2884,7 @@ class RealTimeERP(QMainWindow):
         self.stream = stream
 
         self._apply_visual_montage()
+        self._update_montage_dependent_ui()
 
         eeg_picks = mne.pick_types(self.stream.info, eeg=True, exclude=())
         self.info = mne.pick_info(self.stream.info, eeg_picks)
@@ -2644,7 +2910,7 @@ class RealTimeERP(QMainWindow):
         self.colors = build_trace_colors(
             len(self.ch_names),
             self.coords_3d,
-            prefer_position_colors=bool(self.active_montage_name),
+            prefer_position_colors=self._has_visual_montage(),
         )
 
         self.n_chan_spinbox.setRange(1, max(1, len(self.ch_names)))
@@ -2664,8 +2930,11 @@ class RealTimeERP(QMainWindow):
         self.data_worker.destroyed.connect(lambda *_: self._clear_qt_attr("data_worker"))
 
         self.times = np.asarray(self.data_worker.times, dtype=float)
+        self.emg_names = list(self.data_worker.emg_names)
+        self.params["emg_names"] = self.emg_names
 
         self.setup_plots()
+        self._configure_mep_controls()
 
         # Connections for data worker
         self.data_worker.data_ready.connect(self._on_data_ready)
@@ -2687,13 +2956,17 @@ class RealTimeERP(QMainWindow):
         if not self.ch_names or self.times.size == 0:
             return
 
-        positions = calculate_mne_style_layout(self.coords_2d)
         time_axis_ms = self.times * 1e3
         stream_duration = float(self.params.get("stream_duration", 5) or 5.0)
 
         self.raw_dock.configure(self.ch_names, self.colors, stream_duration)
         self.evoked_dock.configure(time_axis_ms, self.ch_names, self.colors)
-        self.topo_dock.configure(time_axis_ms, self.ch_names, self.colors, positions)
+        self.mep_dock.configure(time_axis_ms)
+        if self._has_visual_montage():
+            positions = calculate_mne_style_layout(self.coords_2d)
+            self.topo_dock.configure(time_axis_ms, self.ch_names, self.colors, positions)
+        self._update_montage_dependent_ui()
+        self._update_mep_dependent_ui()
         self._update_n_channels_shown()
         self.refresh_theme()
         self._render_latest_visible_docks(force=True)
@@ -2722,6 +2995,45 @@ class RealTimeERP(QMainWindow):
             return
         self.raw_dock.set_visible_channels(self.n_chan_spinbox.value())
 
+    def _configure_mep_controls(self):
+        for combo in (self.mep_active_combo, self.mep_reference_combo):
+            combo.blockSignals(True)
+            combo.clear()
+
+        try:
+            self.mep_active_combo.addItems(self.emg_names)
+            self.mep_reference_combo.addItem("None")
+            self.mep_reference_combo.addItems(self.emg_names)
+
+            if self.emg_names:
+                self.mep_active_combo.setCurrentText(self.emg_names[0])
+            if len(self.emg_names) > 1:
+                self.mep_reference_combo.setCurrentText(self.emg_names[1])
+            else:
+                self.mep_reference_combo.setCurrentText("None")
+        finally:
+            for combo in (self.mep_active_combo, self.mep_reference_combo):
+                combo.blockSignals(False)
+
+        self._update_mep_dependent_ui()
+        self._render_mep_payload(self.latest_mep_payload, force=True)
+
+    def _current_mep_selection(self) -> tuple[str | None, str | None]:
+        if not self.emg_names:
+            return None, None
+
+        active = self.mep_active_combo.currentText()
+        if active not in self.emg_names:
+            active = self.emg_names[0]
+
+        reference = self.mep_reference_combo.currentText()
+        if reference == "None" or reference == active or reference not in self.emg_names:
+            reference = None
+        return active, reference
+
+    def _on_mep_channel_changed(self, *_):
+        self._render_mep_payload(self.latest_mep_payload, force=True)
+
     def _on_scale_mode_changed(self, text: str):
         if self._qt_object_alive(self.data_worker):
             self.params_changed.emit({"scale_mode": text})
@@ -2741,9 +3053,13 @@ class RealTimeERP(QMainWindow):
 
     def _flush_epoch_render_cycle(self):
         epoch_payload = self.pending_epoch_payload
+        mep_payload = self.pending_mep_payload
         self.pending_epoch_payload = None
+        self.pending_mep_payload = None
         if epoch_payload is not None:
             self._render_epoch_payload(epoch_payload)
+        if mep_payload is not None:
+            self._render_mep_payload(mep_payload)
 
     def _flush_raw_render_cycle(self):
         raw_payload = self.pending_raw_payload
@@ -2786,7 +3102,7 @@ class RealTimeERP(QMainWindow):
         mean_data_uV = self.mean_data * 1e6
         if force or self.evoked_dock.isVisible():
             self.evoked_dock.update_data(mean_data_uV, self.bads, global_min, global_max)
-        if force or self.topo_dock.isVisible():
+        if self._has_visual_montage() and (force or self.topo_dock.isVisible()):
             self.topo_dock.update_data(
                 mean_data_uV,
                 self.bads,
@@ -2801,8 +3117,45 @@ class RealTimeERP(QMainWindow):
                 continue
             plot_dialog.update_plot(self.mean_data[ch_idx, :] * 1e6, self.std_data[ch_idx, :] * 1e6, self.n_epochs)
 
-        if self.topomap_dialog is not None:
+        if self._has_visual_montage() and self.topomap_dialog is not None:
             self._schedule_topomap_update()
+
+    def _render_mep_payload(self, payload, *, force: bool = False):
+        if payload is None or not self._has_mep_channels() or self.times.size == 0:
+            return
+        if not force and not self.mep_dock.isVisible():
+            return
+
+        mean_data = payload.mean_data if isinstance(payload, MEPRenderPayload) else payload["mean_data"]
+        emg_names = payload.emg_names if isinstance(payload, MEPRenderPayload) else list(payload["emg_names"])
+        n_epochs = payload.n_epochs if isinstance(payload, MEPRenderPayload) else int(payload["n_epochs"])
+        if np.ndim(mean_data) != 2 or mean_data.shape[0] != len(emg_names):
+            return
+
+        active_channel, reference_channel = self._current_mep_selection()
+        if active_channel is None:
+            return
+
+        trace_uV = build_mep_trace_uV(
+            mean_data,
+            emg_names,
+            active_channel,
+            reference_channel,
+        )
+        if trace_uV.size != self.times.size:
+            return
+
+        times_ms = self.times * 1e3
+        p2p_uV, window_mask = compute_mep_peak_to_peak_uV(trace_uV, times_ms)
+        self.mep_dock.update_data(
+            trace_uV,
+            window_mask,
+            p2p_uV=p2p_uV,
+            threshold_uV=MEP_THRESHOLD_UV,
+            active_channel=active_channel,
+            reference_channel=reference_channel,
+            n_epochs=n_epochs,
+        )
 
     def _render_raw_payload(self, payload, *, force: bool = False):
         if payload is None or not self.ch_names:
@@ -2833,6 +3186,18 @@ class RealTimeERP(QMainWindow):
                 global_max=float(epoch_data["global_max"]),
             )
             self.latest_epoch_payload = self.pending_epoch_payload
+            if not self.epoch_render_timer.isActive():
+                self.epoch_render_timer.start()
+
+        if "mep_data" in data_dict:
+            mep_data = data_dict["mep_data"]
+            self.pending_mep_payload = MEPRenderPayload(
+                mean_data=np.asarray(mep_data["mean_data"]),
+                std_data=np.asarray(mep_data["std_data"]),
+                emg_names=list(mep_data["emg_names"]),
+                n_epochs=int(mep_data["n_epochs"]),
+            )
+            self.latest_mep_payload = self.pending_mep_payload
             if not self.epoch_render_timer.isActive():
                 self.epoch_render_timer.start()
 
@@ -2868,6 +3233,17 @@ class RealTimeERP(QMainWindow):
             self.latest_epoch_payload = cleared_payload
             self.pending_epoch_payload = None
             self._render_epoch_payload(cleared_payload, force=True)
+            if self.emg_names:
+                empty_mep = np.full((len(self.emg_names), len(self.times)), np.nan)
+                cleared_mep_payload = MEPRenderPayload(
+                    mean_data=empty_mep.copy(),
+                    std_data=empty_mep.copy(),
+                    emg_names=self.emg_names.copy(),
+                    n_epochs=0,
+                )
+                self.latest_mep_payload = cleared_mep_payload
+                self.pending_mep_payload = None
+                self._render_mep_payload(cleared_mep_payload, force=True)
         else:
             self.mean_data = None
             self.std_data = None
@@ -2919,6 +3295,10 @@ class RealTimeERP(QMainWindow):
         self._schedule_topomap_update()
 
     def _schedule_topomap_update(self, immediate: bool = False):
+        if not self._has_visual_montage():
+            if self.topomap_dialog is not None:
+                self.topomap_dialog.close()
+            return
         if self.mean_data is None:
             return
         if immediate:
@@ -2950,7 +3330,13 @@ class RealTimeERP(QMainWindow):
 
     def _build_topomap_payload(self):
         roi_region = getattr(self.evoked_dock, "roi_region", None)
-        if self.mean_data is None or roi_region is None or self.info is None or self.times.size == 0:
+        if (
+            not self._has_visual_montage()
+            or self.mean_data is None
+            or roi_region is None
+            or self.info is None
+            or self.times.size == 0
+        ):
             return None
         start_ms, end_ms = roi_region
 
@@ -2963,6 +3349,19 @@ class RealTimeERP(QMainWindow):
 
         good_indices = np.asarray(mne.pick_types(self.info, eeg=True, exclude="bads"))
         if len(good_indices) == 0:
+            return None
+
+        positions = []
+        for pick in good_indices:
+            loc = self.info["chs"][pick].get("loc", np.zeros(12))
+            positions.append(loc[:3] if loc is not None and len(loc) >= 3 else np.zeros(3))
+        positions = np.asarray(positions, dtype=float)
+        valid_position_mask = (
+            np.isfinite(positions).all(axis=1)
+            & np.any(np.abs(positions) > 1e-9, axis=1)
+        )
+        good_indices = good_indices[valid_position_mask]
+        if len(good_indices) < 2:
             return None
         
         topo_window = self.mean_data[good_indices, start_idx:end_idx]
@@ -3029,7 +3428,7 @@ class RealTimeERP(QMainWindow):
             self.params_changed.emit({"bads": ordered_bads})
         self.refresh_theme()
         self._render_epoch_payload(self.latest_epoch_payload, force=True)
-        if self.topomap_dialog is not None and self.mean_data is not None:
+        if self._has_visual_montage() and self.topomap_dialog is not None and self.mean_data is not None:
             self._schedule_topomap_update(immediate=True)
 
     def _shutdown_threads(self):
@@ -3095,7 +3494,8 @@ class RealTimeERP(QMainWindow):
         if self.stream is None:
             return
 
-        if self.stream.get_montage() is not None:
+        self.has_visual_montage = realtime_info_has_montage(self.stream.info)
+        if self.has_visual_montage:
             self.active_montage_name = self.params.get("info_label") or "MNE info montage"
             return
 
@@ -3103,9 +3503,9 @@ class RealTimeERP(QMainWindow):
 
     def channel_position_text(self, ch_name: str) -> str:
         coords = self.channel_coords.get(ch_name)
-        if coords is None:
+        if coords is None or not self._has_visual_montage():
             return ""
-        if all(abs(value) < 1e-9 for value in coords) and not self.active_montage_name:
+        if all(abs(value) < 1e-9 for value in coords):
             return ""
 
         return f"Layout: x={coords[0]:.3f}, y={coords[1]:.3f}"
@@ -3141,7 +3541,7 @@ class RealTimeMainWidget(QWidget):
         live_card = self._build_card("Connect to Live Stream")
         live_layout = live_card.layout()
         live_help = QLabel(
-            "Select an MNE info source with montage, then launch the live visualizer."
+            "Select an MNE info source, then launch the live visualizer."
         )
         live_help.setObjectName("mutedLabel")
         live_help.setWordWrap(True)
@@ -3206,7 +3606,7 @@ class RealTimeMainWidget(QWidget):
             QMessageBox.warning(
                 self,
                 "No MNE Info",
-                "Select an MNE info source with a montage before launching the live visualizer.",
+                "Select an MNE info source before launching the live visualizer.",
             )
             return
         if not params.get("event_channels"):
