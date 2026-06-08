@@ -48,6 +48,58 @@ class TestCore(unittest.TestCase):
         preprocessor.run_artifact_removal()
         self.assertTrue(preprocessor.has("filtered_raw"))
 
+    def test_artifact_removal_zero_length_window_does_not_write_nans(self):
+        """Zero-length artifact windows should not smooth edge samples into NaNs."""
+        sfreq = 1000
+        info = mne.create_info(["EEG 001", "EEG 002"], sfreq=sfreq, ch_types="eeg")
+        data = np.vstack(
+            [
+                np.linspace(-1.0, 1.0, 1000),
+                np.linspace(1.0, -1.0, 1000),
+            ]
+        )
+        raw = mne.io.RawArray(data.copy(), info)
+        raw.set_annotations(
+            mne.Annotations(onset=[0.01, 0.5], duration=[0.0, 0.0], description=["TMS", "TMS"])
+        )
+
+        result = Preprocessor.interpolate_tms_pulse(
+            raw,
+            window=(0.0, 0.0),
+            smoothing=(-0.002, 0.002),
+            span=5,
+            event_id=[1],
+            verbose=False,
+        )
+
+        result_data = result.get_data()
+        self.assertTrue(np.isfinite(result_data).all())
+        np.testing.assert_allclose(result_data, data)
+
+    def test_artifact_removal_skips_edge_events_needed_for_smoothing(self):
+        """Events too close to the recording start should be skipped before smoothing."""
+        sfreq = 1000
+        info = mne.create_info(["EEG 001"], sfreq=sfreq, ch_types="eeg")
+        data = np.linspace(-1.0, 1.0, 1000, dtype=float).reshape(1, -1)
+        raw = mne.io.RawArray(data.copy(), info)
+        raw.set_annotations(
+            mne.Annotations(onset=[0.005, 0.5], duration=[0.0, 0.0], description=["TMS", "TMS"])
+        )
+
+        result = Preprocessor.interpolate_tms_pulse(
+            raw,
+            window=(-0.002, 0.006),
+            smoothing=(-0.002, 0.002),
+            span=5,
+            event_id=[1],
+            verbose=False,
+        )
+
+        result_data = result.get_data()
+        self.assertTrue(np.isfinite(result_data).all())
+        np.testing.assert_allclose(result_data[:, :20], data[:, :20])
+        self.assertFalse(np.allclose(result_data[:, 498:506], data[:, 498:506]))
+
     def test_raw_review_saves_to_filtered_derivative_without_touching_source(self):
         """Test raw inspection edits are persisted only to the derivative raw."""
         output_dir = self.test_dir / "derivatives"

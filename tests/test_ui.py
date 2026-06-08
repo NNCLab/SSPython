@@ -16,6 +16,7 @@ from ui.widgets.real_time_widget import (
     ConnectionWidget,
     DataProcessingWorker,
     RealTimeERP,
+    RealTimeSettingsWidget,
     apply_realtime_info_to_stream,
     apply_artifact_mask,
     apply_frequency_filters,
@@ -255,6 +256,42 @@ class TestUI(unittest.TestCase):
         self.assertEqual(snapshot["mep_data"]["mean_data"].shape, (2, worker.times.size))
         self.assertEqual(snapshot["mep_data"]["n_epochs"], 2)
 
+    def test_data_processing_worker_reprocesses_when_average_reference_toggles(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(["Cz", "Pz"], sfreq=1000.0, ch_types=["eeg", "eeg"])
+
+        class FakeStream:
+            def __init__(self, stream_info):
+                self.info = stream_info
+                self.n_new_samples = 0
+
+        worker = DataProcessingWorker(
+            FakeStream(info),
+            {
+                "tlim": (0.001, 0.003),
+                "decimate": 1,
+                "max_epochs": 4,
+                "art_rem": (None, None),
+                "reference": "average",
+            },
+        )
+        epoch_batch = np.zeros((1, 2, worker.original_times.size), dtype=float)
+        epoch_batch[:, 0, :] = 1.0
+        epoch_batch[:, 1, :] = 3.0
+
+        worker._store_epoch_batch(epoch_batch)
+
+        np.testing.assert_allclose(worker.processed_epoch_buffer[0, 0], -1.0)
+        np.testing.assert_allclose(worker.processed_epoch_buffer[0, 1], 1.0)
+
+        worker.update_params({"reference": "none"})
+
+        np.testing.assert_allclose(worker.processed_epoch_buffer[0, 0], 1.0)
+        np.testing.assert_allclose(worker.processed_epoch_buffer[0, 1], 3.0)
+
     def test_mep_trace_and_peak_to_peak_threshold_helpers(self):
         times_ms = np.array([0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
         mean_emg_data = np.array(
@@ -367,8 +404,29 @@ class TestUI(unittest.TestCase):
         widget._configure_mep_controls()
 
         self.assertTrue(widget.mep_toggle_action.isEnabled())
+        self.assertFalse(widget.mep_active_combo.isHidden())
+        self.assertFalse(widget.mep_reference_combo.isHidden())
+        self.assertTrue(widget.mep_active_combo.isEnabled())
+        self.assertTrue(widget.mep_reference_combo.isEnabled())
         self.assertEqual(widget.mep_active_combo.currentText(), "EMG Active")
         self.assertEqual(widget.mep_reference_combo.currentText(), "EMG Ref")
+        widget.close()
+
+    def test_real_time_erp_hides_mep_controls_without_emg_channels(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = RealTimeERP({})
+        widget.emg_names = []
+        widget._configure_mep_controls()
+
+        self.assertFalse(widget.mep_toggle_action.isEnabled())
+        self.assertFalse(widget.mep_toggle_action.isVisible())
+        self.assertTrue(widget.mep_active_combo.isHidden())
+        self.assertTrue(widget.mep_reference_combo.isHidden())
+        self.assertFalse(widget.mep_active_combo.isEnabled())
+        self.assertFalse(widget.mep_reference_combo.isEnabled())
         widget.close()
 
     def test_connection_widget_uses_info_summary_instead_of_channel_table(self):
@@ -640,6 +698,32 @@ class TestUI(unittest.TestCase):
 
         self.assertTrue(widget.average_ref_radio.isChecked())
         self.assertEqual(widget.get_params()["reference"], "average")
+        widget.close()
+
+    def test_real_time_settings_widget_supports_average_reference(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = RealTimeSettingsWidget()
+        widget.set_settings(
+            {
+                "refresh_rate": 24,
+                "art_rem": (-0.005, 0.005),
+                "reference": "average",
+                "apply_bandpass": False,
+                "bandpass_range": (8.0, 80.0),
+                "apply_notch": False,
+                "notch_freqs": [50.0],
+            }
+        )
+
+        self.assertTrue(widget.average_reference_checkbox.isChecked())
+        self.assertEqual(widget.get_settings()["reference"], "average")
+
+        widget.average_reference_checkbox.setChecked(False)
+
+        self.assertEqual(widget.get_settings()["reference"], "none")
         widget.close()
 
 if __name__ == '__main__':

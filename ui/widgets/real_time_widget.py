@@ -1418,6 +1418,9 @@ class RealTimeSettingsWidget(QWidget):
         )
         form_layout.addRow("Artifact Removal:", self.art_rem_input)
 
+        self.average_reference_checkbox = QCheckBox("Apply Average Reference")
+        form_layout.addRow(self.average_reference_checkbox)
+
         self.apply_bandpass = QCheckBox("Apply Bandpass Filter")
         self.bandpass_input = OptionalRangeWidget(
             labels=("Low:", "High:"), suffix=" Hz", range=(0.1, 200)
@@ -1433,6 +1436,7 @@ class RealTimeSettingsWidget(QWidget):
         self.apply_notch.toggled.connect(self.notch_input.setEnabled)
         self.refresh_rate_input.valueChanged.connect(self._emit_settings_changed)
         self.art_rem_input.valueChanged.connect(self._emit_settings_changed)
+        self.average_reference_checkbox.toggled.connect(self._emit_settings_changed)
         self.apply_bandpass.toggled.connect(self._emit_settings_changed)
         self.bandpass_input.valueChanged.connect(self._emit_settings_changed)
         self.apply_notch.toggled.connect(self._emit_settings_changed)
@@ -1453,6 +1457,7 @@ class RealTimeSettingsWidget(QWidget):
         return {
             "refresh_rate": self.refresh_rate_input.value(),
             "art_rem": self.art_rem_input.value(),
+            "reference": "average" if self.average_reference_checkbox.isChecked() else "none",
             "apply_bandpass": self.apply_bandpass.isChecked(),
             "bandpass_range": self.bandpass_input.value(),
             "apply_notch": self.apply_notch.isChecked(),
@@ -1464,6 +1469,7 @@ class RealTimeSettingsWidget(QWidget):
         self._suppress_settings_changed = True
         try:
             self.refresh_rate_input.setValue(params.get("refresh_rate"))
+            self.average_reference_checkbox.setChecked(params.get("reference", "average") == "average")
             self.apply_bandpass.setChecked(params.get("apply_bandpass"))
             self.apply_notch.setChecked(params.get("apply_notch"))
 
@@ -1494,6 +1500,7 @@ class RealTimeSettingsWidget(QWidget):
         default_params = {
             "refresh_rate": 24,
             "art_rem": (-0.005, 0.005),
+            "reference": "average",
             "apply_bandpass": False,
             "bandpass_range": (8.0, 80.0),
             "apply_notch": False,
@@ -2485,7 +2492,9 @@ class RealTimeERP(QMainWindow):
             self.mep_toggle_action.setVisible(has_mep)
         for attr_name in ("mep_active_label", "mep_active_combo", "mep_reference_label", "mep_reference_combo"):
             if hasattr(self, attr_name):
-                getattr(self, attr_name).setVisible(has_mep)
+                widget = getattr(self, attr_name)
+                widget.setEnabled(has_mep)
+                widget.setVisible(has_mep)
 
     def _restore_default_dock_layout(self):
         for dock in (self.raw_dock, self.evoked_dock):
@@ -3257,6 +3266,7 @@ class RealTimeERP(QMainWindow):
         return {
             "refresh_rate": int(self.params.get("refresh_rate", 24) or 24),
             "art_rem": self.params.get("art_rem", (-0.005, 0.005)),
+            "reference": "average" if self.params.get("reference", "average") == "average" else "none",
             "apply_bandpass": bool(self.params.get("apply_bandpass", False)),
             "bandpass_range": self.params.get("bandpass_range", (8.0, 80.0)),
             "apply_notch": bool(self.params.get("apply_notch", False)),

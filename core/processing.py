@@ -251,27 +251,50 @@ class Preprocessor:
             events = events[mask]
         onsets = events[:, 0]
 
+        if window is None or any(w is None for w in window):
+            logger.warning(
+                "Artifact removal window is disabled. Returning original data."
+            )
+            return raw
+
         # Convert time in seconds to integer samples, rounding to the nearest sample
         window_s = np.array([np.round(w * sfreq) for w in window], dtype=int)
-        smoothing_s = np.array([np.round(sw * sfreq) for sw in smoothing], dtype=int)
         window_len = window_s[1] - window_s[0]
+        if window_len < 0:
+            raise ValueError("Artifact removal window stop must be after start.")
+        if window_len == 0:
+            logger.warning(
+                "Artifact removal window has zero length. Returning original data."
+            )
+            return raw
+
+        smoothing_s = None
+        if smoothing is not None and not any(sw is None for sw in smoothing):
+            smoothing_s = np.array([np.round(sw * sfreq) for sw in smoothing], dtype=int)
+            if smoothing_s[0] >= smoothing_s[1]:
+                logger.info("Smoothing window has zero or negative length. Skipping smoothing.")
+                smoothing_s = None
+
         span_s = (span // 2, span // 2)
 
         # --- STEP 2: Filter onsets to prevent out-of-bounds indexing ---
-        min_rel_idx = window_s[0] - window_len
+        relative_starts = [window_s[0], window_s[0] - window_len]
+        relative_stops = [window_s[1], window_s[1] - window_len]
 
-        # Calculate the latest sample needed relative to an onset
-        # The max index is from the end smoothing: (cut1 + smoothing_s[1]) + span_s[1]
-        max_rel_idx = window_s[1] + smoothing_s[1] + span_s[1]
+        if smoothing_s is not None:
+            for edge in (window_s[0], window_s[1]):
+                smooth_start = edge + smoothing_s[0]
+                smooth_stop = edge + smoothing_s[1]
+                relative_starts.extend([smooth_start, smooth_start - span_s[0]])
+                relative_stops.extend([smooth_stop, smooth_stop + span_s[1]])
 
-        # Determine the required margin at the start and end of the recording
-        required_start_padding = abs(min_rel_idx)
-        required_end_padding = max_rel_idx
+        min_rel_idx = min(relative_starts)
+        max_rel_idx = max(relative_stops)
 
         # Filter out any onsets that are too close to the edges
         original_n_onsets = len(onsets)
-        valid_onsets_mask = (onsets >= required_start_padding) & (
-            onsets < n_samples - required_end_padding
+        valid_onsets_mask = (onsets + min_rel_idx >= 0) & (
+            onsets + max_rel_idx <= n_samples
         )
         onsets = onsets[valid_onsets_mask]
 
@@ -312,23 +335,24 @@ class Preprocessor:
                 # Note: A list comprehension calculates all means before assigning,
                 # which is important for the logic to be correct.
 
-                # Smooth at the start of the replaced window
-                start_smooth_range = range(cut0 + smoothing_s[0], cut0 + smoothing_s[1])
-                y[start_smooth_range.start : start_smooth_range.stop] = np.array(
-                    [
-                        np.mean(y[samp - span_s[0] : samp + span_s[1] + 1])
-                        for samp in start_smooth_range
-                    ]
-                )
+                if smoothing_s is not None:
+                    # Smooth at the start of the replaced window
+                    start_smooth_range = range(cut0 + smoothing_s[0], cut0 + smoothing_s[1])
+                    y[start_smooth_range.start : start_smooth_range.stop] = np.array(
+                        [
+                            np.mean(y[samp - span_s[0] : samp + span_s[1] + 1])
+                            for samp in start_smooth_range
+                        ]
+                    )
 
-                # Smooth at the end of the replaced window
-                end_smooth_range = range(cut1 + smoothing_s[0], cut1 + smoothing_s[1])
-                y[end_smooth_range.start : end_smooth_range.stop] = np.array(
-                    [
-                        np.mean(y[samp - span_s[0] : samp + span_s[1] + 1])
-                        for samp in end_smooth_range
-                    ]
-                )
+                    # Smooth at the end of the replaced window
+                    end_smooth_range = range(cut1 + smoothing_s[0], cut1 + smoothing_s[1])
+                    y[end_smooth_range.start : end_smooth_range.stop] = np.array(
+                        [
+                            np.mean(y[samp - span_s[0] : samp + span_s[1] + 1])
+                            for samp in end_smooth_range
+                        ]
+                    )
             return y
 
         # raw.apply_function(tms_pulse_removal, picks='eeg', verbose=verbose)
