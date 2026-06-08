@@ -292,6 +292,46 @@ class TestUI(unittest.TestCase):
         np.testing.assert_allclose(worker.processed_epoch_buffer[0, 0], 1.0)
         np.testing.assert_allclose(worker.processed_epoch_buffer[0, 1], 3.0)
 
+    def test_data_processing_worker_applies_input_amplitude_scale(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(
+            ["Cz", "EMG"],
+            sfreq=1000.0,
+            ch_types=["eeg", "emg"],
+        )
+
+        class FakeStream:
+            def __init__(self, stream_info):
+                self.info = stream_info
+                self.n_new_samples = 0
+
+        worker = DataProcessingWorker(
+            FakeStream(info),
+            {
+                "tlim": (0.001, 0.003),
+                "decimate": 1,
+                "max_epochs": 4,
+                "art_rem": (None, None),
+                "reference": "none",
+                "amplitude_scale": 1e-6,
+            },
+        )
+        eeg_batch = np.full((1, 1, worker.original_times.size), 100.0, dtype=float)
+        emg_batch = np.full((1, 1, worker.original_times.size), 50.0, dtype=float)
+
+        worker._store_epoch_batch(eeg_batch, emg_batch)
+
+        np.testing.assert_allclose(worker.processed_epoch_buffer[0, 0], 100e-6)
+        np.testing.assert_allclose(worker.processed_emg_epoch_buffer[0, 0], 50e-6)
+
+        worker.update_params({"amplitude_scale": 1.0})
+
+        np.testing.assert_allclose(worker.processed_epoch_buffer[0, 0], 100.0)
+        np.testing.assert_allclose(worker.processed_emg_epoch_buffer[0, 0], 50.0)
+
     def test_mep_trace_and_peak_to_peak_threshold_helpers(self):
         times_ms = np.array([0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
         mean_emg_data = np.array(
@@ -724,6 +764,33 @@ class TestUI(unittest.TestCase):
         widget.average_reference_checkbox.setChecked(False)
 
         self.assertEqual(widget.get_settings()["reference"], "none")
+        widget.close()
+
+    def test_real_time_settings_widget_supports_input_amplitude_scale(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = RealTimeSettingsWidget()
+        widget.set_settings(
+            {
+                "refresh_rate": 24,
+                "art_rem": (-0.005, 0.005),
+                "amplitude_scale": 1e-6,
+                "reference": "average",
+                "apply_bandpass": False,
+                "bandpass_range": (8.0, 80.0),
+                "apply_notch": False,
+                "notch_freqs": [50.0],
+            }
+        )
+
+        self.assertEqual(widget.amplitude_scale_combo.currentText(), "Microvolts (uV)")
+        self.assertAlmostEqual(widget.get_settings()["amplitude_scale"], 1e-6)
+
+        widget.amplitude_scale_combo.setCurrentText("Volts (V)")
+
+        self.assertEqual(widget.get_settings()["amplitude_scale"], 1.0)
         widget.close()
 
 if __name__ == '__main__':

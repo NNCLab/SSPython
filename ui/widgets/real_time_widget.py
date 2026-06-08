@@ -51,6 +51,24 @@ from utils import apply_theme, current_theme_name, theme_tokens
 DEFAULT_LIVE_EVENT_ID_MAX = 65535
 MEP_THRESHOLD_UV = 50.0
 DEFAULT_MEP_WINDOW_MS = (15.0, 50.0)
+REALTIME_AMPLITUDE_SCALE_OPTIONS = (
+    ("Volts (V)", 1.0),
+    ("Microvolts (uV)", 1e-6),
+)
+
+
+def normalize_realtime_amplitude_scale(value) -> float:
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("microvolts", "uv").replace("microvolt", "uv")
+        if "uv" in normalized or "micro volts" in normalized:
+            return 1e-6
+        if normalized in {"v", "volts", "volt"} or normalized.startswith("volts"):
+            return 1.0
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return scale if np.isfinite(scale) and scale > 0 else 1.0
 
 
 @dataclass(slots=True)
@@ -1418,6 +1436,11 @@ class RealTimeSettingsWidget(QWidget):
         )
         form_layout.addRow("Artifact Removal:", self.art_rem_input)
 
+        self.amplitude_scale_combo = QComboBox()
+        for label, scale in REALTIME_AMPLITUDE_SCALE_OPTIONS:
+            self.amplitude_scale_combo.addItem(label, scale)
+        form_layout.addRow("Input Amplitude:", self.amplitude_scale_combo)
+
         self.average_reference_checkbox = QCheckBox("Apply Average Reference")
         form_layout.addRow(self.average_reference_checkbox)
 
@@ -1436,12 +1459,21 @@ class RealTimeSettingsWidget(QWidget):
         self.apply_notch.toggled.connect(self.notch_input.setEnabled)
         self.refresh_rate_input.valueChanged.connect(self._emit_settings_changed)
         self.art_rem_input.valueChanged.connect(self._emit_settings_changed)
+        self.amplitude_scale_combo.currentIndexChanged.connect(self._emit_settings_changed)
         self.average_reference_checkbox.toggled.connect(self._emit_settings_changed)
         self.apply_bandpass.toggled.connect(self._emit_settings_changed)
         self.bandpass_input.valueChanged.connect(self._emit_settings_changed)
         self.apply_notch.toggled.connect(self._emit_settings_changed)
         self.notch_input.textChanged.connect(self._emit_settings_changed)
         main_layout.addStretch(1)
+
+    def _set_amplitude_scale(self, value):
+        scale = normalize_realtime_amplitude_scale(value)
+        for index in range(self.amplitude_scale_combo.count()):
+            if np.isclose(float(self.amplitude_scale_combo.itemData(index)), scale):
+                self.amplitude_scale_combo.setCurrentIndex(index)
+                return
+        self.amplitude_scale_combo.setCurrentIndex(0)
 
     def get_settings(self) -> dict:
         """Returns the current settings as a dictionary."""
@@ -1457,6 +1489,7 @@ class RealTimeSettingsWidget(QWidget):
         return {
             "refresh_rate": self.refresh_rate_input.value(),
             "art_rem": self.art_rem_input.value(),
+            "amplitude_scale": normalize_realtime_amplitude_scale(self.amplitude_scale_combo.currentData()),
             "reference": "average" if self.average_reference_checkbox.isChecked() else "none",
             "apply_bandpass": self.apply_bandpass.isChecked(),
             "bandpass_range": self.bandpass_input.value(),
@@ -1469,6 +1502,7 @@ class RealTimeSettingsWidget(QWidget):
         self._suppress_settings_changed = True
         try:
             self.refresh_rate_input.setValue(params.get("refresh_rate"))
+            self._set_amplitude_scale(params.get("amplitude_scale", 1.0))
             self.average_reference_checkbox.setChecked(params.get("reference", "average") == "average")
             self.apply_bandpass.setChecked(params.get("apply_bandpass"))
             self.apply_notch.setChecked(params.get("apply_notch"))
@@ -1500,6 +1534,7 @@ class RealTimeSettingsWidget(QWidget):
         default_params = {
             "refresh_rate": 24,
             "art_rem": (-0.005, 0.005),
+            "amplitude_scale": 1.0,
             "reference": "average",
             "apply_bandpass": False,
             "bandpass_range": (8.0, 80.0),
@@ -1565,7 +1600,7 @@ class DataProcessingWorker(QObject):
     data_ready = Signal(dict)
     finished = Signal()
     FILTER_PARAM_KEYS = frozenset({"apply_bandpass", "bandpass_range", "apply_notch", "notch_freqs"})
-    EPOCH_PROCESSING_PARAM_KEYS = FILTER_PARAM_KEYS | frozenset({"art_rem", "reference"})
+    EPOCH_PROCESSING_PARAM_KEYS = FILTER_PARAM_KEYS | frozenset({"amplitude_scale", "art_rem", "reference"})
     EPOCH_REPROCESS_BATCH_SIZE = 16
 
     def __init__(self, stream, params, parent=None):
@@ -1703,7 +1738,8 @@ class DataProcessingWorker(QObject):
             self.data_ready.emit(emit_dict)
 
     def _process_epoch_batch(self, epoch_batch: np.ndarray) -> np.ndarray:
-        plot_data = apply_baseline_correction(epoch_batch, self.original_times, baseline=(None, 0.0))
+        plot_data = np.asarray(epoch_batch, dtype=float) * self._input_amplitude_scale()
+        plot_data = apply_baseline_correction(plot_data, self.original_times, baseline=(None, 0.0))
         plot_data = fill_epoch_artifact_window(
             plot_data,
             self.original_times,
@@ -1726,7 +1762,8 @@ class DataProcessingWorker(QObject):
         return self._process_epoch_batch(epoch_batch)[:, :, :: self.decimate]
 
     def _process_emg_epoch_batch(self, epoch_batch: np.ndarray) -> np.ndarray:
-        plot_data = apply_baseline_correction(epoch_batch, self.original_times, baseline=(None, 0.0))
+        plot_data = np.asarray(epoch_batch, dtype=float) * self._input_amplitude_scale()
+        plot_data = apply_baseline_correction(plot_data, self.original_times, baseline=(None, 0.0))
         plot_data = fill_epoch_artifact_window(
             plot_data,
             self.original_times,
@@ -1794,6 +1831,9 @@ class DataProcessingWorker(QObject):
 
     def _apply_live_filters(self, data: np.ndarray) -> np.ndarray:
         return apply_frequency_filters(data, self.bandpass_sos, self.notch_filters)
+
+    def _input_amplitude_scale(self) -> float:
+        return normalize_realtime_amplitude_scale(self.params.get("amplitude_scale", 1.0))
 
     def _update_epoch_good_mask(self):
         bads = set(self.bads)
@@ -1950,7 +1990,7 @@ class DataProcessingWorker(QObject):
 
         if include_raw and self.raw_history.size > 0:
             sample_count = min(self.raw_display_samples, self.raw_history.shape[1])
-            raw_chunk = self.raw_history[:, -sample_count:]
+            raw_chunk = self.raw_history[:, -sample_count:] * self._input_amplitude_scale()
             stim_chunk = (
                 self.stim_history[:, -sample_count:]
                 if self.stim_history.size > 0
@@ -3266,6 +3306,7 @@ class RealTimeERP(QMainWindow):
         return {
             "refresh_rate": int(self.params.get("refresh_rate", 24) or 24),
             "art_rem": self.params.get("art_rem", (-0.005, 0.005)),
+            "amplitude_scale": normalize_realtime_amplitude_scale(self.params.get("amplitude_scale", 1.0)),
             "reference": "average" if self.params.get("reference", "average") == "average" else "none",
             "apply_bandpass": bool(self.params.get("apply_bandpass", False)),
             "bandpass_range": self.params.get("bandpass_range", (8.0, 80.0)),
