@@ -376,10 +376,10 @@ class Preprocessor:
         event_id: list[int] | None = None,
         verbose=True,
     ):
-        """Applies the TMS pulse interpolation to the raw data."""
-        self._clear_downstream_files("raw")  # Clear everything after the raw input
+        """Applies the TMS pulse interpolation to the latest continuous raw data."""
+        self._clear_downstream_files("filtered_raw")
 
-        raw = self.raw.load_data()
+        raw = self._get_last_continuous().load_data()
 
         interpolated_raw = self.interpolate_tms_pulse(
             raw,

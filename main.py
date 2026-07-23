@@ -142,6 +142,7 @@ class MainWindow(QMainWindow):
         self.dataset_inspector_panel = DatasetInspectorPanel(self)
         self.dataset_inspector_panel.collapsed = self.inspector_collapsed
         self.dataset_inspector_panel._apply_collapsed_state(animated=False)
+        self.dataset_inspector_panel.derivatives_changed.connect(self.refresh_workspace)
         layout.addWidget(self.dataset_inspector_panel)
 
         self.nav_list.currentItemChanged.connect(self._change_page)

@@ -1,14 +1,18 @@
 import unittest
+import tempfile
+from pathlib import Path
 import mne
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QListWidgetItem
 from main import MainWindow
+from core.pipelines import DatasetRecord, build_processing_paths, get_pipeline
 from ui.widgets.evoked_plot import EvokedPlotWidget
 from ui.widgets.preprocessing_widgets import (
     EpochingSettingsWidget,
     PreprocessingSettingsWidget,
 )
+from ui.widgets.workspace_panel import DatasetInspectorPanel
 from ui.widgets.tools.conversion_tool import ConvertToolDialog, MergeToolDialog
 from ui.widgets.tools.object_info_widget import ObjectInfoWidget, extract_event_counts
 from ui.widgets.tools.optional_range_widget import OptionalRangeWidget
@@ -600,6 +604,58 @@ class TestUI(unittest.TestCase):
         convert_dialog.close()
         merge_dialog.close()
         window.close()
+
+    def test_dataset_inspector_deletes_selected_and_subsequent_derivatives(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir)
+            raw_path = workspace_root / "sub-01" / "eeg" / "sub-01_raw.fif"
+            raw_path.parent.mkdir(parents=True)
+            raw_path.touch()
+
+            pipeline = get_pipeline("standard")
+            derivative_root = workspace_root / "derivatives" / "standard"
+            paths = build_processing_paths(raw_path, derivative_root, pipeline=pipeline)
+            derivative_stage_ids = [
+                "filtered_raw",
+                "continuous_ica",
+                "epochs",
+                "epochs_ica",
+                "preprocessed",
+            ]
+            for stage_id in derivative_stage_ids:
+                paths[stage_id].touch()
+
+            dataset = DatasetRecord(
+                raw_path=raw_path,
+                pipeline=pipeline,
+                derivative_root=derivative_root,
+                paths=paths,
+            )
+
+            panel = DatasetInspectorPanel()
+            panel.set_dataset(dataset)
+
+            delete_paths = panel._existing_derivative_paths_from_stage("epochs")
+            self.assertEqual(
+                delete_paths,
+                [paths["epochs"], paths["epochs_ica"], paths["preprocessed"]],
+            )
+
+            errors = panel._delete_derivative_paths(delete_paths)
+
+            self.assertEqual(errors, [])
+            self.assertTrue(paths["raw"].exists())
+            self.assertTrue(paths["filtered_raw"].exists())
+            self.assertTrue(paths["continuous_ica"].exists())
+            self.assertFalse(paths["epochs"].exists())
+            self.assertFalse(paths["epochs_ica"].exists())
+            self.assertFalse(paths["preprocessed"].exists())
+            self.assertEqual(panel._existing_derivative_paths_from_stage("raw"), [])
+            panel.close()
 
     def test_epoching_settings_preserve_selected_event_mapping(self):
         app = QApplication.instance()

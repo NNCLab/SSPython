@@ -171,6 +171,40 @@ class TestCore(unittest.TestCase):
         if hasattr(updated, "close"):
             updated.close()
 
+    def test_artifact_removal_uses_reviewed_raw_derivative(self):
+        """Pulse interpolation should run on raw inspection edits."""
+        output_dir = self.test_dir / "derivatives"
+        preprocessor = Preprocessor(self.raw_filepath, output_dir)
+
+        reviewed_raw = preprocessor.raw.copy()
+        reviewed_raw.drop_channels(["EEG 003"])
+        reviewed_raw.set_annotations(
+            mne.Annotations(
+                onset=[1.0],
+                duration=[0.0],
+                description=["TMS"],
+            )
+        )
+        preprocessor.update_raw_review(reviewed_raw)
+
+        preprocessor.run_artifact_removal(
+            window=(-0.001, 0.003),
+            smoothing=None,
+            event_id=[1],
+            verbose=False,
+        )
+
+        processed = mne.io.read_raw_fif(
+            preprocessor.paths["filtered_raw"],
+            preload=False,
+            verbose="error",
+        )
+        self.assertEqual(processed.ch_names, ["EEG 001", "EEG 002"])
+        self.assertEqual(len(processed.annotations), 1)
+        self.assertEqual(processed.annotations.description[0], "TMS")
+        if hasattr(processed, "close"):
+            processed.close()
+
     def test_epoching(self):
         """Test the epoching method."""
         output_dir = self.test_dir / "derivatives"

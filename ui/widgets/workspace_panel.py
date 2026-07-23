@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt, Signal, QSize
-from PySide6.QtGui import QFontMetrics, QPainter
+from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt, Signal, QSize, QUrl
+from PySide6.QtGui import QDesktopServices, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QMenu,
     QProgressBar,
     QPushButton,
     QStyle,
@@ -128,6 +129,7 @@ class DiscreteProgressWidget(QWidget):
 
 class StageStatusRow(QFrame):
     activated = Signal(str)
+    context_requested = Signal(str, object)
 
     def __init__(
         self,
@@ -161,21 +163,25 @@ class StageStatusRow(QFrame):
         bullet.setObjectName("stageDot")
         bullet.setProperty("state", state)
         bullet.setFixedSize(8, 8)
+        bullet.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         header_row.addWidget(bullet, 0, Qt.AlignmentFlag.AlignVCenter)
 
         title_label = QLabel(title)
         title_label.setObjectName("stageStatusLabel")
+        title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         header_row.addWidget(title_label, 1)
 
         if optional:
             optional_tag = QLabel("Optional")
             optional_tag.setObjectName("optionalTag")
+            optional_tag.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             header_row.addWidget(optional_tag, 0, Qt.AlignmentFlag.AlignRight)
 
         detail_label = QLabel(detail_text)
         detail_label.setObjectName("mutedLabel")
         detail_label.setWordWrap(True)
         detail_label.setToolTip(detail_tooltip)
+        detail_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         row_layout.addLayout(header_row)
         row_layout.addWidget(detail_label)
@@ -185,9 +191,14 @@ class StageStatusRow(QFrame):
             self.activated.emit(self.stage_id)
         super().mousePressEvent(event)
 
+    def contextMenuEvent(self, event):
+        self.context_requested.emit(self.stage_id, event.globalPos())
+        event.accept()
+
 
 class StageStatusList(QFrame):
     stage_clicked = Signal(str)
+    stage_context_requested = Signal(str, object)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -233,6 +244,7 @@ class StageStatusList(QFrame):
                 parent=self,
             )
             row.activated.connect(self.stage_clicked)
+            row.context_requested.connect(self.stage_context_requested)
             self.main_layout.addWidget(row)
 
         self.main_layout.addStretch()
@@ -397,6 +409,8 @@ class WorkspacePanel(QFrame):
 
 
 class DatasetInspectorPanel(QFrame):
+    derivatives_changed = Signal()
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("inspectorPanel")
@@ -440,6 +454,7 @@ class DatasetInspectorPanel(QFrame):
 
         self.stage_status_list = StageStatusList()
         self.stage_status_list.stage_clicked.connect(self._open_stage_details)
+        self.stage_status_list.stage_context_requested.connect(self._show_stage_context_menu)
         content_layout.addWidget(self.stage_status_list, 1)
 
         layout.addWidget(self.content_container, 1)
@@ -537,3 +552,113 @@ class DatasetInspectorPanel(QFrame):
             parent=self,
         )
         dialog.exec()
+
+    def _show_stage_context_menu(self, stage_id: str, global_pos):
+        if self.current_dataset is None:
+            return
+
+        stage_path = self.current_dataset.paths.get(stage_id)
+        if stage_path is None or not stage_path.exists():
+            return
+
+        menu = QMenu(self)
+        open_location_action = menu.addAction("Open File Location")
+
+        delete_paths = self._existing_derivative_paths_from_stage(stage_id)
+        delete_action = menu.addAction("Delete This and Subsequent Derivatives")
+        delete_action.setEnabled(bool(delete_paths))
+
+        selected_action = menu.exec(global_pos)
+        if selected_action == open_location_action:
+            self._open_file_location(stage_path)
+        elif selected_action == delete_action:
+            self._confirm_and_delete_derivatives(stage_id)
+
+    def _open_file_location(self, file_path: Path):
+        location = file_path.parent if file_path.is_file() else file_path
+        if not location.exists():
+            QMessageBox.warning(
+                self,
+                "Location not found",
+                f"The file location does not exist:\n{location}",
+            )
+            return
+
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(location)))
+        if not opened:
+            QMessageBox.warning(
+                self,
+                "Unable to open location",
+                f"Could not open the file location:\n{location}",
+            )
+
+    def _existing_derivative_paths_from_stage(self, stage_id: str) -> list[Path]:
+        if self.current_dataset is None or stage_id == "raw":
+            return []
+
+        try:
+            start_index = self.current_dataset.pipeline.stage_index(stage_id)
+        except ValueError:
+            return []
+
+        paths: list[Path] = []
+        for stage in self.current_dataset.pipeline.stages[start_index:]:
+            if stage.id == "raw":
+                continue
+            path = self.current_dataset.paths.get(stage.id)
+            if path is not None and path.exists() and path.is_file():
+                paths.append(path)
+        return paths
+
+    def _confirm_and_delete_derivatives(self, stage_id: str):
+        delete_paths = self._existing_derivative_paths_from_stage(stage_id)
+        if not delete_paths:
+            return
+
+        stage = self.current_dataset.stage_definition(stage_id) if self.current_dataset else None
+        stage_label = stage.label if stage else "selected stage"
+        file_word = "file" if len(delete_paths) == 1 else "files"
+        preview = "\n".join(path.name for path in delete_paths[:5])
+        if len(delete_paths) > 5:
+            preview += f"\n...and {len(delete_paths) - 5} more"
+
+        message_box = QMessageBox(self)
+        message_box.setIcon(QMessageBox.Icon.Warning)
+        message_box.setWindowTitle("Delete derivatives?")
+        message_box.setText(
+            f"Delete {len(delete_paths)} derivative {file_word} from {stage_label} onward?"
+        )
+        message_box.setInformativeText(
+            f"{preview}\n\nThis cannot be undone."
+        )
+        message_box.setDetailedText("\n".join(str(path) for path in delete_paths))
+        delete_button = message_box.addButton("Delete", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = message_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        message_box.setDefaultButton(cancel_button)
+        message_box.exec()
+
+        if message_box.clickedButton() != delete_button:
+            return
+
+        errors = self._delete_derivative_paths(delete_paths)
+        self.set_dataset(self.current_dataset)
+        self.derivatives_changed.emit()
+
+        if errors:
+            error_text = "\n".join(f"{path}: {error}" for path, error in errors)
+            QMessageBox.warning(
+                self,
+                "Unable to delete some derivatives",
+                error_text,
+            )
+
+    def _delete_derivative_paths(self, delete_paths: list[Path]) -> list[tuple[Path, str]]:
+        errors: list[tuple[Path, str]] = []
+        for path in delete_paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                errors.append((path, str(exc)))
+        return errors
