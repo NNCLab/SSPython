@@ -22,16 +22,15 @@ The software is currently in a pre-release stage. Validate all outputs before us
 - [8. Data Conversion and Merging](#8-data-conversion-and-merging)
 - [9. Main Interface Overview](#9-main-interface-overview)
 - [10. Preprocessing Workflow](#10-preprocessing-workflow)
-- [11. Continuous Analysis](#11-continuous-analysis)
-- [12. ERP and TEP Analysis](#12-erp-and-tep-analysis)
-- [13. Real-Time Visualization](#13-real-time-visualization)
-- [14. Preferences and Persistent Settings](#14-preferences-and-persistent-settings)
-- [15. Output Files and Naming](#15-output-files-and-naming)
-- [16. Repository Structure](#16-repository-structure)
-- [17. Testing](#17-testing)
-- [18. Packaging and Distribution](#18-packaging-and-distribution)
-- [19. Known Limitations and Assumptions](#19-known-limitations-and-assumptions)
-- [20. License](#20-license)
+- [11. Analysis](#11-analysis)
+- [12. Real-Time Visualization](#12-real-time-visualization)
+- [13. Preferences and Persistent Settings](#13-preferences-and-persistent-settings)
+- [14. Output Files and Naming](#14-output-files-and-naming)
+- [15. Repository Structure](#15-repository-structure)
+- [16. Testing](#16-testing)
+- [17. Packaging and Distribution](#17-packaging-and-distribution)
+- [18. Known Limitations and Assumptions](#18-known-limitations-and-assumptions)
+- [19. License](#19-license)
 
 ## 1. What SSPython Does
 
@@ -55,7 +54,7 @@ SSPython uses MNE-Python as its signal-processing foundation and recommends the 
 - Workspace browser that discovers all `*_raw.fif` files under the selected workspace.
 - Pipeline derivative tracking with progress indicators and stage inspection.
 - Interactive evoked plotting with single-click channel selection, event-condition dropdowns, and drag-to-topomap inspection.
-- PSD visualization for continuous data.
+- On-demand PSD visualization for preprocessed epochs.
 - ERP/TEP analysis tools including topoplot, response amplitude analysis, natural frequency analysis, and time-frequency analysis.
 - Real-time connection and plotting settings saved in application preferences.
 - Theme support and global plotting defaults.
@@ -259,8 +258,7 @@ The sidebar provides access to:
 - Home
 - Real-Time
 - Preprocessing
-- Continuous Analysis
-- ERP Analysis
+- Analysis
 - Preferences
 
 ### Workspace Panel
@@ -342,21 +340,9 @@ The core preprocessing logic lives in [processing.py](/C:/Users/DW60ZF/Documents
 - epoch ICA
 - final epoch filtering and output generation
 
-## 11. Continuous Analysis
+## 11. Analysis
 
-The continuous analysis page is implemented in [continuous_analysis_page.py](/C:/Users/DW60ZF/Documents/SSPython/ui/pages/continuous_analysis_page.py).
-
-Current functionality:
-
-- load the most recent continuous representation of a dataset
-- show a recording summary
-- display PSD through the PSD plot widget
-
-This page is intended for spectral inspection of raw or filtered continuous data, depending on what has already been generated for the selected dataset.
-
-## 12. ERP and TEP Analysis
-
-The ERP/TEP page is implemented in [erp_analysis_page.py](/C:/Users/DW60ZF/Documents/SSPython/ui/pages/erp_analysis_page.py).
+The analysis page is implemented in [erp_analysis_page.py](/C:/Users/DW60ZF/Documents/SSPython/ui/pages/erp_analysis_page.py).
 
 It is enabled when a dataset has reached the `preprocessed` stage.
 
@@ -364,6 +350,7 @@ It is enabled when a dataset has reached the `preprocessed` stage.
 
 - evoked plot
 - topoplot button
+- Plot PSD button with user-facing `mne.Epochs.plot_psd` parameters
 
 ### Analysis Tools
 
@@ -380,9 +367,9 @@ The shared evoked plot widget supports:
 - drag-range topomap creation
 - average-reference toggling
 
-This widget is reused across preprocessing and ERP/TEP analysis pages.
+This widget is reused across preprocessing and analysis pages.
 
-## 13. Real-Time Visualization
+## 12. Real-Time Visualization
 
 The real-time page wraps [RealTimeMainWidget](/C:/Users/DW60ZF/Documents/SSPython/ui/widgets/real_time_widget.py), which provides:
 
@@ -410,7 +397,7 @@ The live visualizer contains grouped views for:
 
 Real-time settings are persisted through the preferences system.
 
-## 14. Preferences and Persistent Settings
+## 13. Preferences and Persistent Settings
 
 The preferences page is implemented in [preferences_page.py](/C:/Users/DW60ZF/Documents/SSPython/ui/pages/preferences_page.py).
 
@@ -441,7 +428,7 @@ The settings layer supports:
 - default values for theme, output root, and active pipeline
 - per-pipeline settings paths
 
-## 15. Output Files and Naming
+## 14. Output Files and Naming
 
 Derivative naming is defined in [pipelines.py](/C:/Users/DW60ZF/Documents/SSPython/core/pipelines.py).
 
@@ -483,7 +470,7 @@ Derivatives are saved under:
 
 The default output root is `derivatives`.
 
-## 16. Repository Structure
+## 15. Repository Structure
 
 ```text
 SSPython/
@@ -507,7 +494,7 @@ SSPython/
 - [conversion.py](/C:/Users/DW60ZF/Documents/SSPython/core/conversion.py): generic import, MAT loading, montage application, and merging
 - [app_settings.py](/C:/Users/DW60ZF/Documents/SSPython/core/app_settings.py): persistent settings wrapper
 
-## 17. Testing
+## 16. Testing
 
 Run the full test suite with:
 
@@ -523,7 +510,7 @@ Targeted test files include:
 
 The test suite covers selected preprocessing logic, UI initialization, event handling, and conversion behavior. It is not yet a complete end-to-end validation harness.
 
-## 18. Packaging and Distribution
+## 17. Packaging and Distribution
 
 The repository includes packaging-related artifacts for Windows:
 
@@ -531,7 +518,7 @@ The repository includes packaging-related artifacts for Windows:
 
 These indicate a Windows packaging flow, creating Nuitka-built executables plus an Inno Setup installer.
 
-## 19. Known Limitations and Assumptions
+## 18. Known Limitations and Assumptions
 
 - SSPython discovers source datasets only from files ending in `*_raw.fif`.
 - `.mat` inputs require an external channel-info JSON file. Channel names and types are not inferred automatically.
@@ -541,6 +528,6 @@ These indicate a Windows packaging flow, creating Nuitka-built executables plus 
 - The project is pre-release and should not be treated as a validated clinical or publication pipeline without independent verification.
 - The documented path is Windows-first.
 
-## 20. License
+## 19. License
 
 See [LICENSE](/C:/Users/DW60ZF/Documents/SSPython/LICENSE).

@@ -1005,6 +1005,16 @@ class TMSEEGAnalysis:
                 if self.has("masked_ave")
                 else None
             ),
+            "stc": (
+                mne.read_source_estimate(self.paths["stc"])
+                if self.has("stc")
+                else None
+            ),
+            "stc_metadata": (
+                json.loads(self.paths["stc_metadata"].read_text(encoding="utf-8"))
+                if self.has("stc_metadata")
+                else None
+            ),
         }
         return all_derivatives
 

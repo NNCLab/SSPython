@@ -3,11 +3,31 @@ import tempfile
 from pathlib import Path
 import mne
 import numpy as np
+from matplotlib.backend_bases import MouseButton
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QListWidgetItem
 from main import MainWindow
 from core.pipelines import DatasetRecord, build_processing_paths, get_pipeline
+from ui.pages.erp_analysis_page import ErpAnalysisPage
 from ui.widgets.evoked_plot import EvokedPlotWidget
+from ui.widgets.psd_plot import PSDPlotSettingsWidget
+from ui.widgets.source_estimate_widget import (
+    ComputeSTCSettingsDialog,
+    STCSourceConfig,
+    metadata_to_source_config,
+    parse_covariance_methods,
+)
+from ui.widgets.time_frequency_widget import (
+    ComputeTFRSettingsDialog,
+    POWER_DB_MODE,
+    RAW_POWER_MODE,
+    TimeFrequencyDialog,
+    TimeFrequencyWidget,
+    apply_time_frequency_transform,
+    build_time_frequency_display,
+    parse_channel_selection,
+    parse_tfr_freqs,
+)
 from ui.widgets.preprocessing_widgets import (
     EpochingSettingsWidget,
     PreprocessingSettingsWidget,
@@ -48,6 +68,23 @@ class TestUI(unittest.TestCase):
             app = QApplication([])
         window = MainWindow()
         self.assertIsInstance(window, MainWindow)
+        window.close()
+
+    def test_main_window_navigation_uses_analysis_without_continuous_analysis(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+        window = MainWindow()
+
+        nav_labels = [
+            window.nav_list.item(index).text()
+            for index in range(window.nav_list.count())
+            if window.nav_list.item(index).text()
+        ]
+
+        self.assertIn("Analysis", nav_labels)
+        self.assertNotIn("Continuous Analysis", nav_labels)
+        self.assertNotIn("ERP Analysis", nav_labels)
         window.close()
 
     def test_object_info_widget_event_counts(self):
@@ -742,6 +779,30 @@ class TestUI(unittest.TestCase):
         self.assertEqual(second_axes_count, first_axes_count)
         widget.close()
 
+    def test_evoked_plot_widget_defaults_to_full_epoch_xlim(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        montage = mne.channels.make_standard_montage("standard_1020")
+        ch_names = montage.ch_names[:8]
+        info = mne.create_info(ch_names=ch_names, sfreq=1000, ch_types="eeg")
+        info.set_montage(montage)
+        evoked = mne.EvokedArray(
+            np.random.randn(len(ch_names), 1000) * 1e-6,
+            info,
+            tmin=-0.25,
+            verbose=False,
+        )
+
+        widget = EvokedPlotWidget()
+        widget.update_plot(evoked, label="Test")
+        x_min, x_max = widget.canvas.axes.get_xlim()
+
+        self.assertAlmostEqual(x_min, evoked.times[0] * 1000)
+        self.assertAlmostEqual(x_max, evoked.times[-1] * 1000)
+        widget.close()
+
     def test_evoked_plot_widget_exposes_event_selector_for_epochs(self):
         app = QApplication.instance()
         if app is None:
@@ -773,6 +834,8 @@ class TestUI(unittest.TestCase):
 
         widget = EvokedPlotWidget()
         widget.update_plot(epochs, label="Test")
+        app.processEvents()
+        self.assertFalse(widget.event_selector.isHidden())
         self.assertEqual(widget.event_selector.count(), 3)
         self.assertEqual(widget.event_selector.currentData()["code"], None)
 
@@ -783,6 +846,453 @@ class TestUI(unittest.TestCase):
         self.assertEqual(widget.selected_event_label, "Sham")
         self.assertIn("Sham", widget.title_label.text())
         widget.close()
+
+    def test_evoked_plot_widget_hides_event_selector_for_single_event(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        montage = mne.channels.make_standard_montage("standard_1020")
+        ch_names = montage.ch_names[:8]
+        info = mne.create_info(ch_names=ch_names, sfreq=1000, ch_types="eeg")
+        info.set_montage(montage)
+        data = np.random.randn(3, len(ch_names), 300) * 1e-6
+        events = np.array([[0, 0, 1], [400, 0, 1], [800, 0, 1]])
+        epochs = mne.EpochsArray(
+            data,
+            info,
+            events=events,
+            event_id={"Pulse": 1},
+            tmin=-0.1,
+            verbose=False,
+        )
+
+        widget = EvokedPlotWidget()
+        widget.update_plot(epochs, label="Test")
+
+        self.assertTrue(widget.event_selector.isHidden())
+        self.assertEqual(widget.event_selector.count(), 0)
+        self.assertIsNone(widget.selected_event_code)
+        widget.close()
+
+    def test_psd_plot_settings_widget_builds_epoch_plot_params(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(["Cz", "Pz"], sfreq=1000, ch_types="eeg")
+        epochs = mne.EpochsArray(
+            np.random.randn(3, 2, 300) * 1e-6,
+            info,
+            tmin=-0.1,
+            verbose=False,
+        )
+
+        widget = PSDPlotSettingsWidget(epochs)
+        widget.frequency_range_input.setValue((2.0, 40.0))
+        widget.time_range_input.setValue((-0.05, 0.19))
+        widget.picks_input.setText("Cz, Pz")
+        widget.method_input.setCurrentText("welch")
+        widget.average_input.setChecked(True)
+        widget.db_input.setChecked(False)
+        widget.xscale_input.setCurrentText("log")
+        widget.exclude_bads_input.setChecked(False)
+
+        params = widget.get_plot_params()
+
+        self.assertEqual(params["fmin"], 2.0)
+        self.assertEqual(params["fmax"], 40.0)
+        self.assertEqual(params["tmin"], -0.05)
+        self.assertEqual(params["tmax"], 0.19)
+        self.assertEqual(params["picks"], ["Cz", "Pz"])
+        self.assertEqual(params["method"], "welch")
+        self.assertTrue(params["average"])
+        self.assertFalse(params["dB"])
+        self.assertEqual(params["xscale"], "log")
+        self.assertEqual(params["exclude"], ())
+        self.assertIsNone(widget.validation_error())
+        widget.close()
+
+    def test_time_frequency_transform_applies_db_baseline(self):
+        power = np.array(
+            [
+                [1.0, 3.0, 6.0],
+                [2.0, 2.0, 8.0],
+            ]
+        )
+        times_s = np.array([-0.1, 0.0, 0.1])
+
+        transformed, units = apply_time_frequency_transform(
+            power,
+            times_s,
+            mode=POWER_DB_MODE,
+            baseline_s=(-0.1, 0.0),
+            apply_baseline=True,
+        )
+
+        expected = 10.0 * np.log10(power / np.array([[2.0], [2.0]]))
+        np.testing.assert_allclose(transformed, expected)
+        self.assertEqual(units, "Power (dB)")
+
+    def test_time_frequency_display_filters_channel_and_event(self):
+        info = mne.create_info(["Cz", "Pz"], sfreq=1000, ch_types="eeg")
+        events = np.array([[0, 0, 1], [200, 0, 2], [400, 0, 1]])
+        epochs = mne.EpochsArray(
+            np.random.randn(3, 2, 4) * 1e-6,
+            info,
+            events=events,
+            event_id={"Pulse": 1, "Sham": 2},
+            tmin=-0.001,
+            verbose=False,
+        )
+        freqs = np.array([8.0, 12.0])
+        tfr_data = np.ones((3, 2, 2, 4), dtype=float)
+        tfr_data[:, 0, :, :] = 2.0
+        tfr_data[:, 1, :, :] = 4.0
+        tfr_data[1, 1, :, :] = 8.0
+        tfr = mne.time_frequency.EpochsTFRArray(
+            info,
+            tfr_data,
+            epochs.times,
+            freqs,
+            events=events,
+            event_id={"Pulse": 1, "Sham": 2},
+        )
+
+        display = build_time_frequency_display(
+            epochs=epochs,
+            tfr=tfr,
+            channel_name="Pz",
+            event_code=2,
+            transform_mode=RAW_POWER_MODE,
+            apply_baseline=False,
+        )
+
+        np.testing.assert_allclose(display.values, np.full((2, 4), 8.0e12))
+        self.assertEqual(display.channel_label, "Pz")
+        self.assertEqual(display.event_label, "Sham")
+        self.assertEqual(display.n_epochs, 1)
+
+    def test_compute_tfr_settings_dialog_builds_mne_params(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(["Cz", "Pz"], sfreq=1000, ch_types="eeg")
+        epochs = mne.EpochsArray(
+            np.random.randn(2, 2, 20) * 1e-6,
+            info,
+            tmin=-0.01,
+            verbose=False,
+        )
+
+        dialog = ComputeTFRSettingsDialog(epochs)
+        dialog.method_combo.setCurrentText("multitaper")
+        dialog.freqs_input.setText("8:12:2")
+        dialog.time_range_input.setValue((-0.005, 0.009))
+        dialog.picks_input.setText("Cz, Pz")
+        dialog.proj_checkbox.setChecked(True)
+        dialog.output_combo.setCurrentText("power")
+        dialog.average_checkbox.setChecked(True)
+        dialog.return_itc_checkbox.setChecked(True)
+        dialog.decim_input.setValue(2)
+        dialog.n_jobs_checkbox.setChecked(True)
+        dialog.n_jobs_input.setValue(-1)
+        dialog.verbose_combo.setCurrentText("INFO")
+        dialog.n_cycles_input.setText("3.5")
+        dialog.time_bandwidth_input.setValue(5.0)
+
+        params = dialog.get_compute_params()
+
+        self.assertEqual(params["method"], "multitaper")
+        np.testing.assert_allclose(params["freqs"], np.array([8.0, 10.0, 12.0]))
+        self.assertEqual(params["tmin"], -0.005)
+        self.assertEqual(params["tmax"], 0.009)
+        self.assertEqual(params["picks"], ["Cz", "Pz"])
+        self.assertTrue(params["proj"])
+        self.assertEqual(params["output"], "power")
+        self.assertTrue(params["average"])
+        self.assertTrue(params["return_itc"])
+        self.assertEqual(params["decim"], 2)
+        self.assertEqual(params["n_jobs"], -1)
+        self.assertEqual(params["verbose"], "INFO")
+        self.assertEqual(params["n_cycles"], 3.5)
+        self.assertTrue(params["use_fft"])
+        self.assertTrue(params["zero_mean"])
+        self.assertEqual(params["time_bandwidth"], 5.0)
+        dialog.close()
+
+    def test_compute_stc_settings_dialog_builds_mne_params(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(["Cz", "Pz"], sfreq=1000, ch_types="eeg")
+        events = np.array([[0, 0, 1], [100, 0, 2]])
+        epochs = mne.EpochsArray(
+            np.random.randn(2, 2, 20) * 1e-6,
+            info,
+            events=events,
+            event_id={"Pulse": 1, "Sham": 2},
+            tmin=-0.01,
+            verbose=False,
+        )
+
+        dialog = ComputeSTCSettingsDialog(epochs)
+        self.assertFalse(dialog.isModal())
+        dialog.condition_combo.setCurrentText("Pulse")
+        dialog.noise_window_input.setValue((-0.01, 0.0))
+        dialog.noise_method_input.setText("empirical")
+        dialog.rank_combo.setCurrentText("info")
+        dialog.mindist_input.setValue(7.5)
+        dialog.n_jobs_checkbox.setChecked(True)
+        dialog.n_jobs_input.setValue(2)
+        dialog.loose_input.setValue(0.4)
+        dialog.depth_input.setValue(0.6)
+        dialog.inverse_method_combo.setCurrentText("sLORETA")
+        dialog.snr_input.setValue(4.0)
+        dialog.pick_ori_combo.setCurrentText("normal")
+
+        params = dialog.get_compute_params()
+
+        self.assertIsInstance(params["source_config"], STCSourceConfig)
+        self.assertEqual(params["source_config"].mode, "fsaverage")
+        self.assertEqual(params["condition"], "Pulse")
+        self.assertTrue(params["pick_eeg"])
+        self.assertTrue(params["set_eeg_reference"])
+        self.assertEqual(params["noise_tmin"], -0.01)
+        self.assertEqual(params["noise_tmax"], 0.0)
+        self.assertEqual(params["noise_method"], "empirical")
+        self.assertEqual(params["rank"], "info")
+        self.assertEqual(params["mindist"], 7.5)
+        self.assertEqual(params["n_jobs"], 2)
+        self.assertEqual(params["loose"], 0.4)
+        self.assertEqual(params["depth"], 0.6)
+        self.assertEqual(params["inverse_method"], "sLORETA")
+        self.assertEqual(params["snr"], 4.0)
+        self.assertEqual(params["pick_ori"], "normal")
+        self.assertEqual(parse_covariance_methods("shrunk, empirical"), ["shrunk", "empirical"])
+        dialog.close()
+
+    def test_stc_metadata_maps_to_source_config(self):
+        metadata = {
+            "source": {
+                "mode": "custom",
+                "subject": "sub-01",
+                "subjects_dir": "subjects",
+                "src": "sub-01-src.fif",
+                "bem": "sub-01-bem-sol.fif",
+                "trans": "sub-01-trans.fif",
+            }
+        }
+
+        config = metadata_to_source_config(metadata)
+
+        self.assertEqual(config.mode, "custom")
+        self.assertEqual(config.subject, "sub-01")
+        self.assertEqual(config.subjects_dir, Path("subjects"))
+        self.assertEqual(config.src, Path("sub-01-src.fif"))
+        self.assertEqual(config.bem, Path("sub-01-bem-sol.fif"))
+        self.assertEqual(config.trans, Path("sub-01-trans.fif"))
+
+    def test_tfr_frequency_parser_supports_stockwell_auto(self):
+        self.assertEqual(parse_tfr_freqs("auto", method="stockwell"), "auto")
+        np.testing.assert_allclose(
+            parse_tfr_freqs("8, 45", method="stockwell"),
+            np.array([8.0, 45.0]),
+        )
+        with self.assertRaises(ValueError):
+            parse_tfr_freqs("auto", method="morlet")
+
+    def test_channel_selection_parser_accepts_typed_names(self):
+        available = ["Cz", "Pz", "EEG 001"]
+        self.assertEqual(parse_channel_selection("Cz, Pz", available), ["Cz", "Pz"])
+        self.assertEqual(parse_channel_selection("cz", available), ["Cz"])
+        self.assertEqual(parse_channel_selection("EEG 001", available), ["EEG 001"])
+        self.assertIsNone(parse_channel_selection("", available))
+        with self.assertRaises(ValueError):
+            parse_channel_selection("Missing", available)
+
+    def test_time_frequency_widget_is_non_modal_and_updates_roi_marginals(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(["Cz", "Pz", "Fz"], sfreq=1000, ch_types="eeg")
+        events = np.array([[0, 0, 1], [200, 0, 1]])
+        epochs = mne.EpochsArray(
+            np.random.randn(2, 3, 20) * 1e-6,
+            info,
+            events=events,
+            event_id={"Pulse": 1},
+            tmin=-0.01,
+            verbose=False,
+        )
+        freqs = np.array([6.0, 10.0, 20.0])
+        tfr = mne.time_frequency.EpochsTFRArray(
+            info,
+            np.abs(np.random.randn(2, 3, 3, 20)) + 1.0,
+            epochs.times,
+            freqs,
+            events=events,
+            event_id={"Pulse": 1},
+        )
+        itc = mne.time_frequency.AverageTFRArray(
+            info,
+            np.full((3, 3, 20), 0.5),
+            epochs.times,
+            freqs,
+        )
+
+        widget = TimeFrequencyWidget(
+            epochs,
+            label="Test TF",
+            tfr_derivatives={
+                "Power (TFR)": tfr,
+                "Inter-trial coherence (ITC)": itc,
+            },
+        )
+        self.assertIsNotNone(widget.image_artist)
+        self.assertFalse(hasattr(widget, "dock_button"))
+        self.assertFalse(hasattr(widget, "close_button"))
+        self.assertFalse(hasattr(widget, "band_checkboxes"))
+        self.assertFalse(hasattr(widget, "link_time_checkbox"))
+        self.assertFalse(hasattr(widget, "compute_button"))
+        self.assertEqual(widget.derivative_combo.count(), 2)
+        self.assertTrue(hasattr(widget, "channels_input"))
+        self.assertTrue(hasattr(widget, "channel_picker_button"))
+        self.assertEqual(len(widget.erp_channel_lines), 3)
+        self.assertIsNone(widget.erp_average_line)
+        widget._set_selected_channels(["Cz", "Pz"])
+        self.assertEqual(widget._selected_channels(), ["Cz", "Pz"])
+        self.assertEqual(len(widget.erp_channel_lines), 2)
+        self.assertIsNotNone(widget.erp_average_line)
+        self.assertEqual(widget.erp_average_line.get_color(), "black")
+
+        widget.canvas.draw()
+        self.assertGreater(
+            widget.spectrum_ax.get_position().x0,
+            widget.main_ax.get_position().x1,
+        )
+        self.assertGreater(
+            widget.erp_ax.get_position().y0,
+            widget.main_ax.get_position().y1,
+        )
+        self.assertTrue(
+            widget.spectrum_ax.get_shared_y_axes().joined(
+                widget.spectrum_ax,
+                widget.main_ax,
+            )
+        )
+        self.assertLess(
+            widget.time_power_ax.get_position().y1,
+            widget.main_ax.get_position().y0,
+        )
+        self.assertTrue(
+            widget.time_power_ax.get_shared_x_axes().joined(
+                widget.time_power_ax,
+                widget.main_ax,
+            )
+        )
+        self.assertGreater(
+            widget.slider_ax.get_position().x0 - widget.colorbar_ax.get_position().x1,
+            0.02,
+        )
+        self.assertFalse(widget.settings_panel.isHidden())
+        widget.controls_toggle_button.setChecked(False)
+        app.processEvents()
+        self.assertTrue(widget.settings_panel.isHidden())
+        widget.controls_toggle_button.setChecked(True)
+        app.processEvents()
+        self.assertFalse(widget.settings_panel.isHidden())
+
+        widget.derivative_combo.setCurrentIndex(1)
+        app.processEvents()
+        self.assertEqual(widget.current_derivative_key, "Inter-trial coherence (ITC)")
+
+        widget._set_roi_from_values(0.0, 8.0, 8.0, 12.0, update_controls=True, draw=True)
+        self.assertAlmostEqual(widget.roi_time_start_input.value(), 0.0)
+        self.assertAlmostEqual(widget.roi_time_stop_input.value(), 8.0)
+        self.assertAlmostEqual(widget.roi_freq_low_input.value(), 8.0)
+        self.assertAlmostEqual(widget.roi_freq_high_input.value(), 12.0)
+        self.assertIn("Mean:", widget.roi_mean_label.text())
+        self.assertEqual(len(widget.time_power_line.get_xdata()), len(epochs.times))
+
+        class PlotEvent:
+            def __init__(self, xdata, ydata, axis):
+                self.inaxes = axis
+                self.button = MouseButton.LEFT
+                self.xdata = xdata
+                self.ydata = ydata
+                self.x, self.y = axis.transData.transform((xdata, ydata))
+
+        widget._on_button_press(PlotEvent(0.0, 8.0, widget.main_ax))
+        widget._on_button_release(PlotEvent(6.0, 12.0, widget.main_ax))
+        self.assertAlmostEqual(widget.roi_time_start_input.value(), 0.0)
+        self.assertAlmostEqual(widget.roi_time_stop_input.value(), 6.0)
+        self.assertAlmostEqual(widget.roi_freq_low_input.value(), 8.0)
+        self.assertAlmostEqual(widget.roi_freq_high_input.value(), 12.0)
+
+        class HoverEvent:
+            def __init__(self, xdata, ydata, axis):
+                self.inaxes = axis
+                self.xdata = xdata
+                self.ydata = ydata
+                self.x, self.y = axis.transData.transform((xdata, ydata))
+
+        widget._on_mouse_move(HoverEvent(0.0, 0.0, widget.erp_ax))
+        self.assertTrue(widget.erp_tooltip.get_visible())
+        self.assertTrue(widget.erp_hover_vline.get_visible())
+        self.assertTrue(widget.erp_hover_hline.get_visible())
+        self.assertIn("Time:", widget.erp_tooltip.get_text())
+        widget._on_mouse_move(HoverEvent(0.0, 0.0, widget.time_power_ax))
+        self.assertTrue(widget.time_power_tooltip.get_visible())
+        self.assertTrue(widget.time_power_hover_vline.get_visible())
+        self.assertTrue(widget.time_power_hover_hline.get_visible())
+        self.assertIn("Avg power:", widget.time_power_tooltip.get_text())
+        widget._on_mouse_move(HoverEvent(0.0, 10.0, widget.spectrum_ax))
+        self.assertTrue(widget.spectrum_tooltip.get_visible())
+        self.assertTrue(widget.spectrum_hover_vline.get_visible())
+        self.assertTrue(widget.spectrum_hover_hline.get_visible())
+        self.assertIn("Freq:", widget.spectrum_tooltip.get_text())
+
+        dialog = TimeFrequencyDialog(widget=widget)
+        self.assertFalse(dialog.isModal())
+        self.assertGreaterEqual(dialog.minimumWidth(), 900)
+        dialog.close()
+
+    def test_analysis_page_time_frequency_button_requires_derivatives(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        page = ErpAnalysisPage()
+
+        class FakeAnalysis:
+            derivatives = {}
+
+        page.tep = FakeAnalysis()
+        self.assertFalse(page._has_time_frequency_derivatives())
+        self.assertFalse(page._has_source_estimate_derivative())
+
+        page.tep.derivatives = {"tfr": object(), "itc": None}
+        self.assertTrue(page._has_time_frequency_derivatives())
+        self.assertEqual(
+            list(page._available_time_frequency_derivatives().keys()),
+            ["Power (TFR)"],
+        )
+        self.assertEqual(page.tf_button.text(), "Compute TFR")
+        self.assertEqual(page.time_frequency_button.text(), "Plot TFR")
+        self.assertIs(page.tf_button.parentWidget(), page.analysis_group)
+        self.assertIs(page.time_frequency_button.parentWidget(), page.analysis_group)
+
+        page.tep.derivatives = {"stc": object(), "stc_metadata": None}
+        self.assertTrue(page._has_source_estimate_derivative())
+        self.assertEqual(page.stc_button.text(), "Compute STC")
+        self.assertEqual(page.source_estimate_button.text(), "Plot STC")
+        self.assertIs(page.stc_button.parentWidget(), page.analysis_group)
+        self.assertIs(page.source_estimate_button.parentWidget(), page.analysis_group)
+        page.close()
 
     def test_preprocessing_settings_widget_supports_average_reference(self):
         app = QApplication.instance()

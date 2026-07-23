@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
 
 from core.app_settings import get_settings_store
 from core.pipelines import all_pipelines, get_pipeline
-from ui.pages.continuous_analysis_page import ContinuousAnalysisPage
 from ui.pages.erp_analysis_page import ErpAnalysisPage
 from ui.pages.home_page import HomePage
 from ui.pages.preferences_page import PreferencesPage
@@ -68,8 +67,7 @@ class MainWindow(QMainWindow):
         None,
         ("assets/icons/erp_preprocess.svg", "Preprocessing", ProcessingPage),
         None,
-        ("assets/icons/cont_analysis.svg", "Continuous Analysis", ContinuousAnalysisPage),
-        ("assets/icons/erp_analysis.svg", "ERP Analysis", ErpAnalysisPage),
+        ("assets/icons/erp_analysis.svg", "Analysis", ErpAnalysisPage),
         None,
         ("assets/icons/settings.svg", "Preferences", PreferencesPage),
     ]

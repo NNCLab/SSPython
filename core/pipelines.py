@@ -416,6 +416,10 @@ def build_analysis_paths(
         "itc": base_dir / derivative_filename(source_stem, "itc", "itc", ".h5"),
         "itc_mask": base_dir / derivative_filename(source_stem, "itcmask", "mask", ".npy"),
         "masked_ave": base_dir / derivative_filename(source_stem, "maskedave", "ave", ".fif"),
+        "stc": base_dir / derivative_filename(source_stem, "stc", "stc", ".h5"),
+        "stc_metadata": base_dir / derivative_filename(
+            source_stem, "stc", "metadata", ".json"
+        ),
     }
     if create_dirs:
         for path in paths.values():

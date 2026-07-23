@@ -116,7 +116,8 @@ class EvokedPlotWidget(QWidget):
         self.progress_dialog = progress_dialog
         self.figsize = figsize
         self.dpi = dpi
-        self.params = params or {}
+        self._explicit_params = dict(params or {})
+        self.params = {}
         self.source_data = None
         self.epochs = None
         self.evoked = None
@@ -147,17 +148,14 @@ class EvokedPlotWidget(QWidget):
             QComboBox.SizeAdjustPolicy.AdjustToContents
         )
         self.channel_label = QLabel()
-        self.event_label.hide()
-        self.event_selector.hide()
-        self.channel_label.hide()
 
         self.topbar = QToolBar()
         self.topbar.setMovable(False)
 
         self.topbar.addWidget(self.reference_widget)
-        self.topbar.addWidget(self.event_label)
-        self.topbar.addWidget(self.event_selector)
-        self.topbar.addWidget(self.channel_label)
+        self.event_label_action = self.topbar.addWidget(self.event_label)
+        self.event_selector_action = self.topbar.addWidget(self.event_selector)
+        self.channel_label_action = self.topbar.addWidget(self.channel_label)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.topbar.addWidget(spacer)
@@ -172,6 +170,9 @@ class EvokedPlotWidget(QWidget):
         layout.addWidget(self.topbar)
         layout.addWidget(self.canvas)
         layout.addWidget(self.toolbar)
+        self._set_event_selector_visible(False)
+        self.channel_label_action.setVisible(False)
+        self.channel_label.hide()
 
     def init_params(self):
         # Initialize instance variables
@@ -190,7 +191,6 @@ class EvokedPlotWidget(QWidget):
 
         self.default_params = {
             "baseline": (None, 0),
-            "evoked_xlim": (-200, 500),
             "spatial_colors": True,
             "time_unit": "ms",
             "gfp": False,
@@ -198,11 +198,21 @@ class EvokedPlotWidget(QWidget):
         }
 
     def _load_plot_params(self):
-        self.params = get_settings_store().get(
+        stored_params = get_settings_store().get(
             "appearance/plots/global",
             self.default_params,
             legacy_keys=("plot_settings/plot_params",),
         )
+        if not isinstance(stored_params, dict):
+            stored_params = {}
+        else:
+            stored_params = dict(stored_params)
+        stored_params.pop("evoked_xlim", None)
+        self.params = {
+            **self.default_params,
+            **stored_params,
+            **self._explicit_params,
+        }
         update_toolbar_color(self.toolbar)
 
     def _reset_canvas(self):
@@ -218,6 +228,8 @@ class EvokedPlotWidget(QWidget):
         self._set_selected_channel(None)
 
     def _set_event_selector_visible(self, visible: bool):
+        self.event_label_action.setVisible(visible)
+        self.event_selector_action.setVisible(visible)
         self.event_label.setVisible(visible)
         self.event_selector.setVisible(visible)
 
@@ -238,8 +250,13 @@ class EvokedPlotWidget(QWidget):
         for event_name, event_code in (epochs.event_id or {}).items():
             names_by_code.setdefault(int(event_code), []).append(str(event_name))
 
+        event_codes = sorted({int(code) for code in epochs.events[:, 2]})
+        if len(event_codes) <= 1:
+            self._clear_event_selector()
+            return
+
         event_options = [{"label": "All events", "code": None, "title": None}]
-        for event_code in sorted({int(code) for code in epochs.events[:, 2]}):
+        for event_code in event_codes:
             names = names_by_code.get(event_code, [])
             if len(names) == 1 and names[0].isdigit() and int(names[0]) == event_code:
                 event_label = f"Event {event_code}"
@@ -321,9 +338,11 @@ class EvokedPlotWidget(QWidget):
         self.selected_channel_name = channel_name
         if channel_name:
             self.channel_label.setText(f"Channel: {channel_name}")
+            self.channel_label_action.setVisible(True)
             self.channel_label.show()
         else:
             self.channel_label.clear()
+            self.channel_label_action.setVisible(False)
             self.channel_label.hide()
 
     def _prepare_display_evoked(self, evoked: mne.Evoked) -> mne.Evoked:
@@ -366,7 +385,7 @@ class EvokedPlotWidget(QWidget):
             axes=self.canvas.axes,
             show=False,
             selectable=False,
-            xlim=self.params.get("evoked_xlim", (-200, 500)),
+            xlim=self.params.get("evoked_xlim") or "tight",
             spatial_colors=self.params.get("spatial_colors", True),
             time_unit=self.params.get("time_unit", "ms"),
             gfp=self.params.get("gfp", False),

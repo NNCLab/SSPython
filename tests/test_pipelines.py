@@ -9,6 +9,7 @@ from core.pipelines import (
     PipelineDefinition,
     PipelineStage,
     all_pipelines,
+    build_analysis_paths,
     discover_datasets,
     get_pipeline,
 )
@@ -132,6 +133,33 @@ class TestPipelines(unittest.TestCase):
                 / "sub-01"
                 / "eeg"
                 / "sub-01_task-rest_desc-custom_epo.fif",
+            )
+
+    def test_analysis_paths_include_source_estimate_derivatives(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            derivative_root = Path(tmp_dir) / "derivatives" / "standard"
+            preprocessed_path = (
+                derivative_root
+                / "sub-01"
+                / "eeg"
+                / "sub-01_task-tms_desc-preprocessed_epo.fif"
+            )
+
+            paths = build_analysis_paths(preprocessed_path, derivative_root)
+
+            self.assertEqual(
+                paths["stc"],
+                derivative_root
+                / "sub-01"
+                / "eeg"
+                / "sub-01_task-tms_desc-stc_stc.h5",
+            )
+            self.assertEqual(
+                paths["stc_metadata"],
+                derivative_root
+                / "sub-01"
+                / "eeg"
+                / "sub-01_task-tms_desc-stc_metadata.json",
             )
 
     def test_settings_migrate_active_legacy_pipeline_to_standard(self):

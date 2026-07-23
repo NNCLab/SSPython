@@ -1,14 +1,26 @@
 import logging
+import json
+from datetime import datetime
+from pathlib import Path
 
 import mne
 
 from PySide6.QtCore import Slot
-from PySide6.QtWidgets import QGroupBox, QLabel, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import QDialog, QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout
 
 from core.processing import TMSEEGAnalysis
 from ui.widgets.evoked_plot import EvokedPlotWidget
+from ui.widgets.psd_plot import PSDPlotSettingsDialog
 from ui.widgets.tep_analysis.excitability import ExcitabilityApp
 from ui.widgets.tep_analysis.natural_frequency import NaturalFrequencyApp
+from ui.widgets.source_estimate_widget import (
+    ComputeSTCSettingsDialog,
+    STCSourceConfig,
+    compute_stc,
+    metadata_to_source_config,
+    prepare_stc_source_model,
+)
+from ui.widgets.time_frequency_widget import ComputeTFRSettingsDialog, TimeFrequencyDialog
 from ui.widgets.tools.object_info_widget import ObjectInfoWidget
 from utils import Worker
 
@@ -19,11 +31,14 @@ logger = logging.getLogger(__name__)
 
 class ErpAnalysisPage(BasePage):
     def __init__(self, parent=None):
-        super().__init__("ERP / TEP Analysis", parent)
+        super().__init__("Analysis", parent)
         self.main_window = parent
         self.current_dataset = None
         self.tep: TMSEEGAnalysis | None = None
         self._needs_reload = False
+        self.time_frequency_dialogs: list[TimeFrequencyDialog] = []
+        self.source_estimate_dialogs: list[ComputeSTCSettingsDialog] = []
+        self.source_estimate_brain = None
 
         self.context_label = QLabel("Select a dataset that has reached the preprocessed stage.")
         self.context_label.setObjectName("contextCard")
@@ -58,7 +73,9 @@ class ErpAnalysisPage(BasePage):
         layout.addWidget(self.evoked_plot_widget)
 
         self.topoplot_button = QPushButton("Topoplot")
+        self.psd_button = QPushButton("Plot PSD")
         layout.addWidget(self.topoplot_button)
+        layout.addWidget(self.psd_button)
         return group
 
     def _create_analysis_group(self) -> QGroupBox:
@@ -66,11 +83,22 @@ class ErpAnalysisPage(BasePage):
         layout = QVBoxLayout(group)
         self.excitability_button = QPushButton("Response Amplitude Analysis")
         self.nf_button = QPushButton("Natural Frequency Analysis")
-        self.tf_button = QPushButton("Run Time-Frequency Analysis")
+        self.tf_button = QPushButton("Compute TFR")
+        self.time_frequency_button = QPushButton("Plot TFR")
+        tfr_button_row = QHBoxLayout()
+        tfr_button_row.addWidget(self.tf_button)
+        tfr_button_row.addWidget(self.time_frequency_button)
+
+        self.stc_button = QPushButton("Compute STC")
+        self.source_estimate_button = QPushButton("Plot STC")
+        stc_button_row = QHBoxLayout()
+        stc_button_row.addWidget(self.stc_button)
+        stc_button_row.addWidget(self.source_estimate_button)
 
         layout.addWidget(self.excitability_button)
         layout.addWidget(self.nf_button)
-        layout.addWidget(self.tf_button)
+        layout.addLayout(tfr_button_row)
+        layout.addLayout(stc_button_row)
         return group
 
     def _connect_to_main_window(self):
@@ -82,9 +110,13 @@ class ErpAnalysisPage(BasePage):
         self._needs_reload = True
 
         self.topoplot_button.clicked.connect(self.topoplot)
+        self.psd_button.clicked.connect(self.plot_psd)
+        self.time_frequency_button.clicked.connect(self.open_time_frequency_widget)
         self.excitability_button.clicked.connect(self.run_excitability)
         self.nf_button.clicked.connect(self.run_natural_frequency)
         self.tf_button.clicked.connect(self.run_time_frequency)
+        self.stc_button.clicked.connect(self.run_source_estimate)
+        self.source_estimate_button.clicked.connect(self.plot_source_estimate)
 
     @Slot(object)
     def on_dataset_changed(self, dataset):
@@ -149,9 +181,13 @@ class ErpAnalysisPage(BasePage):
             self.evoked_plot_widget.update_plot(None)
 
         self.topoplot_button.setEnabled(has_data)
+        self.psd_button.setEnabled(has_data)
+        self.time_frequency_button.setEnabled(has_data and self._has_time_frequency_derivatives())
+        self.source_estimate_button.setEnabled(has_data and self._has_source_estimate_derivative())
         self.excitability_button.setEnabled(has_data)
         self.nf_button.setEnabled(has_data)
         self.tf_button.setEnabled(has_data)
+        self.stc_button.setEnabled(has_data)
         self.evoked_plot_widget.setVisible(has_data)
 
     @Slot()
@@ -196,14 +232,265 @@ class ErpAnalysisPage(BasePage):
         dialog = NaturalFrequencyApp(self.tep.epochs, parent=self)
         dialog.exec()
 
+    def plot_psd(self):
+        if not self.tep or self.tep.epochs is None:
+            return
+
+        dialog = PSDPlotSettingsDialog(self.tep.epochs, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            self.tep.epochs.plot_psd(**dialog.get_plot_params(), show=True)
+        except Exception as exc:
+            logger.exception("PSD plotting failed")
+            QMessageBox.critical(self, "PSD Plot Failed", str(exc))
+
+    def _available_time_frequency_derivatives(self) -> dict[str, object]:
+        if not self.tep or not hasattr(self.tep, "derivatives"):
+            return {}
+        derivatives = self.tep.derivatives or {}
+        available: dict[str, object] = {}
+        if derivatives.get("tfr") is not None:
+            available["Power (TFR)"] = derivatives["tfr"]
+        if derivatives.get("itc") is not None:
+            available["Inter-trial coherence (ITC)"] = derivatives["itc"]
+        return available
+
+    def _has_time_frequency_derivatives(self) -> bool:
+        return bool(self._available_time_frequency_derivatives())
+
+    def _available_source_estimate(self):
+        if not self.tep or not hasattr(self.tep, "derivatives"):
+            return None
+        derivatives = self.tep.derivatives or {}
+        return derivatives.get("stc")
+
+    def _has_source_estimate_derivative(self) -> bool:
+        return self._available_source_estimate() is not None
+
+    def _forget_time_frequency_dialog(self, dialog: TimeFrequencyDialog):
+        if dialog in self.time_frequency_dialogs:
+            self.time_frequency_dialogs.remove(dialog)
+
+    def _show_time_frequency_dialog(self):
+        if not self.tep or self.tep.epochs is None:
+            return
+        tfr_derivatives = self._available_time_frequency_derivatives()
+        if not tfr_derivatives:
+            return
+        dialog = TimeFrequencyDialog(
+            self.tep.epochs,
+            label=self.tep.label,
+            tfr_derivatives=tfr_derivatives,
+            parent=self,
+        )
+        dialog.finished.connect(lambda: self._forget_time_frequency_dialog(dialog))
+        self.time_frequency_dialogs.append(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def open_time_frequency_widget(self):
+        if not self.tep or self.tep.epochs is None:
+            return
+        if not self._has_time_frequency_derivatives():
+            return
+        self._show_time_frequency_dialog()
+
     def run_time_frequency(self):
         if not self.tep:
             return
+        dialog = ComputeTFRSettingsDialog(self.tep.epochs, parent=self)
+        dialog.return_itc_checkbox.setChecked(True)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        compute_params = dialog.get_compute_params()
+
+        def compute_and_save():
+            result = self.tep.epochs.copy().compute_tfr(**compute_params)
+            if isinstance(result, tuple):
+                tfr, itc = result
+            else:
+                tfr, itc = result, None
+
+            self.tep.derivatives["tfr"] = tfr
+            tfr.save(self.tep.paths["tfr"], overwrite=True, verbose=False)
+            if itc is not None:
+                self.tep.derivatives["itc"] = itc
+                itc.save(self.tep.paths["itc"], overwrite=True, verbose=False)
+            return result
+
         worker = Worker(
-            lambda: self.tep.run_tfr_analysis(overwrite=True),
+            compute_and_save,
             parent=self,
             add_loggers="mne",
         )
         worker.exec_with_dialog("Please wait", "Running Time-Frequency Analysis...")
+        if getattr(worker, "_error", None):
+            return
+        if hasattr(self.tep, "_get_derivatives"):
+            self.tep.derivatives = self.tep._get_derivatives()
         self._needs_reload = True
         self.update_ui_state()
+        self.open_time_frequency_widget()
+
+    def run_source_estimate(self):
+        if not self.tep or self.tep.epochs is None:
+            return
+        dialog = ComputeSTCSettingsDialog(self.tep.epochs, parent=self)
+        dialog.accepted.connect(lambda: self._compute_source_estimate_from_dialog(dialog))
+        dialog.finished.connect(lambda: self._forget_source_estimate_dialog(dialog))
+        self.source_estimate_dialogs.append(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _compute_source_estimate_from_dialog(self, dialog: ComputeSTCSettingsDialog):
+        if not self.tep or self.tep.epochs is None:
+            return
+        compute_params = dialog.get_compute_params()
+
+        def compute_and_save():
+            stc, source_model = compute_stc(self.tep.epochs, **compute_params)
+            self.tep.paths["stc"].parent.mkdir(parents=True, exist_ok=True)
+            stc.save(self.tep.paths["stc"], ftype="h5", overwrite=True, verbose=False)
+
+            metadata = self._stc_metadata(compute_params, source_model)
+            self.tep.paths["stc_metadata"].write_text(
+                json.dumps(metadata, indent=2),
+                encoding="utf-8",
+            )
+            return stc, metadata
+
+        worker = Worker(
+            compute_and_save,
+            parent=self,
+            add_loggers="mne",
+        )
+        result = worker.exec_with_dialog("Please wait", "Computing source time course...")
+        if result is None or getattr(worker, "_error", None):
+            return
+
+        stc, metadata = result
+        self.tep.derivatives["stc"] = stc
+        self.tep.derivatives["stc_metadata"] = metadata
+        if hasattr(self.tep, "_get_derivatives"):
+            self.tep.derivatives = self.tep._get_derivatives()
+        self._needs_reload = True
+        self.update_ui_state()
+        self.plot_source_estimate()
+
+    def _forget_source_estimate_dialog(self, dialog: ComputeSTCSettingsDialog):
+        if dialog in self.source_estimate_dialogs:
+            self.source_estimate_dialogs.remove(dialog)
+
+    def plot_source_estimate(self):
+        if not self.tep:
+            return
+        stc = self._available_source_estimate()
+        if stc is None:
+            return
+
+        source_config = self._source_config_for_stc_plot(stc)
+        if source_config is None:
+            QMessageBox.warning(
+                self,
+                "Missing STC Metadata",
+                "This STC does not include enough source-space metadata to plot. "
+                "Recompute it with the source files selected.",
+            )
+            return
+
+        worker = Worker(
+            lambda: prepare_stc_source_model(source_config),
+            parent=self,
+            add_loggers="mne",
+        )
+        source_model = worker.exec_with_dialog(
+            "Please wait",
+            "Preparing source model files...",
+        )
+        if source_model is None:
+            return
+
+        try:
+            self.source_estimate_brain = stc.plot(
+                subject=source_model.subject,
+                subjects_dir=source_model.subjects_dir,
+                hemi=self._stc_plot_hemi(stc),
+                colormap="turbo",
+                views="dorsal",
+                initial_time=self._stc_initial_time(stc),
+                time_unit="s",
+                size=(800, 800),
+                smoothing_steps=5,
+                time_viewer=True,
+                surface="pial",
+                title=self.tep.label,
+            )
+        except Exception as exc:
+            logger.exception("STC plotting failed")
+            QMessageBox.critical(self, "STC Plot Failed", str(exc))
+
+    def _source_config_for_stc_plot(self, stc) -> STCSourceConfig | None:
+        derivatives = self.tep.derivatives if self.tep and self.tep.derivatives else {}
+        source_config = metadata_to_source_config(derivatives.get("stc_metadata"))
+        if source_config is not None:
+            return source_config
+
+        subject = getattr(stc, "subject", None) or "fsaverage"
+        if subject == "fsaverage":
+            return STCSourceConfig(mode="fsaverage")
+        return None
+
+    @staticmethod
+    def _stc_plot_hemi(stc) -> str:
+        vertices = getattr(stc, "vertices", [])
+        if len(vertices) > 1 and len(vertices[0]) and len(vertices[1]):
+            return "both"
+        if len(vertices) > 1 and len(vertices[1]):
+            return "rh"
+        return "lh"
+
+    @staticmethod
+    def _stc_initial_time(stc) -> float | None:
+        vertices = getattr(stc, "vertices", [])
+        hemi = "rh" if len(vertices) > 1 and len(vertices[1]) else "lh"
+        try:
+            _, time_max = stc.get_peak(hemi=hemi)
+        except Exception:
+            return None
+        return float(time_max)
+
+    @classmethod
+    def _stc_metadata(cls, compute_params: dict[str, object], source_model) -> dict[str, object]:
+        return {
+            "created": datetime.now().isoformat(),
+            "source": source_model.to_metadata(),
+            "compute": {
+                key: cls._json_safe(value)
+                for key, value in compute_params.items()
+                if key != "source_config"
+            },
+        }
+
+    @classmethod
+    def _json_safe(cls, value):
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, STCSourceConfig):
+            return {
+                "mode": value.mode,
+                "subject": value.subject,
+                "subjects_dir": cls._json_safe(value.subjects_dir),
+                "src": cls._json_safe(value.src),
+                "bem": cls._json_safe(value.bem),
+                "trans": cls._json_safe(value.trans),
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._json_safe(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): cls._json_safe(item) for key, item in value.items()}
+        return value

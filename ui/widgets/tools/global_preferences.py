@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
 
 from core.app_settings import DEFAULT_OUTPUT_ROOT, get_settings_store
 from core.pipelines import all_pipelines
-from utils import parse_tuple, to_display_string
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +34,10 @@ class PlotSettingsWidget(QWidget):
 
         self.matplotlib_style_combo = QComboBox()
         self.cmap_input = QComboBox()
-        self.evoked_xlim_input = QLineEdit()
 
         self._populate_styles_combo()
 
         form_layout.addRow("Matplotlib Style:", self.matplotlib_style_combo)
-        form_layout.addRow("Evoked Plot X-Limits (ms):", self.evoked_xlim_input)
         form_layout.addRow("Default Colormap:", self.cmap_input)
 
         layout.addWidget(groupbox)
@@ -59,7 +56,7 @@ class PlotSettingsWidget(QWidget):
         self.cmap_input.addItems(list(matplotlib.colormaps))
 
     def load_settings(self):
-        defaults = {"style": "default", "evoked_xlim": (-200, 500), "cmap": "turbo"}
+        defaults = {"style": "default", "cmap": "turbo"}
         params = self.settings_store.get(self.SETTINGS_PATH, defaults)
         if not isinstance(params, dict):
             params = defaults
@@ -70,7 +67,6 @@ class PlotSettingsWidget(QWidget):
             "Default",
         )
         self.matplotlib_style_combo.setCurrentText(display_style)
-        self.evoked_xlim_input.setText(to_display_string(params.get("evoked_xlim")))
         self.cmap_input.setCurrentText(params.get("cmap", "turbo"))
 
     def save_settings(self):
@@ -87,7 +83,6 @@ class PlotSettingsWidget(QWidget):
         selected_display = self.matplotlib_style_combo.currentText()
         return {
             "style": self.style_name_map.get(selected_display, "default"),
-            "evoked_xlim": parse_tuple(self.evoked_xlim_input.text(), float),
             "cmap": self.cmap_input.currentText(),
         }
 
