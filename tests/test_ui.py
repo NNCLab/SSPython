@@ -973,6 +973,116 @@ class TestUI(unittest.TestCase):
         self.assertEqual(display.event_label, "Sham")
         self.assertEqual(display.n_epochs, 1)
 
+    def test_time_frequency_widget_updates_tfr_image_when_selected_event_changes(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(["Cz", "Pz"], sfreq=1000, ch_types="eeg")
+        events = np.array([[0, 0, 1], [100, 0, 2], [200, 0, 1], [300, 0, 2]])
+        epochs = mne.EpochsArray(
+            np.random.randn(4, 2, 5) * 1e-6,
+            info,
+            events=events,
+            event_id={"Pulse": 1, "Sham": 2},
+            tmin=0.0,
+            verbose=False,
+        )
+        freqs = np.array([8.0, 12.0])
+        tfr_data = np.zeros((4, 2, 2, 5), dtype=float)
+        tfr_data[events[:, 2] == 1] = 2.0
+        tfr_data[events[:, 2] == 2] = 7.0
+        epoch_tfr = mne.time_frequency.EpochsTFRArray(
+            info,
+            tfr_data,
+            epochs.times,
+            freqs,
+            events=events,
+            event_id={"Pulse": 1, "Sham": 2},
+        )
+        average_tfr = mne.time_frequency.AverageTFRArray(
+            info,
+            np.full((2, 2, 5), 4.5),
+            epochs.times,
+            freqs,
+        )
+
+        widget = TimeFrequencyWidget(
+            epochs,
+            tfr_derivatives={
+                "Epoch power": epoch_tfr,
+                "Average power": average_tfr,
+            },
+        )
+        widget.transform_combo.setCurrentText(RAW_POWER_MODE)
+        widget.baseline_checkbox.setChecked(False)
+        app.processEvents()
+
+        self.assertEqual(widget.event_combo.count(), 3)
+        np.testing.assert_allclose(widget.image_artist.get_array(), np.full((2, 5), 4.5e12))
+
+        widget.event_combo.setCurrentIndex(1)
+        app.processEvents()
+        self.assertEqual(widget.display_data.event_label, "Pulse")
+        np.testing.assert_allclose(widget.image_artist.get_array(), np.full((2, 5), 2.0e12))
+
+        widget.event_combo.setCurrentIndex(2)
+        app.processEvents()
+        self.assertEqual(widget.display_data.event_label, "Sham")
+        np.testing.assert_allclose(widget.image_artist.get_array(), np.full((2, 5), 7.0e12))
+
+        widget.derivative_combo.setCurrentIndex(1)
+        app.processEvents()
+        self.assertEqual(widget.event_combo.count(), 1)
+        self.assertIsNone(widget._selected_event_code())
+        np.testing.assert_allclose(widget.image_artist.get_array(), np.full((2, 5), 4.5e12))
+        widget.close()
+
+    def test_time_frequency_evoked_hover_reports_channel_extrema_for_all_channels(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(["Cz", "Pz", "Fz"], sfreq=1000, ch_types="eeg")
+        epochs = mne.EpochsArray(
+            np.array(
+                [
+                    [
+                        [0.0, -2.0, 0.5, 1.0],
+                        [0.0, 5.0, 0.25, 0.5],
+                        [0.0, 1.0, -0.5, -1.0],
+                    ]
+                ]
+            )
+            * 1e-6,
+            info,
+            tmin=0.0,
+            verbose=False,
+        )
+        tfr = mne.time_frequency.AverageTFRArray(
+            info,
+            np.ones((3, 2, 4)),
+            epochs.times,
+            np.array([8.0, 12.0]),
+        )
+
+        widget = TimeFrequencyWidget(epochs, tfr_derivatives={"Power (TFR)": tfr})
+        widget.canvas.draw()
+
+        class HoverEvent:
+            def __init__(self, xdata, ydata, axis):
+                self.inaxes = axis
+                self.xdata = xdata
+                self.ydata = ydata
+                self.x, self.y = axis.transData.transform((xdata, ydata))
+
+        widget._on_mouse_move(HoverEvent(1.0, 0.0, widget.erp_ax))
+        tooltip_text = widget.erp_tooltip.get_text()
+
+        self.assertIn("Min amplitude: -2.00 uV (Cz)", tooltip_text)
+        self.assertIn("Max amplitude: 5.00 uV (Pz)", tooltip_text)
+        widget.close()
+
     def test_compute_tfr_settings_dialog_builds_mne_params(self):
         app = QApplication.instance()
         if app is None:

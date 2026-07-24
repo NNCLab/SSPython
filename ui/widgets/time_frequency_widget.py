@@ -969,15 +969,23 @@ class TimeFrequencyWidget(QWidget):
         )
 
     def _populate_event_selector(self):
+        current_event_code = self.event_combo.currentData()
+        event_codes = self._current_tfr_event_codes()
+        event_counts = self._current_tfr_event_counts()
+
         self.event_combo.blockSignals(True)
         self.event_combo.clear()
         self.event_combo.addItem("All events", None)
-        if self.epochs.events is not None and len(self.epochs.events) > 0:
+        selected_index = 0
+        if event_codes:
             names_by_code = _event_name_lookup(self.epochs)
-            for event_code in sorted({int(code) for code in self.epochs.events[:, 2]}):
-                count = int(np.sum(self.epochs.events[:, 2] == event_code))
+            for index, event_code in enumerate(event_codes, start=1):
+                count = event_counts.get(event_code, 0)
                 label = names_by_code.get(event_code, f"Event {event_code}")
                 self.event_combo.addItem(f"{label} ({count})", event_code)
+                if current_event_code == event_code:
+                    selected_index = index
+        self.event_combo.setCurrentIndex(selected_index)
         self.event_combo.setVisible(self.event_combo.count() > 2)
         self.event_combo.blockSignals(False)
 
@@ -1005,6 +1013,24 @@ class TimeFrequencyWidget(QWidget):
             channel_names = tfr_channels
         return channel_names
 
+    def _current_tfr_event_codes(self) -> list[int]:
+        tfr = _coerce_tfr(self.tfr)
+        if tfr is None:
+            return []
+        data = np.asarray(getattr(tfr, "data", []))
+        events = getattr(tfr, "events", None)
+        if data.ndim != 4 or events is None or len(events) == 0:
+            return []
+        return sorted({int(code) for code in np.asarray(events)[:, 2]})
+
+    def _current_tfr_event_counts(self) -> dict[int, int]:
+        tfr = _coerce_tfr(self.tfr)
+        events = getattr(tfr, "events", None) if tfr is not None else None
+        if events is None or len(events) == 0:
+            return {}
+        event_codes = np.asarray(events)[:, 2].astype(int)
+        return {int(code): int(np.sum(event_codes == code)) for code in np.unique(event_codes)}
+
     def _selected_channels(self) -> list[str] | None:
         return parse_channel_selection(self.channels_input.text(), self._available_channel_names())
 
@@ -1031,6 +1057,8 @@ class TimeFrequencyWidget(QWidget):
             self._set_selected_channels(selected_channels)
 
     def _selected_event_code(self) -> int | None:
+        if not self._current_tfr_event_codes():
+            return None
         value = self.event_combo.currentData()
         return None if value is None else int(value)
 
@@ -1041,6 +1069,7 @@ class TimeFrequencyWidget(QWidget):
         self.current_derivative_key = self.derivative_combo.currentData()
         self.tfr = self.tfr_derivatives.get(self.current_derivative_key)
         self._populate_channel_selector()
+        self._populate_event_selector()
         self._clim = None
         self._render()
 
@@ -1162,6 +1191,13 @@ class TimeFrequencyWidget(QWidget):
         self.main_ax.set_axis_off()
         self.canvas.draw_idle()
 
+    def _evoked_plot_shows_all_channels(self) -> bool:
+        selected_channels = self._selected_channels()
+        if selected_channels is None:
+            return True
+        available_channel_count = len(self._available_channel_names())
+        return available_channel_count > 0 and len(selected_channels) >= available_channel_count
+
     def _plot_evoked_traces(self, tokens: dict[str, str]):
         if self.display_data is None or self.erp_ax is None:
             return
@@ -1179,11 +1215,8 @@ class TimeFrequencyWidget(QWidget):
             return
 
         selected_channels = self._selected_channels()
+        show_all_channels = self._evoked_plot_shows_all_channels()
         available_channel_count = len(self._available_channel_names())
-        selected_count = len(selected_channels or [])
-        show_all_channels = selected_channels is None or (
-            available_channel_count > 0 and selected_count >= available_channel_count
-        )
         show_subset_average = (
             selected_channels is not None
             and len(channel_names) > 1
@@ -1759,6 +1792,29 @@ class TimeFrequencyWidget(QWidget):
         index = int(np.argmin(np.abs(times_ms - float(event.xdata))))
         time_value = float(times_ms[index])
         amp_value = float(self.display_data.erp_uV[index])
+        tooltip_text = f"Time: {time_value:.0f} ms\nAmplitude: {amp_value:.2f} uV"
+
+        channel_data = np.asarray(self.display_data.erp_channel_uV, dtype=float)
+        channel_names = list(self.display_data.erp_channel_names)
+        if (
+            self._evoked_plot_shows_all_channels()
+            and channel_data.ndim == 2
+            and channel_data.shape[0] == len(channel_names)
+            and channel_data.shape[1] > index
+        ):
+            amplitudes = channel_data[:, index]
+            finite_indices = np.flatnonzero(np.isfinite(amplitudes))
+            if finite_indices.size:
+                min_index = int(finite_indices[int(np.argmin(amplitudes[finite_indices]))])
+                max_index = int(finite_indices[int(np.argmax(amplitudes[finite_indices]))])
+                min_value = float(amplitudes[min_index])
+                max_value = float(amplitudes[max_index])
+                amp_value = max_value
+                tooltip_text = (
+                    f"Time: {time_value:.0f} ms\n"
+                    f"Min amplitude: {min_value:.2f} uV ({channel_names[min_index]})\n"
+                    f"Max amplitude: {max_value:.2f} uV ({channel_names[max_index]})"
+                )
         if self.erp_hover_vline is not None:
             self.erp_hover_vline.set_xdata([time_value, time_value])
             self.erp_hover_vline.set_visible(True)
@@ -1769,7 +1825,7 @@ class TimeFrequencyWidget(QWidget):
             self.erp_tooltip,
             time_value,
             amp_value,
-            f"Time: {time_value:.0f} ms\nAmplitude: {amp_value:.2f} uV",
+            tooltip_text,
         )
 
     def _show_time_power_hover(self, event):

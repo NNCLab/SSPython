@@ -302,7 +302,6 @@ class ErpAnalysisPage(BasePage):
         if not self.tep:
             return
         dialog = ComputeTFRSettingsDialog(self.tep.epochs, parent=self)
-        dialog.return_itc_checkbox.setChecked(True)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
