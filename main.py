@@ -1,9 +1,20 @@
 import logging
+import os
 import sys
-from importlib import metadata
+import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt, QSettings, Signal, QSize, Slot
+from PySide6.QtCore import (
+    QEasingCurve,
+    QParallelAnimationGroup,
+    QPropertyAnimation,
+    QSettings,
+    QSize,
+    QTimer,
+    Qt,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from core.app_settings import get_settings_store
 from core.pipelines import all_pipelines, get_pipeline
+from core.version import __version__
 from ui.pages.erp_analysis_page import ErpAnalysisPage
 from ui.pages.home_page import HomePage
 from ui.pages.preferences_page import PreferencesPage
@@ -32,19 +44,57 @@ from ui.widgets.tools.qss_helper import QSSEditorDialog
 from ui.widgets.workspace_panel import DatasetInspectorPanel, WorkspacePanel
 from utils import apply_theme, get_path, themed_svg_icon, toggle_theme as toggle_app_theme
 
-import os
 os.environ["MNE_FORCE_EAGER"] = "1"
 
 APP_NAME = "SSPython"
 ORGANIZATION_NAME = "SSPython"
-
-try:
-    APP_VERSION = metadata.version("sspython")
-except metadata.PackageNotFoundError:
-    APP_VERSION = "0.1.1"
+APP_VERSION = __version__
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _validate_frozen_dependencies() -> None:
+    """Exercise dynamic imports and native resources used by packaged features."""
+    import inspect
+    from importlib.resources import files
+    from tempfile import TemporaryDirectory
+
+    import pyvista
+    import pyvistaqt
+    import torch
+    from h5io import read_hdf5, write_hdf5
+    from mne_icalabel.iclabel.network.torch import ICLabelNet
+    from mne_lsl.lsl.load_liblsl import load_liblsl
+    from mne.viz.backends.renderer import _TimeInteraction
+    from vtkmodules.vtkRenderingOpenGL2 import vtkOpenGLRenderer
+
+    lsl = load_liblsl()
+    if lsl.lsl_library_version() <= 0:
+        raise RuntimeError("The bundled liblsl library did not initialize.")
+
+    network_file = files("mne_icalabel.iclabel.network") / "assets" / "ICLabelNet.pt"
+    network = ICLabelNet()
+    network.load_state_dict(torch.load(network_file, weights_only=True))
+
+    h5io_payload = {
+        "version": 1,
+        "channels": ["C3", "C4"],
+        "values": [1.25, 2.5],
+    }
+    with TemporaryDirectory(prefix="sspython-h5io-") as temp_directory:
+        h5io_file = Path(temp_directory) / "roundtrip.h5"
+        write_hdf5(h5io_file, h5io_payload, overwrite=True)
+        if read_hdf5(h5io_file) != h5io_payload:
+            raise RuntimeError("The bundled h5io backend failed its round-trip check.")
+
+    renderer_source = inspect.getsource(_TimeInteraction._enable_time_interaction)
+    if "@_auto_weakref" not in renderer_source:
+        raise RuntimeError("The bundled MNE STC renderer source is unavailable.")
+
+    # Keep these references live so the imports cannot be optimized away.
+    if not pyvista.__version__ or not pyvistaqt.__version__ or vtkOpenGLRenderer is None:
+        raise RuntimeError("The bundled PyVista/VTK backend did not initialize.")
 
 
 class MainWindow(QMainWindow):
@@ -446,8 +496,12 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
 
-def main():
-    app = QApplication(sys.argv)
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv if argv is None else argv)
+    smoke_test = "--smoke-test" in args
+    qt_args = [arg for arg in args if arg != "--smoke-test"]
+
+    app = QApplication(qt_args)
     QApplication.setOrganizationName(ORGANIZATION_NAME)
     QApplication.setApplicationName(APP_NAME)
     QApplication.setApplicationVersion(APP_VERSION)
@@ -467,8 +521,20 @@ def main():
     window = MainWindow()
     window.show()
     splash.finish(window)
-    sys.exit(app.exec())
+
+    if smoke_test:
+        _validate_frozen_dependencies()
+        QTimer.singleShot(0, app.quit)
+
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        exit_code = main()
+    except BaseException:
+        smoke_log_path = os.environ.get("SSPYTHON_SMOKE_LOG")
+        if smoke_log_path:
+            Path(smoke_log_path).write_text(traceback.format_exc(), encoding="utf-8")
+        raise
+    raise SystemExit(exit_code)

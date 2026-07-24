@@ -512,11 +512,26 @@ The test suite covers selected preprocessing logic, UI initialization, event han
 
 ## 17. Packaging and Distribution
 
-The repository includes packaging-related artifacts for Windows:
+Windows releases use a PyInstaller one-directory bundle wrapped in an Inno
+Setup installer. Run the complete release pipeline from the repository root:
 
-- `inno_setup.iss`
+```powershell
+.\packaging\build_windows.cmd
+```
 
-These indicate a Windows packaging flow, creating Nuitka-built executables plus an Inno Setup installer.
+The script creates an isolated `.venv-build` environment, runs the unit tests,
+builds and smoke-tests `dist\SSPython\SSPython.exe`, and creates
+`dist\installer\SSPython-<version>-Setup.exe`.
+
+Useful development options:
+
+```powershell
+.\packaging\build_windows.cmd -SkipInstaller -DebugConsole
+.\packaging\build_windows.cmd -SkipTests
+```
+
+Inno Setup 6 is required unless `-SkipInstaller` is used. Application versions
+are defined once in `core\version.py`.
 
 ## 18. Known Limitations and Assumptions
 

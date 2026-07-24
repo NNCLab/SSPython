@@ -1,11 +1,14 @@
+[build-system]
+requires = ["setuptools>=81.0.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sspython"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "jupyter>=1.1.1",
     "mat73>=0.65",
     "mne>=1.11.0",
     "mne-icalabel>=0.8.1",
@@ -18,13 +21,29 @@ dependencies = [
     "scipy>=1.17.1",
     "statsmodels>=0.14.6",
     "torch>=2.11.0",
-    "nuitka>=4.0.7",
-    "setuptools>=81.0.0",
-    "wheel>=0.46.3",
-    "ordered-set>=4.1.0",
-    "zstandard>=0.25.0",
     "imageio>=2.37.3",
     "h5io>=0.2.5",
     "pyvistaqt>=0.12.0",
     "nibabel>=5.4.2",
 ]
+
+[dependency-groups]
+build = [
+    "pyinstaller>=6.21.0",
+    "pyinstaller-hooks-contrib>=2026.6",
+]
+dev = [
+    "jupyter>=1.1.1",
+]
+
+[tool.setuptools]
+py-modules = ["main", "utils"]
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = { attr = "core.version.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "ui*"]
+namespaces = true
