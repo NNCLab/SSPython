@@ -1,0 +1,2 @@
+# this is just to avoid git from changing line endings on shell scripts (build_linux.sh, etc...)
+*.sh text eol=lf
