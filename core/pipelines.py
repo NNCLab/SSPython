@@ -181,20 +181,6 @@ STANDARD_WORKFLOW_SECTIONS = (
                     ),
                 ),
             ),
-            PipelinePanel(
-                id="epoch_segmentation",
-                info_stage_id=None,
-                actions=(
-                    PipelineAction(
-                        id="segment",
-                        label="Segment into Epochs",
-                        stage_id="epochs",
-                        role="process",
-                        handler="segment_epochs",
-                        requires_stage_id="raw",
-                    ),
-                ),
-            ),
         ),
     ),
     PipelineSection(
@@ -205,6 +191,14 @@ STANDARD_WORKFLOW_SECTIONS = (
                 id="epochs",
                 info_stage_id="epochs",
                 actions=(
+                    PipelineAction(
+                        id="segment",
+                        label="Segment into Epochs",
+                        stage_id="epochs",
+                        role="process",
+                        handler="segment_epochs",
+                        requires_stage_id="raw",
+                    ),
                     PipelineAction(
                         id="plot_raw_evoked",
                         label="Plot Raw Evoked",

@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QScrollArea,
     QSizePolicy,
+    QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -106,24 +107,18 @@ def _top_level_log_entry(entry: dict, index: int) -> tuple[str, object, str]:
 
 
 def build_summary_metrics(mne_object: MNEObject) -> list[tuple[str, str]]:
-    event_counts = extract_event_counts(mne_object)
-    total_events = sum(count for _, count in event_counts)
-
     if isinstance(mne_object, (mne.io.Raw, mne.io.RawArray)):
-        metrics = [
+        return [
             ("Channels", str(len(mne_object.ch_names))),
             ("Time Points", str(mne_object.n_times)),
             ("Sampling", f"{mne_object.info['sfreq']:.2f} Hz"),
             ("Duration", f"{mne_object.times[-1]:.2f} s"),
         ]
-        if total_events:
-            metrics.append(("Events", str(total_events)))
-        return metrics
 
     if isinstance(mne_object, (mne.Epochs, mne.EpochsArray, mne.epochs.EpochsFIF)):
         total_epochs = len(mne_object.drop_log)
         kept_epochs = len(mne_object)
-        metrics = [
+        return [
             ("Epochs", f"{kept_epochs}/{total_epochs}"),
             (
                 "Channels",
@@ -132,9 +127,6 @@ def build_summary_metrics(mne_object: MNEObject) -> list[tuple[str, str]]:
             ("Sampling", f"{mne_object.info['sfreq']:.2f} Hz"),
             ("Window", _window_text(mne_object.tmin, mne_object.tmax, scale=1e3, suffix=" ms")),
         ]
-        if total_events:
-            metrics.append(("Events", str(total_events)))
-        return metrics
 
     if isinstance(mne_object, mne.preprocessing.ICA):
         n_components = int(mne_object.n_components_ or 0)
@@ -375,8 +367,8 @@ class ObjectDetailsDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(820, 700)
-        self.setMinimumSize(680, 520)
+        self.resize(1040, 700)
+        self.setMinimumSize(820, 520)
         self.setObjectName("appDialog")
 
         layout = QVBoxLayout(self)
@@ -406,31 +398,80 @@ class ObjectDetailsDialog(QDialog):
             layout.addWidget(path_label)
 
         if mne_object is not None:
-            summary = ObjectInfoWidget(self)
-            summary.update_info(mne_object, "Summary")
-            layout.addWidget(summary)
+            self.summary_widget = ObjectInfoWidget(self)
+            self.summary_widget.update_info(mne_object, "Summary")
+            layout.addWidget(self.summary_widget)
 
-            sections_scroll = QScrollArea()
-            sections_scroll.setWidgetResizable(True)
-            sections_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+            detail_sections = build_detail_sections(mne_object)
+            processing_log = next(
+                (
+                    content
+                    for section_title, content in detail_sections
+                    if section_title == "Processing Log"
+                ),
+                None,
+            )
+            information_sections = [
+                (section_title, content)
+                for section_title, content in detail_sections
+                if section_title != "Processing Log"
+            ]
 
-            sections_widget = QWidget()
-            sections_layout = QVBoxLayout(sections_widget)
-            sections_layout.setContentsMargins(0, 0, 0, 0)
-            sections_layout.setSpacing(10)
+            self.details_scroll = self._build_sections_scroll(information_sections)
+            if processing_log is not None:
+                self.details_splitter = QSplitter(Qt.Orientation.Horizontal)
+                self.details_splitter.setObjectName("objectInfoDetailsSplitter")
+                self.details_splitter.setChildrenCollapsible(False)
+                self.details_splitter.addWidget(self.details_scroll)
 
-            for section_title, content in build_detail_sections(mne_object):
-                sections_layout.addWidget(self._build_section(section_title, content))
-            sections_layout.addStretch()
-
-            sections_scroll.setWidget(sections_widget)
-            layout.addWidget(sections_scroll, 1)
+                self.processing_log_section = self._build_section(
+                    "Processing Log",
+                    processing_log,
+                )
+                self.processing_log_section.setSizePolicy(
+                    QSizePolicy.Policy.Expanding,
+                    QSizePolicy.Policy.Expanding,
+                )
+                self.details_splitter.addWidget(self.processing_log_section)
+                self.details_splitter.setStretchFactor(0, 2)
+                self.details_splitter.setStretchFactor(1, 3)
+                self.details_splitter.setSizes([400, 600])
+                layout.addWidget(self.details_splitter, 1)
+            else:
+                layout.addWidget(self.details_scroll, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.accept)
         layout.addWidget(buttons)
+
+    def release_object(self):
+        """Drop the dialog's reference to a file-backed MNE object."""
+        summary_widget = getattr(self, "summary_widget", None)
+        if summary_widget is not None:
+            summary_widget.clear_info()
+
+    def _build_sections_scroll(
+        self,
+        sections: list[tuple[str, object]],
+    ) -> QScrollArea:
+        sections_scroll = QScrollArea()
+        sections_scroll.setObjectName("objectInfoDetailsScroll")
+        sections_scroll.setWidgetResizable(True)
+        sections_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+
+        sections_widget = QWidget()
+        sections_layout = QVBoxLayout(sections_widget)
+        sections_layout.setContentsMargins(0, 0, 0, 0)
+        sections_layout.setSpacing(10)
+
+        for section_title, content in sections:
+            sections_layout.addWidget(self._build_section(section_title, content))
+        sections_layout.addStretch()
+
+        sections_scroll.setWidget(sections_widget)
+        return sections_scroll
 
     def _build_section(self, title: str, content: object) -> QWidget:
         section = QFrame()

@@ -1,15 +1,17 @@
 import logging
 from collections import Counter
-from datetime import datetime
+from pathlib import Path
 
-from PySide6.QtCore import Slot
+from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (
     QDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -34,6 +36,31 @@ from .base_page import BasePage
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
+
+
+class WorkflowDescriptionLabel(QLabel):
+    """A wrapping label that keeps its layout height in sync with its width."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum,
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        label_width = event.size().width()
+        if label_width <= 0:
+            return
+        required_height = self.heightForWidth(label_width)
+        if required_height < 0:
+            return
+        required_height = max(self.fontMetrics().lineSpacing(), required_height)
+        if self.minimumHeight() != required_height:
+            self.setMinimumHeight(required_height)
+            self.updateGeometry()
 
 
 def _annotation_entries(annotations) -> list[tuple[float, float, str, tuple[str, ...]]]:
@@ -67,6 +94,7 @@ def _is_bad_annotation(entry: tuple[float, float, str, tuple[str, ...]]) -> bool
 class ProcessingPage(BasePage):
     def __init__(self, parent=None):
         super().__init__("Preprocessing", parent)
+        self.set_content_maximum_width(1360)
         self.main_window = parent
         self.current_dataset = None
         self.preprocessor: Preprocessor | None = None
@@ -119,8 +147,10 @@ class ProcessingPage(BasePage):
         if pipeline is None:
             return
 
+        step_number = 1
         for section in pipeline.workflow_sections:
-            title_widget = QLabel(f"<h2>{section.title}</h2>")
+            title_widget = QLabel(section.title)
+            title_widget.setObjectName("sectionTitle")
             self.workflow_layout.addWidget(title_widget)
 
             group = QGroupBox()
@@ -128,20 +158,32 @@ class ProcessingPage(BasePage):
 
             for panel in section.panels:
                 if panel.info_stage_id is None:
-                    for action in panel.actions:
-                        group_layout.addWidget(self._create_workflow_button(action))
+                    for stage_actions in self._group_actions_by_stage(panel.actions):
+                        group_layout.addWidget(
+                            self._create_workflow_stage_row(stage_actions, step_number)
+                        )
+                        step_number += 1
                 else:
-                    row = QHBoxLayout()
+                    panel_frame = QFrame()
+                    panel_frame.setObjectName("workflowPanel")
+                    row = QHBoxLayout(panel_frame)
+                    row.setContentsMargins(0, 0, 0, 0)
+                    row.setSpacing(12)
                     info_widget = ObjectInfoWidget()
                     self.info_widgets_by_stage[panel.info_stage_id] = info_widget
                     setattr(self, f"{panel.info_stage_id}_info_widget", info_widget)
                     row.addWidget(info_widget, 1)
 
                     actions_layout = QVBoxLayout()
-                    for action in panel.actions:
-                        actions_layout.addWidget(self._create_workflow_button(action))
+                    actions_layout.setContentsMargins(0, 0, 0, 0)
+                    actions_layout.setSpacing(8)
+                    for stage_actions in self._group_actions_by_stage(panel.actions):
+                        actions_layout.addWidget(
+                            self._create_workflow_stage_row(stage_actions, step_number)
+                        )
+                        step_number += 1
                     row.addLayout(actions_layout, 1)
-                    group_layout.addLayout(row)
+                    group_layout.addWidget(panel_frame)
 
                 if panel.plot_stage_id is not None:
                     plot_widget = EvokedPlotWidget()
@@ -157,6 +199,16 @@ class ProcessingPage(BasePage):
         self.workflow_layout.addStretch()
         self._configure_workflow_buttons()
 
+    @staticmethod
+    def _group_actions_by_stage(actions):
+        grouped_actions = []
+        for action in actions:
+            if grouped_actions and grouped_actions[-1][0].stage_id == action.stage_id:
+                grouped_actions[-1].append(action)
+            else:
+                grouped_actions.append([action])
+        return grouped_actions
+
     def _create_workflow_button(self, action) -> QPushButton:
         button = QPushButton(action.label)
         handler = getattr(self, action.handler, None)
@@ -169,6 +221,48 @@ class ProcessingPage(BasePage):
         self._workflow_button_specs[button] = action
         setattr(self, f"{action.id}_button", button)
         return button
+
+    def _create_workflow_stage_row(self, actions, step_number: int) -> QFrame:
+        if not actions:
+            raise ValueError("A workflow stage row requires at least one action.")
+
+        primary_action = actions[0]
+        row = QFrame()
+        row.setObjectName("workflowActionRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(10)
+
+        number = QLabel(str(step_number))
+        number.setObjectName("stepNumber")
+        number.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        number.setFixedSize(28, 28)
+        layout.addWidget(number, 0, Qt.AlignmentFlag.AlignTop)
+
+        stage = self._stage_definition(primary_action.stage_id)
+        details = QVBoxLayout()
+        details.setContentsMargins(0, 0, 0, 0)
+        details.setSpacing(2)
+        stage_label = QLabel(stage.label if stage is not None else primary_action.label)
+        stage_label.setObjectName("workflowActionTitle")
+        details.addWidget(stage_label)
+        if stage is not None:
+            description = WorkflowDescriptionLabel(stage.description)
+            description.setObjectName("mutedLabel")
+            details.addWidget(description)
+        layout.addLayout(details, 1)
+
+        buttons_widget = QWidget()
+        buttons_layout = QVBoxLayout(buttons_widget)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.setSpacing(8)
+        for action in actions:
+            button = self._create_workflow_button(action)
+            button.setMinimumWidth(170)
+            button.setMaximumWidth(260)
+            buttons_layout.addWidget(button)
+        layout.addWidget(buttons_widget, 0, Qt.AlignmentFlag.AlignVCenter)
+        return row
 
     def _connect_plot_scrolling(self, plot_widget: EvokedPlotWidget):
         plot_widget.scrolled.connect(
@@ -267,26 +361,71 @@ class ProcessingPage(BasePage):
         if self.isVisible():
             self.update_ui_state()
 
-    def _save_ica_changes(self, ica_object, path, log_key: str):
-        if not self.preprocessor:
+    def release_derivative_resources(self, paths):
+        """Release cached readers for derivative files before they are deleted."""
+        target_paths = {Path(path).resolve() for path in paths}
+        stage_ids = {
+            stage_id
+            for stage_id, path in (self.preprocessor.paths.items() if self.preprocessor else ())
+            if Path(path).resolve() in target_paths
+        }
+        if not stage_ids:
             return
 
-        self.preprocessor.add_description(
-            ica_object,
-            {
-                log_key: {
-                    "excluded_components": list(ica_object.exclude),
-                    "excluded_count": len(ica_object.exclude),
-                    "date": datetime.now().isoformat(),
-                }
-            },
+        for stage_id in stage_ids:
+            info_widget = self.info_widgets_by_stage.get(stage_id)
+            if info_widget is not None:
+                info_widget.clear_info()
+            plot_widget = self.plot_widgets_by_stage.get(stage_id)
+            if plot_widget is not None:
+                plot_widget.update_plot(None)
+
+        if "epochs" in stage_ids:
+            self.raw_evoked_plot_widget.update_plot(None)
+            for attr in ("viz_epochs", "original_bads", "original_selection"):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+
+        self.preprocessor.release_cached_stages(stage_ids, verbose=False)
+        self._needs_reload = True
+
+    def _confirm_ica_update(self, stage_id: str) -> bool:
+        if not self.preprocessor:
+            return False
+
+        downstream_files = self.preprocessor.existing_downstream_files(stage_id)
+        if not downstream_files:
+            return True
+
+        file_names = "\n".join(f" - {path.name}" for _, path in downstream_files)
+        reply = QMessageBox.question(
+            self,
+            "Update ICA and delete downstream files?",
+            "The ICA component selection changed. Saving it will delete "
+            "the following dependent files so they cannot be mistaken for "
+            f"up-to-date results:\n\n{file_names}\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _save_ica_changes(self, ica_object, path, stage_id: str):
+        if not self.preprocessor:
+            return False
+
+        self.preprocessor._clear_downstream_files(stage_id)
+
         worker = Worker(
             lambda: ica_object.save(path, overwrite=True),
             parent=self,
             add_loggers="mne",
         )
         worker.exec_with_dialog("Please wait", "Saving ICA...")
+        if getattr(worker, "_error", None):
+            return False
+
+        setattr(self.preprocessor, f"_{stage_id}", ica_object)
+        return True
 
     def _has_stage(self, stage_id: str | None) -> bool:
         if not self.preprocessor or not stage_id:
@@ -538,15 +677,27 @@ class ProcessingPage(BasePage):
         if not self.preprocessor or not self.preprocessor.has("continuous_ica"):
             return
         raw = self.preprocessor._get_last_continuous().load_data()
-        ica = run_ica_viewer(self.preprocessor.continuous_ica, raw, self)
-        if ica:
-            self.preprocessor.continuous_ica.exclude = ica.exclude
-            self._save_ica_changes(
-                self.preprocessor.continuous_ica,
+        ica_object = self.preprocessor.continuous_ica
+        original_exclude = list(ica_object.exclude)
+        reviewed_ica = run_ica_viewer(ica_object, raw, self)
+        if not reviewed_ica:
+            ica_object.exclude = original_exclude
+            return
+        if reviewed_ica:
+            reviewed_exclude = list(reviewed_ica.exclude)
+            if reviewed_exclude == original_exclude:
+                return
+            if not self._confirm_ica_update("continuous_ica"):
+                ica_object.exclude = original_exclude
+                return
+            ica_object.exclude = reviewed_exclude
+            if self._save_ica_changes(
+                ica_object,
                 self.preprocessor.paths["continuous_ica"],
-                "continuous_ica_review",
-            )
-            self._refresh_after_step()
+                "continuous_ica",
+            ):
+                QMessageBox.information(self, "ICA Updated", "ICA changes have been saved.")
+                self._refresh_after_step()
 
     def segment_epochs(self):
         if not self.preprocessor:
@@ -678,15 +829,27 @@ class ProcessingPage(BasePage):
                 "Please wait",
                 "Loading epoched data...",
             )
-        ica = run_ica_viewer(self.preprocessor.epochs_ica, self.preprocessor.epochs, self)
-        if ica:
-            self.preprocessor.epochs_ica.exclude = ica.exclude
-            self._save_ica_changes(
-                self.preprocessor.epochs_ica,
+        ica_object = self.preprocessor.epochs_ica
+        original_exclude = list(ica_object.exclude)
+        reviewed_ica = run_ica_viewer(ica_object, self.preprocessor.epochs, self)
+        if not reviewed_ica:
+            ica_object.exclude = original_exclude
+            return
+        if reviewed_ica:
+            reviewed_exclude = list(reviewed_ica.exclude)
+            if reviewed_exclude == original_exclude:
+                return
+            if not self._confirm_ica_update("epochs_ica"):
+                ica_object.exclude = original_exclude
+                return
+            ica_object.exclude = reviewed_exclude
+            if self._save_ica_changes(
+                ica_object,
                 self.preprocessor.paths["epochs_ica"],
-                "epochs_ica_review",
-            )
-            self._refresh_after_step()
+                "epochs_ica",
+            ):
+                QMessageBox.information(self, "ICA Updated", "ICA changes have been saved.")
+                self._refresh_after_step()
 
     def apply_filters(self):
         if not self.preprocessor:

@@ -1,11 +1,12 @@
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 import mne
 import numpy as np
 from matplotlib.backend_bases import MouseButton
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QListWidgetItem
+from PySide6.QtWidgets import QApplication, QListWidgetItem, QToolButton
 from main import MainWindow
 from core.pipelines import DatasetRecord, build_processing_paths, get_pipeline
 from ui.pages.erp_analysis_page import ErpAnalysisPage
@@ -34,7 +35,13 @@ from ui.widgets.preprocessing_widgets import (
 )
 from ui.widgets.workspace_panel import DatasetInspectorPanel
 from ui.widgets.tools.conversion_tool import ConvertToolDialog, MergeToolDialog
-from ui.widgets.tools.object_info_widget import ObjectInfoWidget, extract_event_counts
+from ui.widgets.tools.export_tool import ExportFilesDialog
+from ui.widgets.tools.object_info_widget import (
+    ObjectDetailsDialog,
+    ObjectInfoWidget,
+    build_summary_metrics,
+    extract_event_counts,
+)
 from ui.widgets.tools.optional_range_widget import OptionalRangeWidget
 from ui.widgets.real_time_widget import (
     ConnectionWidget,
@@ -57,7 +64,11 @@ from ui.widgets.real_time_widget import (
     raw_artifact_segments,
     realtime_info_has_montage,
 )
-from ui.widgets.real_time_plot_docks import RawMonitorDock
+from ui.widgets.real_time_plot_docks import (
+    EvokedButterflyDock,
+    RawMonitorDock,
+    compute_butterfly_snr,
+)
 
 class TestUI(unittest.TestCase):
 
@@ -87,6 +98,121 @@ class TestUI(unittest.TestCase):
         self.assertNotIn("ERP Analysis", nav_labels)
         window.close()
 
+    def test_main_window_exposes_export_menu(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+        window = MainWindow()
+
+        export_actions = [action.text() for action in window.export_menu.actions()]
+
+        self.assertEqual(
+            export_actions,
+            ["Export Preprocessed Files...", "Export Evoked Files..."],
+        )
+        window.close()
+
+    def test_export_dialog_lists_workspace_files_with_checkboxes(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        workspace_root = Path("workspace")
+        source_paths = [
+            workspace_root / "derivatives" / "sub-01_desc-preprocessed_epo.fif",
+            workspace_root / "derivatives" / "sub-02_desc-preprocessed_epo.fif",
+        ]
+        dialog = ExportFilesDialog(source_paths, workspace_root, "evoked")
+
+        self.assertEqual(dialog.table.rowCount(), 2)
+        self.assertEqual(dialog.selected_source_paths(), source_paths)
+        self.assertEqual(
+            dialog.table.item(0, 2).text(),
+            "sub-01_desc-preprocessed_ave.fif",
+        )
+
+        dialog.table.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+        self.assertEqual(dialog.selected_source_paths(), source_paths[:1])
+        self.assertEqual(dialog.summary_label.text(), "1 of 2 files selected.")
+
+        destination = Path("exports")
+        dialog.destination_edit.setText(str(destination))
+        self.assertEqual(dialog.destination_path(), destination)
+        dialog.close()
+
+    def test_workspace_export_catalog_is_independent_of_highlighted_dataset(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace_root = Path(temp_directory)
+            raw_path = workspace_root / "sub-01_task-tms_raw.fif"
+            raw_path.touch()
+            pipeline = get_pipeline("standard")
+            derivative_root = pipeline.derivative_root(workspace_root, "derivatives")
+            paths = build_processing_paths(
+                raw_path,
+                derivative_root,
+                pipeline=pipeline,
+                create_dirs=True,
+            )
+            paths["preprocessed"].touch()
+            dataset = DatasetRecord(
+                raw_path=raw_path,
+                pipeline=pipeline,
+                derivative_root=derivative_root,
+                paths=paths,
+            )
+
+            window = MainWindow()
+            window.workspace_panel.datasets = [dataset]
+            window.workspace_panel.list_widget.clear()
+
+            self.assertEqual(
+                window._workspace_preprocessed_paths(),
+                [paths["preprocessed"]],
+            )
+            window.close()
+
+    def test_workspace_export_dialog_hands_selected_files_to_worker(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace_root = Path(temp_directory)
+            source_path = workspace_root / "sub-01_desc-preprocessed_epo.fif"
+            source_path.touch()
+            destination = workspace_root / "exports"
+
+            window = MainWindow()
+            window.current_folder = workspace_root
+
+            with (
+                patch.object(
+                    window,
+                    "_workspace_preprocessed_paths",
+                    return_value=[source_path],
+                ),
+                patch("main.ExportFilesDialog") as dialog_class,
+                patch("main.Worker") as worker_class,
+                patch("main.QMessageBox.information"),
+            ):
+                dialog = dialog_class.return_value
+                dialog.exec.return_value = 1
+                dialog.selected_source_paths.return_value = [source_path]
+                dialog.destination_path.return_value = destination
+                worker_class.return_value.exec_with_dialog.return_value = [
+                    destination / source_path.name
+                ]
+
+                window._export_preprocessed_files()
+
+                worker_class.assert_called_once()
+                worker_class.return_value.exec_with_dialog.assert_called_once()
+            window.close()
+
     def test_object_info_widget_event_counts(self):
         app = QApplication.instance()
         if app is None:
@@ -103,11 +229,41 @@ class TestUI(unittest.TestCase):
         )
 
         self.assertEqual(extract_event_counts(raw), [("Sham", 1), ("TMS", 2)])
+        self.assertNotIn(
+            "Events",
+            [label for label, _ in build_summary_metrics(raw)],
+        )
 
         widget = ObjectInfoWidget()
         widget.update_info(raw, "Recording summary")
         self.assertTrue(widget.events_frame.isVisible())
         widget.close()
+
+    def test_derivative_details_places_processing_log_on_the_right(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(ch_names=["EEG 001"], sfreq=1000, ch_types="eeg")
+        info["description"] = (
+            '[{"filter": {"date": "2026-08-13", "low": 1, "high": 40}}]'
+        )
+        raw = mne.io.RawArray(np.zeros((1, 1000)), info, verbose=False)
+        dialog = ObjectDetailsDialog("Filtered", raw)
+        dialog.show()
+        app.processEvents()
+
+        self.assertEqual(dialog.details_splitter.orientation(), Qt.Orientation.Horizontal)
+        self.assertEqual(dialog.details_splitter.indexOf(dialog.details_scroll), 0)
+        self.assertEqual(
+            dialog.details_splitter.indexOf(dialog.processing_log_section),
+            1,
+        )
+        self.assertGreater(
+            dialog.processing_log_section.geometry().left(),
+            dialog.details_scroll.geometry().left(),
+        )
+        dialog.close()
 
     def test_extract_event_counts_from_epochs_uses_event_ids(self):
         info = mne.create_info(ch_names=["EEG 001", "EEG 002"], sfreq=1000, ch_types="eeg")
@@ -123,6 +279,10 @@ class TestUI(unittest.TestCase):
         )
 
         self.assertEqual(extract_event_counts(epochs), [("Pulse", 2), ("Sham", 1)])
+        self.assertNotIn(
+            "Events",
+            [label for label, _ in build_summary_metrics(epochs)],
+        )
 
     def test_build_epoch_stream_configuration_uses_enabled_stim_channels(self):
         channel_settings = [
@@ -388,6 +548,37 @@ class TestUI(unittest.TestCase):
         self.assertTrue(mask[2:6].all())
         self.assertGreaterEqual(p2p_uV, 50.0)
 
+    def test_butterfly_snr_uses_post_over_pre_stimulus_rms(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        times_ms = np.array([-100.0, -50.0, -10.0, 0.0, 10.0, 50.0, 100.0])
+        mean_data_uV = np.array(
+            [
+                [1.0, 1.0, 1.0, 100.0, 2.0, 2.0, 2.0],
+                [1.0, 1.0, 1.0, 100.0, 2.0, 2.0, 2.0],
+            ]
+        )
+
+        snr = compute_butterfly_snr(
+            mean_data_uV,
+            times_ms,
+            (-100.0, 0.0),
+            (0.0, 100.0),
+        )
+        self.assertAlmostEqual(snr, 2.0)
+
+        dock = EvokedButterflyDock()
+        dock.configure(
+            times_ms,
+            ["Cz", "Pz"],
+            [(0.2, 0.4, 0.6, 1.0), (0.6, 0.4, 0.2, 1.0)],
+        )
+        dock.update_data(mean_data_uV, [], -2.0, 2.0)
+        self.assertEqual(dock.ax.get_title(loc="left"), "SNR: 2.00")
+        dock.close()
+
     def test_apply_frequency_filters_preserves_shape(self):
         params = {
             "apply_bandpass": True,
@@ -413,6 +604,29 @@ class TestUI(unittest.TestCase):
         self.assertFalse(widget.raw_widget.isHidden())
         self.assertTrue(widget.topo_widget.isHidden())
         self.assertFalse(widget.topo_toggle_action.isEnabled())
+        widget.close()
+
+    def test_real_time_erp_docks_topology_when_montage_becomes_available(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = RealTimeERP({})
+        self.assertEqual(
+            widget.dockWidgetArea(widget.topo_dock),
+            Qt.DockWidgetArea.NoDockWidgetArea,
+        )
+
+        widget.has_visual_montage = True
+        widget._update_montage_dependent_ui()
+
+        self.assertEqual(
+            widget.dockWidgetArea(widget.topo_dock),
+            Qt.DockWidgetArea.LeftDockWidgetArea,
+        )
+        self.assertFalse(widget.topo_dock.isHidden())
+        self.assertTrue(widget.topo_toggle_action.isEnabled())
+        self.assertTrue(widget.topo_toggle_action.isVisible())
         widget.close()
 
     def test_realtime_info_montage_detection_requires_channel_positions(self):
@@ -491,6 +705,10 @@ class TestUI(unittest.TestCase):
         self.assertTrue(widget.mep_reference_combo.isEnabled())
         self.assertEqual(widget.mep_active_combo.currentText(), "EMG Active")
         self.assertEqual(widget.mep_reference_combo.currentText(), "EMG Ref")
+        self.assertEqual(
+            widget.dockWidgetArea(widget.mep_dock),
+            Qt.DockWidgetArea.BottomDockWidgetArea,
+        )
         widget.close()
 
     def test_real_time_erp_hides_mep_controls_without_emg_channels(self):
@@ -508,6 +726,36 @@ class TestUI(unittest.TestCase):
         self.assertTrue(widget.mep_reference_combo.isHidden())
         self.assertFalse(widget.mep_active_combo.isEnabled())
         self.assertFalse(widget.mep_reference_combo.isEnabled())
+        self.assertTrue(widget.mep_dock.isHidden())
+        self.assertTrue(
+            all(not action.isVisible() for action in widget.mep_toolbar_actions)
+        )
+        widget.close()
+
+    def test_real_time_topbars_do_not_use_overflow_collapse(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = RealTimeERP({})
+        widget.emg_names = ["EMG Active", "EMG Ref"]
+        widget._configure_mep_controls()
+        widget.show()
+        app.processEvents()
+        widget.resize(widget.minimumWidth(), 700)
+        app.processEvents()
+
+        required_width = max(
+            widget.toolbar.sizeHint().width(),
+            widget.controls_toolbar.sizeHint().width(),
+        )
+        self.assertGreaterEqual(widget.minimumWidth(), required_width)
+        extension_buttons = widget.findChildren(
+            QToolButton,
+            "qt_toolbar_ext_button",
+        )
+        self.assertTrue(extension_buttons)
+        self.assertTrue(all(not button.isVisible() for button in extension_buttons))
         widget.close()
 
     def test_connection_widget_uses_info_summary_instead_of_channel_table(self):
@@ -676,6 +924,14 @@ class TestUI(unittest.TestCase):
             panel = DatasetInspectorPanel()
             panel.set_dataset(dataset)
 
+            released_paths = []
+
+            def record_release(paths_to_release):
+                self.assertTrue(all(path.exists() for path in paths_to_release))
+                released_paths.extend(paths_to_release)
+
+            panel.derivatives_about_to_be_deleted.connect(record_release)
+
             delete_paths = panel._existing_derivative_paths_from_stage("epochs")
             self.assertEqual(
                 delete_paths,
@@ -685,6 +941,7 @@ class TestUI(unittest.TestCase):
             errors = panel._delete_derivative_paths(delete_paths)
 
             self.assertEqual(errors, [])
+            self.assertEqual(released_paths, delete_paths)
             self.assertTrue(paths["raw"].exists())
             self.assertTrue(paths["filtered_raw"].exists())
             self.assertTrue(paths["continuous_ica"].exists())
@@ -1467,6 +1724,31 @@ class TestUI(unittest.TestCase):
         widget.amplitude_scale_combo.setCurrentText("Volts (V)")
 
         self.assertEqual(widget.get_settings()["amplitude_scale"], 1.0)
+        widget.close()
+
+    def test_real_time_settings_expose_butterfly_snr_windows(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = RealTimeSettingsWidget()
+        widget.set_settings(
+            {
+                "refresh_rate": 24,
+                "snr_baseline": (-0.08, -0.01),
+                "snr_response": (0.01, 0.12),
+                "art_rem": (-0.005, 0.005),
+                "reference": "average",
+                "apply_bandpass": False,
+                "bandpass_range": (8.0, 80.0),
+                "apply_notch": False,
+                "notch_freqs": [50.0],
+            }
+        )
+
+        settings = widget.get_settings()
+        self.assertEqual(settings["snr_baseline"], (-0.08, -0.01))
+        self.assertEqual(settings["snr_response"], (0.01, 0.12))
         widget.close()
 
 if __name__ == '__main__':

@@ -456,7 +456,12 @@ class Worker(QThread):
                 )
             return None
 
-        return self._result
+        # Workers are usually parented to long-lived pages. Keeping the result
+        # here would also keep file-backed MNE readers (and their Windows file
+        # handles) alive long after the dialog has closed.
+        result = self._result
+        self._result = None
+        return result
 
     def check_interruption(self) -> bool:
         """

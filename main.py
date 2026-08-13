@@ -18,13 +18,16 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
+    QSplitter,
     QSplashScreen,
     QStackedWidget,
     QVBoxLayout,
@@ -32,6 +35,12 @@ from PySide6.QtWidgets import (
 )
 
 from core.app_settings import get_settings_store
+from core.exporting import (
+    evoked_export_targets,
+    export_evoked_files,
+    export_preprocessed_files,
+    preprocessed_export_targets,
+)
 from core.pipelines import all_pipelines, get_pipeline
 from core.version import __version__
 from ui.pages.erp_analysis_page import ErpAnalysisPage
@@ -40,9 +49,10 @@ from ui.pages.preferences_page import PreferencesPage
 from ui.pages.preprocessing_page import ProcessingPage
 from ui.pages.real_time_page import RealTimePage
 from ui.widgets.tools.conversion_tool import ConvertToolDialog, MergeToolDialog
+from ui.widgets.tools.export_tool import ExportFilesDialog
 from ui.widgets.tools.qss_helper import QSSEditorDialog
 from ui.widgets.workspace_panel import DatasetInspectorPanel, WorkspacePanel
-from utils import apply_theme, get_path, themed_svg_icon, toggle_theme as toggle_app_theme
+from utils import Worker, apply_theme, get_path, themed_svg_icon, toggle_theme as toggle_app_theme
 
 os.environ["MNE_FORCE_EAGER"] = "1"
 
@@ -104,6 +114,7 @@ class MainWindow(QMainWindow):
 
 
     GEOMETRY_SETTING = "ui/main_window/geometry"
+    SPLITTER_STATE_SETTING = "ui/main_window/splitter_state"
     SIDEBAR_COLLAPSED_SETTING = "ui/main_window/sidebar_collapsed"
     INSPECTOR_COLLAPSED_SETTING = "ui/main_window/inspector_collapsed"
 
@@ -151,6 +162,7 @@ class MainWindow(QMainWindow):
             False,
             value_type=bool,
         )
+        self._compact_layout_active = False
 
         self.page_lookup: dict[str, QWidget] = {}
 
@@ -158,6 +170,7 @@ class MainWindow(QMainWindow):
         self._setup_menu()
         self._populate_navigation()
         self._read_window_state()
+        self._apply_responsive_layout(self.width(), force=True)
         self.refresh_workspace()
 
     def _setup_ui(self):
@@ -172,10 +185,15 @@ class MainWindow(QMainWindow):
         self.sidebar_widget = self._create_sidebar()
         layout.addWidget(self.sidebar_widget)
 
+        self.shell_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.shell_splitter.setObjectName("shellSplitter")
+        self.shell_splitter.setChildrenCollapsible(False)
+        layout.addWidget(self.shell_splitter, 1)
+
         self.workspace_panel = WorkspacePanel(self)
         self.workspace_panel.folder_selected.connect(self.set_current_folder)
         self.workspace_panel.dataset_selected.connect(self.set_current_dataset)
-        layout.addWidget(self.workspace_panel)
+        self.shell_splitter.addWidget(self.workspace_panel)
 
         content_frame = QFrame()
         content_frame.setObjectName("contentFrame")
@@ -184,14 +202,22 @@ class MainWindow(QMainWindow):
         content_layout.setSpacing(0)
 
         self.stacked_widget = QStackedWidget()
+        self.stacked_widget.setObjectName("pageStack")
         content_layout.addWidget(self.stacked_widget)
-        layout.addWidget(content_frame, 1)
+        self.shell_splitter.addWidget(content_frame)
 
         self.dataset_inspector_panel = DatasetInspectorPanel(self)
         self.dataset_inspector_panel.collapsed = self.inspector_collapsed
         self.dataset_inspector_panel._apply_collapsed_state(animated=False)
+        self.dataset_inspector_panel.derivatives_about_to_be_deleted.connect(
+            self._release_derivative_resources
+        )
         self.dataset_inspector_panel.derivatives_changed.connect(self.refresh_workspace)
-        layout.addWidget(self.dataset_inspector_panel)
+        self.shell_splitter.addWidget(self.dataset_inspector_panel)
+        self.shell_splitter.setStretchFactor(0, 0)
+        self.shell_splitter.setStretchFactor(1, 1)
+        self.shell_splitter.setStretchFactor(2, 0)
+        self.shell_splitter.setSizes([320, 980, 300])
 
         self.nav_list.currentItemChanged.connect(self._change_page)
         self._apply_sidebar_state(animated=False)
@@ -241,6 +267,18 @@ class MainWindow(QMainWindow):
 
         self.file_menu = menu_bar.addMenu("&File")
         self._add_action(self.file_menu, "Open Workspace", self.workspace_panel.select_folder, "Ctrl+O")
+        self.file_menu.addSeparator()
+        self.export_menu = self.file_menu.addMenu("Export")
+        self._add_action(
+            self.export_menu,
+            "Export Preprocessed Files...",
+            self._export_preprocessed_files,
+        )
+        self._add_action(
+            self.export_menu,
+            "Export Evoked Files...",
+            self._export_evoked_files,
+        )
         self.file_menu.addSeparator()
         self.conversion_menu = self.file_menu.addMenu("Convert / Merge EEG data")
         self._add_action(self.conversion_menu, "Convert EEG data", self._open_convert_tool)
@@ -316,8 +354,13 @@ class MainWindow(QMainWindow):
         else:
             self.setGeometry(120, 80, 1600, 920)
 
+        splitter_state = self.settings_store.get(self.SPLITTER_STATE_SETTING, None)
+        if splitter_state:
+            self.shell_splitter.restoreState(splitter_state)
+
     def _write_window_state(self):
         self.settings_store.set(self.GEOMETRY_SETTING, self.saveGeometry())
+        self.settings_store.set(self.SPLITTER_STATE_SETTING, self.shell_splitter.saveState())
         self.settings_store.set(self.SIDEBAR_COLLAPSED_SETTING, self.sidebar_collapsed)
         self.settings_store.set(self.INSPECTOR_COLLAPSED_SETTING, self.dataset_inspector_panel.collapsed)
         self.settings_store.set_current_folder(self.current_folder)
@@ -338,9 +381,11 @@ class MainWindow(QMainWindow):
                 page_widget.update_ui_state()
 
     def _apply_page_chrome_visibility(self, page_name: str):
-        show_workspace_shell = page_name != "Real-Time"
-        self.workspace_panel.setVisible(show_workspace_shell)
-        self.dataset_inspector_panel.setVisible(show_workspace_shell)
+        uses_workspace = page_name in {"Home", "Preprocessing", "Analysis"}
+        uses_inspector = page_name in {"Preprocessing", "Analysis"}
+        show_inspector = uses_inspector and self.current_dataset is not None
+        self.workspace_panel.setVisible(uses_workspace)
+        self.dataset_inspector_panel.setVisible(show_inspector)
 
     @Slot(str)
     def set_current_folder(self, folder_path: str | None):
@@ -365,6 +410,9 @@ class MainWindow(QMainWindow):
     def set_current_dataset(self, dataset):
         self.current_dataset = dataset
         self.dataset_inspector_panel.set_dataset(dataset)
+        current_item = self.nav_list.currentItem()
+        if current_item is not None:
+            self._apply_page_chrome_visibility(current_item.text())
         self.current_dataset_changed.emit(dataset)
 
     def set_current_pipeline(self, pipeline_id: str):
@@ -391,6 +439,14 @@ class MainWindow(QMainWindow):
             pipeline=self.current_pipeline,
             output_root=self.output_root,
         )
+
+    @Slot(object)
+    def _release_derivative_resources(self, paths):
+        """Ask every page to drop references to files about to be deleted."""
+        for page in self.page_lookup.values():
+            release = getattr(page, "release_derivative_resources", None)
+            if callable(release):
+                release(paths)
 
     def toggle_sidebar(self):
         self.sidebar_collapsed = not self.sidebar_collapsed
@@ -459,6 +515,18 @@ class MainWindow(QMainWindow):
                 self.nav_list.setCurrentRow(row)
                 return
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_responsive_layout(event.size().width())
+
+    def _apply_responsive_layout(self, width: int, *, force: bool = False):
+        compact_layout = width < 1320
+        if not force and compact_layout == self._compact_layout_active:
+            return
+        self._compact_layout_active = compact_layout
+        if hasattr(self, "dataset_inspector_panel"):
+            self.dataset_inspector_panel.set_responsive_collapsed(compact_layout)
+
     @Slot()
     def _on_settings_saved(self):
         updated_output_root = self.settings_store.output_root()
@@ -490,6 +558,116 @@ class MainWindow(QMainWindow):
     def _open_merge_tool(self):
         dialog = MergeToolDialog(self)
         dialog.exec()
+
+    def _export_preprocessed_files(self):
+        self._open_workspace_export_dialog(
+            mode="preprocessed",
+            export_label="preprocessed",
+            target_builder=preprocessed_export_targets,
+            exporter=export_preprocessed_files,
+        )
+
+    def _export_evoked_files(self):
+        self._open_workspace_export_dialog(
+            mode="evoked",
+            export_label="evoked",
+            target_builder=evoked_export_targets,
+            exporter=export_evoked_files,
+        )
+
+    def _workspace_preprocessed_paths(self) -> list[Path]:
+        source_paths: list[Path] = []
+        seen_paths: set[str] = set()
+        for dataset in self.workspace_panel.datasets:
+            if not dataset.stage_exists("preprocessed"):
+                continue
+            source_path = dataset.paths["preprocessed"]
+            source_key = str(source_path.resolve()).casefold()
+            if source_key not in seen_paths:
+                seen_paths.add(source_key)
+                source_paths.append(source_path)
+        return source_paths
+
+    def _open_workspace_export_dialog(
+        self,
+        *,
+        mode,
+        export_label,
+        target_builder,
+        exporter,
+    ):
+        if self.current_folder is None:
+            QMessageBox.warning(
+                self,
+                "No workspace open",
+                "Open a workspace before exporting files.",
+            )
+            return
+
+        source_paths = self._workspace_preprocessed_paths()
+        if not source_paths:
+            QMessageBox.information(
+                self,
+                "No preprocessed files",
+                "No preprocessed epochs files were found in the active workspace.",
+            )
+            return
+
+        dialog = ExportFilesDialog(
+            source_paths,
+            self.current_folder,
+            mode,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        source_paths = dialog.selected_source_paths()
+        destination = dialog.destination_path()
+        if destination is None:
+            return
+
+        try:
+            targets = target_builder(source_paths, destination)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Unable to export", str(exc))
+            return
+
+        existing_targets = [target for _, target in targets if target.exists()]
+        overwrite = False
+        if existing_targets:
+            file_word = "file" if len(existing_targets) == 1 else "files"
+            response = QMessageBox.question(
+                self,
+                "Replace existing files?",
+                f"{len(existing_targets)} export {file_word} already exist. Replace them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if response != QMessageBox.StandardButton.Yes:
+                return
+            overwrite = True
+
+        worker = Worker(
+            exporter,
+            source_paths,
+            destination,
+            overwrite=overwrite,
+            parent=self,
+            add_loggers=["", "mne"],
+        )
+        exported_paths = worker.exec_with_dialog(
+            "Exporting files",
+            f"Exporting {len(source_paths)} {export_label} file(s)...",
+        )
+        if exported_paths is None:
+            return
+
+        QMessageBox.information(
+            self,
+            "Export complete",
+            f"Exported {len(exported_paths)} {export_label} file(s) to:\n{destination}",
+        )
 
     def _open_qss_dialog(self):
         dialog = QSSEditorDialog(self)

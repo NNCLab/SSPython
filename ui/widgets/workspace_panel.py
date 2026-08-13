@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import gc
 from pathlib import Path
-from PySide6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt, Signal, QSize, QUrl
+from PySide6.QtCore import Qt, Signal, QSize, QUrl
 from PySide6.QtGui import QDesktopServices, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -15,6 +16,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
+    QSplitter,
     QStyle,
     QStyleOptionProgressBar,
     QVBoxLayout,
@@ -409,6 +412,7 @@ class WorkspacePanel(QFrame):
 
 
 class DatasetInspectorPanel(QFrame):
+    derivatives_about_to_be_deleted = Signal(object)
     derivatives_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None):
@@ -416,15 +420,17 @@ class DatasetInspectorPanel(QFrame):
         self.setObjectName("inspectorPanel")
         self.current_dataset: DatasetRecord | None = None
         self.collapsed = False
+        self.responsive_collapsed = False
         self.expanded_width = 300
         self.collapsed_width = 40
+        self._last_expanded_width = self.expanded_width
         self._build_ui()
         self._apply_collapsed_state(animated=False)
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 18, 10, 18)
-        layout.setSpacing(10)
+        self.root_layout = QVBoxLayout(self)
+        self.root_layout.setContentsMargins(10, 18, 10, 18)
+        self.root_layout.setSpacing(10)
 
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
@@ -436,9 +442,13 @@ class DatasetInspectorPanel(QFrame):
 
         self.toggle_button = QPushButton("")
         self.toggle_button.setObjectName("inspectorToggle")
+        self.toggle_button.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
         self.toggle_button.clicked.connect(self.toggle_collapsed)
         header_row.addWidget(self.toggle_button)
-        layout.addLayout(header_row)
+        self.root_layout.addLayout(header_row, 0)
 
         self.content_container = QWidget()
         content_layout = QVBoxLayout(self.content_container)
@@ -457,48 +467,93 @@ class DatasetInspectorPanel(QFrame):
         self.stage_status_list.stage_context_requested.connect(self._show_stage_context_menu)
         content_layout.addWidget(self.stage_status_list, 1)
 
-        layout.addWidget(self.content_container, 1)
+        self.root_layout.addWidget(self.content_container, 1)
         self.refresh_icons()
 
     def refresh_icons(self):
         self.toggle_button.setIcon(themed_svg_icon("assets/icons/menu.svg", size=20))
         self.toggle_button.setIconSize(QSize(20, 20))
-        self.toggle_button.setObjectName('sidebarToggle')
+        self.toggle_button.setObjectName("inspectorToggle")
 
     def toggle_collapsed(self):
-        self.collapsed = not self.collapsed
+        if self.responsive_collapsed:
+            self.responsive_collapsed = False
+            self.collapsed = False
+        else:
+            self.collapsed = not self.collapsed
         self._apply_collapsed_state(animated=True)
 
-    def _apply_collapsed_state(self, *, animated: bool):
-        target_width = self.collapsed_width if self.collapsed else self.expanded_width
-        if not self.collapsed:
-            self.content_container.setVisible(True)
-            self.title_label.setVisible(True)
-        self.toggle_button.setToolTip("Expand derivative inspector" if self.collapsed else "Collapse derivative inspector")
+    def set_responsive_collapsed(self, collapsed: bool):
+        """Temporarily compact the inspector without changing the saved choice."""
+        if self.responsive_collapsed == collapsed:
+            return
+        self.responsive_collapsed = collapsed
+        self._apply_collapsed_state(animated=False)
 
-        if not animated:
-            self.setMinimumWidth(target_width)
-            self.setMaximumWidth(target_width)
-            self.content_container.setVisible(not self.collapsed)
-            self.title_label.setVisible(not self.collapsed)
+    def _apply_collapsed_state(self, *, animated: bool):
+        effective_collapsed = self.collapsed or self.responsive_collapsed
+        self.content_container.setVisible(not effective_collapsed)
+        self.title_label.setVisible(not effective_collapsed)
+        self.toggle_button.setProperty("collapsed", effective_collapsed)
+        self.toggle_button.setToolTip(
+            "Expand derivative inspector"
+            if effective_collapsed
+            else "Collapse derivative inspector"
+        )
+
+        if effective_collapsed:
+            if self.width() > self.collapsed_width:
+                self._last_expanded_width = min(420, max(220, self.width()))
+            self.root_layout.setContentsMargins(3, 0, 3, 0)
+            self.root_layout.setSpacing(0)
+            self.root_layout.setStretch(0, 1)
+            self.root_layout.setStretch(1, 0)
+            self.toggle_button.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Expanding,
+            )
+            self.setMinimumWidth(self.collapsed_width)
+            self.setMaximumWidth(self.collapsed_width)
+            self._set_splitter_width(self.collapsed_width)
+        else:
+            self.root_layout.setContentsMargins(10, 18, 10, 18)
+            self.root_layout.setSpacing(10)
+            self.root_layout.setStretch(0, 0)
+            self.root_layout.setStretch(1, 1)
+            self.toggle_button.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Fixed,
+            )
+            self.setMinimumWidth(220)
+            self.setMaximumWidth(420)
+            self._set_splitter_width(self._last_expanded_width)
+
+        self.toggle_button.style().unpolish(self.toggle_button)
+        self.toggle_button.style().polish(self.toggle_button)
+
+    def _set_splitter_width(self, target_width: int):
+        splitter = self.parentWidget()
+        if not isinstance(splitter, QSplitter):
+            self.resize(target_width, self.height())
             return
 
-        animation_group = QParallelAnimationGroup(self)
-        for prop in (b"minimumWidth", b"maximumWidth"):
-            animation = QPropertyAnimation(self, prop)
-            animation.setDuration(160)
-            animation.setStartValue(self.width())
-            animation.setEndValue(target_width)
-            animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
-            animation_group.addAnimation(animation)
-        animation_group.finished.connect(
-            lambda: (
-                self.content_container.setVisible(not self.collapsed),
-                self.title_label.setVisible(not self.collapsed),
-            )
-        )
-        animation_group.start()
-        self._animation = animation_group
+        panel_index = splitter.indexOf(self)
+        if panel_index < 0:
+            return
+
+        sizes = splitter.sizes()
+        if panel_index >= len(sizes):
+            return
+
+        current_width = sizes[panel_index]
+        target_width = max(0, int(target_width))
+        reclaimed_width = current_width - target_width
+        sizes[panel_index] = target_width
+
+        content_index = panel_index - 1 if panel_index > 0 else panel_index + 1
+        if 0 <= content_index < len(sizes):
+            sizes[content_index] = max(1, sizes[content_index] + reclaimed_width)
+        splitter.setSizes(sizes)
 
     def set_dataset(self, dataset: DatasetRecord | None):
         self.current_dataset = dataset
@@ -551,7 +606,17 @@ class DatasetInspectorPanel(QFrame):
             description=stage.description,
             parent=self,
         )
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            # A parented Qt dialog can survive after exec() returns. Explicitly
+            # remove its MNE reference so EpochsFIF finalizers close their FIFs.
+            dialog.release_object()
+            dialog.deleteLater()
+            worker._result = None
+            worker.deleteLater()
+            del mne_object
+            gc.collect()
 
     def _show_stage_context_menu(self, stage_id: str, global_pos):
         if self.current_dataset is None:
@@ -653,6 +718,11 @@ class DatasetInspectorPanel(QFrame):
             )
 
     def _delete_derivative_paths(self, delete_paths: list[Path]) -> list[tuple[Path, str]]:
+        # This direct signal gives pages a chance to release cached MNE readers
+        # before Windows enforces its mandatory file locks.
+        self.derivatives_about_to_be_deleted.emit(tuple(delete_paths))
+        gc.collect()
+
         errors: list[tuple[Path, str]] = []
         for path in delete_paths:
             try:

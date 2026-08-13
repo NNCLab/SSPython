@@ -235,11 +235,21 @@ class RunICADialog(QDialog):
         ica_params = self.settings_widget.get_params()
         self.settings_widget.save_settings()
 
-        if self.preprocessor.has(self.mode + "-ica"):
+        if self.preprocessor.has(f"{self.mode}_ica"):
+            stage_id = f"{self.mode}_ica"
+            downstream_files = self.preprocessor.existing_downstream_files(stage_id)
+            downstream_warning = ""
+            if downstream_files:
+                file_names = "\n".join(f" - {path.name}" for _, path in downstream_files)
+                downstream_warning = (
+                    "\n\nOverwriting this ICA will also delete these dependent files:\n"
+                    f"{file_names}"
+                )
             reply = QMessageBox.question(
                 self,
                 "Overwrite ICA?",
-                f"{self.mode.split('-')[0].capitalize()} ICA data already exists. Do you want to overwrite it?",
+                f"{self.mode.split('-')[0].capitalize()} ICA data already exists. "
+                f"Do you want to overwrite it?{downstream_warning}",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -260,6 +270,8 @@ class RunICADialog(QDialog):
                 add_loggers="mne",
             )
         worker.exec_with_dialog("Processing", "Running ICA...")
+        if worker._error is not None:
+            return
         QMessageBox.information(self, "Done", "Finished running ICA.")
         self.accept()
 

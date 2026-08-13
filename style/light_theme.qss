@@ -14,15 +14,21 @@ QLabel, QCheckBox, QRadioButton {
 }
 
 #appShell {
-    background: #edf1f2;
+    background: qlineargradient(
+        x1: 0, y1: 0, x2: 1, y2: 1,
+        stop: 0 #cfe3e8,
+        stop: 0.48 #f6f8f8,
+        stop: 1 #d7e6eb
+    );
 }
 
-#contentFrame, #pageContent, #pageRoot {
-    background: #f7f9fa;
+#shellSplitter, #contentFrame, #pageStack, #pageRoot,
+#pageScrollArea, #pageScrollViewport, #pageContent {
+    background: transparent;
 }
 
 #sidebar, #workspacePanel, #inspectorPanel {
-    background: #ffffff;
+    background: rgba(255, 255, 255, 184);
 }
 
 #sidebar {
@@ -31,14 +37,23 @@ QLabel, QCheckBox, QRadioButton {
 
 #workspacePanel {
     border-right: 1px solid #d7e0e3;
-    min-width: 320px;
-    max-width: 360px;
+    min-width: 240px;
+    max-width: 440px;
 }
 
 #inspectorPanel {
     border-left: 1px solid #d7e0e3;
     min-width: 40px;
-    max-width: 300px;
+    max-width: 420px;
+}
+
+QSplitter#shellSplitter::handle {
+    background: #e2e8eb;
+    width: 2px;
+}
+
+QSplitter#shellSplitter::handle:hover {
+    background: #8eb3bc;
 }
 
 #sidebarBrand {
@@ -86,8 +101,19 @@ QLabel, QCheckBox, QRadioButton {
     border-radius: 10px;
 }
 
+#sectionTitle {
+    color: #142228;
+    font-size: 15pt;
+    font-weight: 600;
+}
+
 #contextCard {
     padding: 14px 16px;
+}
+
+#pageFooter {
+    background: #ffffff;
+    border-top: 1px solid #d7e0e3;
 }
 
 #pipelineCard[active="true"] {
@@ -124,6 +150,12 @@ QLabel, QCheckBox, QRadioButton {
 
 #sidebarToggle:hover, #inspectorToggle:hover {
     background: #eef4f6;
+}
+
+#inspectorToggle[collapsed="true"] {
+    min-height: 0;
+    padding: 0;
+    border-radius: 0;
 }
 
 #navList {
@@ -218,6 +250,12 @@ QPushButton:pressed {
     background: #185c68;
 }
 
+QPushButton:disabled {
+    background: #eef2f3;
+    color: #87949a;
+    border-color: #d8e0e3;
+}
+
 QPushButton:default {
     background: #185f6d;
     border-color: #317b8a;
@@ -234,10 +272,57 @@ QPushButton#secondaryButton:hover {
     background: #f4f7f8;
 }
 
+QPushButton#secondaryButton:disabled {
+    background: #f4f6f7;
+    color: #929da2;
+    border-color: #dce3e6;
+}
+
+QPushButton#dangerButton {
+    background: transparent;
+    color: #a13f3f;
+    border-color: #d8aaaa;
+}
+
+QPushButton#dangerButton:hover {
+    background: #fff2f2;
+    border-color: #c77777;
+}
+
+QPushButton[analysisAction="true"] {
+    min-width: 150px;
+}
+
 QPushButton[workflowButton="true"] {
     min-height: 38px;
-    text-align: left;
     padding: 9px 12px;
+}
+
+#workflowPanel {
+    background: transparent;
+}
+
+#workflowActionRow {
+    background: #f8fafb;
+    border: 1px solid #e0e7ea;
+    border-radius: 8px;
+}
+
+#stepNumber {
+    background: #e2f0f3;
+    color: #245e69;
+    border: 1px solid #bfd6dc;
+    border-radius: 14px;
+    font-weight: 600;
+}
+
+#workflowActionTitle, #analysisMethodTitle {
+    color: #142228;
+    font-weight: 600;
+}
+
+#analysisMethodDescription {
+    color: #64747c;
 }
 
 QPushButton[workflowButton="true"][workflowRole="inspect"] {

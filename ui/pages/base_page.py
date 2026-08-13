@@ -19,22 +19,28 @@ class BasePage(QWidget):
         super().__init__(parent)
         self.setObjectName("pageRoot")
 
-        base_layout = QVBoxLayout(self)
-        base_layout.setContentsMargins(0, 0, 0, 0)
-        base_layout.setSpacing(0)
+        self.base_layout = QVBoxLayout(self)
+        self.base_layout.setContentsMargins(0, 0, 0, 0)
+        self.base_layout.setSpacing(0)
         self.scroll_area = QScrollArea()
+        self.scroll_area.setObjectName("pageScrollArea")
+        self.scroll_area.viewport().setObjectName("pageScrollViewport")
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.scroll_area.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter
+        )
         self.scroll_area.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        base_layout.addWidget(self.scroll_area)
+        self.base_layout.addWidget(self.scroll_area, 1)
 
-        content_container = QWidget()
-        content_container.setObjectName("pageContent")
-        self.scroll_area.setWidget(content_container)
+        self.content_container = QWidget()
+        self.content_container.setObjectName("pageContent")
+        self.content_container.setMaximumWidth(1440)
+        self.scroll_area.setWidget(self.content_container)
 
-        self.content_layout = QVBoxLayout(content_container)
+        self.content_layout = QVBoxLayout(self.content_container)
         self.content_layout.setContentsMargins(24, 24, 24, 24)
         self.content_layout.setSpacing(16)
 
@@ -75,6 +81,18 @@ class BasePage(QWidget):
 
     def set_page_title(self, title: str):
         self.title_label.setText(title)
+
+    def set_content_maximum_width(self, width: int):
+        """Limit long pages while allowing them to shrink with the window."""
+        self.content_container.setMaximumWidth(max(0, int(width)))
+
+    def set_header_visible(self, visible: bool):
+        self.header_frame.setVisible(visible)
+
+    def set_footer(self, footer: QWidget):
+        """Add a fixed footer below the scrollable page body."""
+        footer.setParent(self)
+        self.base_layout.addWidget(footer, 0)
 
     def set_page_subtitle(self, subtitle: str | None):
         if subtitle:

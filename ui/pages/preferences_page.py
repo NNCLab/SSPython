@@ -2,11 +2,13 @@ import logging
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QToolBox,
     QVBoxLayout,
     QWidget,
@@ -33,6 +35,7 @@ class PreferencesPage(BasePage):
 
     def __init__(self, settings_store, parent: QWidget | None = None):
         super().__init__("Preferences", parent)
+        self.set_content_maximum_width(1120)
         self.settings_store = settings_store
         self.main_window = parent
         self.settings_widgets: list[QWidget] = []
@@ -64,11 +67,21 @@ class PreferencesPage(BasePage):
         self.add_content(self.summary_card)
 
         self.tool_box = QToolBox()
+        self.tool_box.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.add_content(self.tool_box)
+        self.content_layout.setStretch(self.content_layout.indexOf(self.tool_box), 1)
 
-        button_row = QHBoxLayout()
+        footer = QFrame()
+        footer.setObjectName("pageFooter")
+        button_row = QHBoxLayout(footer)
+        button_row.setContentsMargins(24, 12, 24, 12)
         self.clear_all_button = QPushButton("Reset Settings")
+        self.clear_all_button.setObjectName("dangerButton")
         self.revert_button = QPushButton("Reload Saved")
+        self.revert_button.setObjectName("secondaryButton")
         self.save_button = QPushButton("Save Changes")
         self.save_button.setDefault(True)
 
@@ -76,7 +89,7 @@ class PreferencesPage(BasePage):
         button_row.addStretch()
         button_row.addWidget(self.revert_button)
         button_row.addWidget(self.save_button)
-        self.add_content(button_row)
+        self.set_footer(footer)
 
     def _populate_categories(self):
         self.global_settings_widget = GlobalSettingsWidget()
@@ -119,13 +132,21 @@ class PreferencesPage(BasePage):
 
     def add_settings_category(self, title: str, *widgets: QWidget):
         container = QFrame()
+        container.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         layout = QVBoxLayout(container)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(12)
         for widget in widgets:
             layout.addWidget(widget)
             self.settings_widgets.append(widget)
+        layout.addStretch(1)
         self.tool_box.addItem(container, title)
+        for button in self.tool_box.findChildren(QAbstractButton):
+            if button.parentWidget() is self.tool_box:
+                button.setMinimumHeight(38)
 
     def _active_pipeline_id(self) -> str:
         return self.global_settings_widget.pipeline_combo.currentData()

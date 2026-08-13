@@ -11,6 +11,55 @@ from PySide6.QtCore import Qt, QTimer, Signal, QSize
 from PySide6.QtWidgets import QDockWidget, QSizePolicy, QVBoxLayout, QWidget
 
 
+def compute_butterfly_snr(
+    mean_data_uV: np.ndarray,
+    times_ms: np.ndarray,
+    baseline_window_ms: tuple[float, float],
+    response_window_ms: tuple[float, float],
+) -> float:
+    """Return response RMS divided by baseline RMS across butterfly traces."""
+    data = np.asarray(mean_data_uV, dtype=float)
+    times = np.asarray(times_ms, dtype=float)
+    if data.ndim == 1:
+        data = data[np.newaxis, :]
+    if data.ndim != 2 or times.ndim != 1 or data.shape[1] != times.size:
+        return np.nan
+
+    baseline_start, baseline_end = sorted(
+        (float(baseline_window_ms[0]), float(baseline_window_ms[1]))
+    )
+    response_start, response_end = sorted(
+        (float(response_window_ms[0]), float(response_window_ms[1]))
+    )
+    baseline_mask = (
+        (times >= baseline_start)
+        & (times <= baseline_end)
+        & (times < 0.0)
+    )
+    response_mask = (
+        (times >= response_start)
+        & (times <= response_end)
+        & (times > 0.0)
+    )
+
+    def window_rms(mask: np.ndarray) -> float:
+        if not np.any(mask):
+            return np.nan
+        values = data[:, mask]
+        finite_values = values[np.isfinite(values)]
+        if finite_values.size == 0:
+            return np.nan
+        return float(np.sqrt(np.mean(np.square(finite_values))))
+
+    baseline_rms = window_rms(baseline_mask)
+    response_rms = window_rms(response_mask)
+    if not np.isfinite(baseline_rms) or baseline_rms <= 0.0:
+        return np.nan
+    if not np.isfinite(response_rms):
+        return np.nan
+    return float(response_rms / baseline_rms)
+
+
 class BasePlotDock(QDockWidget):
     DISPLAY_POINTS_PER_PIXEL = 1.35
     DISPLAY_MIN_POINTS = 320
@@ -279,7 +328,7 @@ class EvokedButterflyDock(BasePlotDock):
 
     def __init__(self, parent=None):
         super().__init__("Evoked Potentials", parent)
-        self.figure.subplots_adjust(left=0.1, right=0.99, bottom=0.12, top=0.98)
+        self.figure.subplots_adjust(left=0.1, right=0.99, bottom=0.12, top=0.9)
         self.ax = self.figure.add_subplot(111)
         self.times_ms = np.array([], dtype=float)
         self.ch_names: list[str] = []
@@ -289,6 +338,9 @@ class EvokedButterflyDock(BasePlotDock):
         self.latest_mean_data_uV = np.empty((0, 0), dtype=float)
         self.latest_bads: list[str] = []
         self.latest_global_limits = (-10.0, 10.0)
+        self.snr_baseline_window_ms = (-100.0, 0.0)
+        self.snr_response_window_ms = (0.0, 100.0)
+        self.latest_snr = np.nan
         self._mouse_press = None
         self._drag_span = None
         self.canvas.mpl_connect("button_press_event", self._on_button_press)
@@ -299,6 +351,7 @@ class EvokedButterflyDock(BasePlotDock):
         self.times_ms = np.asarray(times_ms, dtype=float)
         self.ch_names = list(ch_names)
         self.colors = list(colors)
+        self.latest_snr = np.nan
 
         self.ax.clear()
         self.lines = [
@@ -314,8 +367,28 @@ class EvokedButterflyDock(BasePlotDock):
         self.ax.set_ylim(-10.0, 10.0)
         self.ax.set_xlabel("Time (ms)")
         self.ax.set_ylabel("Potential (uV)")
+        self._update_snr_title()
         self._drag_span = self.ax.axvspan(0.0, 0.0, facecolor="#2f7e8d", alpha=0.22, visible=False, zorder=0.1)
         self.set_roi_region(self._default_roi_region(), emit=False)
+
+    def set_snr_windows(
+        self,
+        baseline_window_ms: tuple[float, float],
+        response_window_ms: tuple[float, float],
+    ):
+        self.snr_baseline_window_ms = tuple(
+            sorted((float(baseline_window_ms[0]), float(baseline_window_ms[1])))
+        )
+        self.snr_response_window_ms = tuple(
+            sorted((float(response_window_ms[0]), float(response_window_ms[1])))
+        )
+        self._rerender_cached_data()
+
+    def _update_snr_title(self):
+        title = "SNR: —"
+        if np.isfinite(self.latest_snr):
+            title = f"SNR: {self.latest_snr:.2f}"
+        self.ax.set_title(title, loc="left", pad=8)
 
     def _default_roi_region(self) -> tuple[float, float]:
         if self.times_ms.size == 0:
@@ -472,6 +545,9 @@ class EvokedButterflyDock(BasePlotDock):
 
     def _rerender_cached_data(self):
         if self.latest_mean_data_uV.size == 0 or self.times_ms.size == 0:
+            self.latest_snr = np.nan
+            self._update_snr_title()
+            self.request_draw()
             return
         indices = self._display_indices(self.times_ms.size)
         time_axis = self.times_ms[indices]
@@ -480,6 +556,24 @@ class EvokedButterflyDock(BasePlotDock):
                 line.set_data(time_axis, np.full_like(time_axis, np.nan))
             else:
                 line.set_data(time_axis, self.latest_mean_data_uV[index, indices])
+
+        good_indices = [
+            index
+            for index, channel_name in enumerate(self.ch_names)
+            if channel_name not in self.latest_bads
+        ]
+        snr_data = (
+            self.latest_mean_data_uV[good_indices]
+            if good_indices
+            else np.empty((0, self.times_ms.size))
+        )
+        self.latest_snr = compute_butterfly_snr(
+            snr_data,
+            self.times_ms,
+            self.snr_baseline_window_ms,
+            self.snr_response_window_ms,
+        )
+        self._update_snr_title()
 
         global_min, global_max = self.latest_global_limits
         y_padding = max(1.0, (global_max - global_min) * 0.12)

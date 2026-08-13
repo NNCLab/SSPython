@@ -1,4 +1,5 @@
 # %% Imports
+import gc
 import os
 from pathlib import Path
 import mne
@@ -10,7 +11,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import core.external.pci_st as pci_st
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 
 from core.pipelines import (
@@ -159,9 +160,50 @@ class Preprocessor:
         else:
             return self.raw
 
+    def release_cached_stages(self, stage_ids, verbose: bool = True):
+        """Release file-backed MNE objects cached for the given stages."""
+        for stage_id in stage_ids:
+            private_attr = f"_{stage_id}"
+            if not hasattr(self, private_attr):
+                continue
+
+            obj = getattr(self, private_attr)
+            # BaseRaw exposes close(). EpochsFIF does not, so loading its data
+            # is the supported way to detach it from the underlying FIF file.
+            if hasattr(obj, "load_data"):
+                obj.load_data()
+            close = getattr(obj, "close", None)
+            if callable(close):
+                close()
+            delattr(self, private_attr)
+            del obj
+            if verbose:
+                logger.info(f"Cleared in-memory object: {private_attr}")
+
+        # MNE's EpochsFIF reader closes its internal file objects when their
+        # final references are collected. Force that finalization before an
+        # unlink/overwrite attempt on Windows.
+        gc.collect()
+
+    def existing_downstream_files(self, current_step: str) -> list[tuple[str, Path]]:
+        """Return existing stage files that depend on ``current_step``."""
+        try:
+            start_index = self.processing_order.index(current_step)
+        except ValueError:
+            return []
+
+        return [
+            (stage_id, self.paths[stage_id])
+            for stage_id in self.processing_order[start_index + 1 :]
+            if stage_id != "raw" and self.has(stage_id)
+        ]
+
     def _clear_downstream_files(self, current_step: str, verbose: bool = True):
         """
-        Deletes all files and memory caches downstream from the current processing step.
+        Release the current output cache and delete all downstream outputs.
+
+        The current stage's file is left in place because the caller will
+        overwrite it, but its cached reader must still be released first.
         """
         try:
             start_index = self.processing_order.index(current_step)
@@ -171,9 +213,11 @@ class Preprocessor:
             )
             return
 
-        # Iterate through all steps that come AFTER the current one
-        for i in range(start_index + 1, len(self.processing_order)):
-            step_to_delete = self.processing_order[i]
+        stages_to_clear = self.processing_order[start_index:]
+        self.release_cached_stages(stages_to_clear, verbose=verbose)
+
+        # Iterate through all steps that come AFTER the current one.
+        for step_to_delete in self.processing_order[start_index + 1 :]:
             if step_to_delete == "raw":
                 continue
 
@@ -185,28 +229,23 @@ class Preprocessor:
                         f"Overwriting '{step_to_delete}'. Deleting downstream file: {file_path.name}"
                     )
 
-                # Construct the private attribute name (e.g., 'epochs' -> '_epochs')
-                private_attr = f"_{step_to_delete}"
-                if hasattr(self, private_attr):
-                    # If the object is in memory, load its data to release the file lock before deleting.
-                    obj = getattr(self, private_attr)
-                    if hasattr(obj, "load_data"):
-                        obj.load_data()
-                    delattr(self, private_attr)
-                    if verbose:
-                        logger.info(f"Cleared in-memory object: {private_attr}")
+                # MNE FIF readers can keep file handles alive until their final
+                # references are collected, which prevents deletion on Windows.
+                gc.collect()
                 try:
                     os.remove(file_path)
                 except PermissionError:
-                    # Fallback for Windows if .close() didn't work or wasn't available
                     logger.warning(
-                        f"File lock detected on {file_path.name}. Attempting to force release..."
+                        f"File lock detected on {file_path.name}. Retrying deletion..."
                     )
+                    gc.collect()
                     try:
-                        # Re-access property to force load, then gc might help, but usually .close() is enough
-                        getattr(self, step_to_delete).load_data()
-                    except Exception as e:
-                        logger.error(f"Could not delete file {file_path.name}: {e}")
+                        os.remove(file_path)
+                    except PermissionError as retry_error:
+                        raise PermissionError(
+                            f"Could not delete downstream file '{file_path}'. "
+                            "Close any plot or program using it, then try again."
+                        ) from retry_error
 
     @staticmethod
     def add_description(obj, description: dict):
@@ -227,6 +266,26 @@ class Preprocessor:
                 log_list = [{"description": str(parsed)}]
         log_list.append(description)
         obj.info["description"] = json.dumps(log_list, indent=4)
+
+    @staticmethod
+    def _ica_log(ica, source_stage: str) -> dict:
+        log = {
+            "applied": ica is not None,
+            "source_stage": source_stage,
+        }
+        if ica is None:
+            return log
+
+        excluded_components = [int(component) for component in ica.exclude]
+        log.update(
+            {
+                "method": ica.method,
+                "n_components": int(ica.n_components_),
+                "excluded_components": excluded_components,
+                "excluded_count": len(excluded_components),
+            }
+        )
+        return log
 
     @staticmethod
     def interpolate_tms_pulse(
@@ -310,18 +369,6 @@ class Preprocessor:
             )
             return raw
 
-        # OLD
-        # def tms_pulse_removal(y):
-        #     for onset in onsets:
-        #         cut0 = int(onset+window[0])
-        #         cut1 = int(onset+window[1])
-
-        #         y[cut0:cut1] = y[cut0-window_len:cut1-window_len][::-1]
-
-        #         y[cut0+smoothing[0]:cut0+smoothing[1]] = np.array([np.mean(y[samp-span[0]:samp+span[1]]) for samp in range(cut0+smoothing[0], cut0+smoothing[1])])
-        #         y[cut1+smoothing[0]:cut1+smoothing[1]] = np.array([np.mean(y[samp-span[0]:samp+span[1]]) for samp in range(cut1+smoothing[0], cut1+smoothing[1])])
-        #     return y
-
         def tms_pulse_removal(y):
             # This function is applied to each channel independently
             for onset in onsets:
@@ -332,9 +379,6 @@ class Preprocessor:
                 y[cut0:cut1] = y[cut0 - window_len : cut1 - window_len][::-1]
 
                 # Smooth the transition points using a moving average
-                # Note: A list comprehension calculates all means before assigning,
-                # which is important for the logic to be correct.
-
                 if smoothing_s is not None:
                     # Smooth at the start of the replaced window
                     start_smooth_range = range(cut0 + smoothing_s[0], cut0 + smoothing_s[1])
@@ -355,7 +399,6 @@ class Preprocessor:
                     )
             return y
 
-        # raw.apply_function(tms_pulse_removal, picks='eeg', verbose=verbose)
         ch_types = raw.get_channel_types()
         eeg_ch_idx = {
             ch: idx
@@ -571,11 +614,13 @@ class Preprocessor:
                 verbose=False,
             )
 
-        if self.has("continuous_ica"):
+        continuous_ica = self.continuous_ica if self.has("continuous_ica") else None
+        continuous_ica_log = self._ica_log(continuous_ica, "continuous_ica")
+        if continuous_ica is not None:
             logger.info(
-                f"Applying continuous ICA ({len(self.continuous_ica.exclude)} components excluded)..."
+                f"Applying continuous ICA ({continuous_ica_log['excluded_count']} components excluded)..."
             )
-            raw = self.continuous_ica.apply(raw)
+            raw = continuous_ica.apply(raw)
 
         # 3. Branching Logic: Event vs Fixed
         logger.info(f"Epoching mode: {mode}")
@@ -643,7 +688,8 @@ class Preprocessor:
             {
                 "epoching": {
                     "mode": mode,
-                    "continuous_ica": self.has("continuous_ica"),
+                    "continuous_ica": continuous_ica_log["applied"],
+                    "ica": continuous_ica_log,
                     "event_id": (
                         resolved_event_id if mode == "event" else "N/A"
                     ),
@@ -698,6 +744,8 @@ class Preprocessor:
         return {str(code): int(code) for code in sorted(selected_codes)}
 
     def update_epochs(self, epochs: mne.Epochs):
+        if not epochs.preload:
+            epochs.load_data()
         self._clear_downstream_files("epochs")
         self.add_description(
             epochs,
@@ -751,13 +799,14 @@ class Preprocessor:
         self,
         reference: list[str] | str | None = None,
     ):
+        epochs = self.epochs.load_data()
         self._clear_downstream_files("epochs")
         if reference is not None:
             logger.info(f"Setting reference {reference}...")
-            self.epochs.set_eeg_reference(reference, projection=True)
-            self.epochs.apply_proj()
+            epochs.set_eeg_reference(reference, projection=True)
+            epochs.apply_proj()
             self.add_description(
-                self.epochs,
+                epochs,
                 {
                     "rereference": {
                         "reference": reference,
@@ -767,7 +816,8 @@ class Preprocessor:
                 },
             )
             logger.info("Saving changes...")
-            self.epochs.save(self.paths["epochs"], overwrite=True)
+            epochs.save(self.paths["epochs"], overwrite=True)
+            self._epochs = epochs
 
     def run_epochs_ica(
         self,
@@ -856,10 +906,16 @@ class Preprocessor:
         logger.info("Loading epoched data...")
         epochs = self.epochs.load_data().copy()
 
-        logger.info("Applying ICA...")
+        ica = self.epochs_ica if self.has("epochs_ica") else None
+        ica_log = self._ica_log(ica, "epochs_ica")
 
-        if self.has("epochs_ica"):
-            self.epochs_ica.apply(epochs, verbose=verbose)
+        if ica is not None:
+            logger.info(
+                f"Applying epoch ICA ({ica_log['excluded_count']} components excluded)..."
+            )
+            ica.apply(epochs, verbose=verbose)
+        else:
+            logger.info("No epoch ICA available; skipping ICA application.")
 
         if bads is not None and len(bads) > 0:
             epochs.info["bads"] = list(set(epochs.info["bads"]).union(set(bads)))
@@ -916,6 +972,8 @@ class Preprocessor:
             logger.info("Skipping baseline correction for fixed-length epochs.")
             baseline = "skipped"  # For logging purposes
 
+        self.release_cached_stages(["preprocessed"], verbose=False)
+
         self.add_description(
             epochs,
             {
@@ -926,6 +984,7 @@ class Preprocessor:
                     "interpolate_bad_channels": interpolate_bad_channels,
                     "reference": reference,
                     "baseline": baseline,
+                    "ica": ica_log,
                     "date": datetime.now().isoformat(),
                 }
             },

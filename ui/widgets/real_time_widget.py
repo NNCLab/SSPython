@@ -12,6 +12,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QWidget,
     QVBoxLayout,
     QPushButton,
@@ -51,6 +52,8 @@ from utils import apply_theme, current_theme_name, theme_tokens
 DEFAULT_LIVE_EVENT_ID_MAX = 65535
 MEP_THRESHOLD_UV = 50.0
 DEFAULT_MEP_WINDOW_MS = (15.0, 50.0)
+DEFAULT_SNR_BASELINE_WINDOW = (-0.1, 0.0)
+DEFAULT_SNR_RESPONSE_WINDOW = (0.0, 0.1)
 REALTIME_AMPLITUDE_SCALE_OPTIONS = (
     ("Volts (V)", 1.0),
     ("Microvolts (uV)", 1e-6),
@@ -1425,6 +1428,30 @@ class RealTimeSettingsWidget(QWidget):
         self.refresh_rate_input.setRange(1, 60)
         form_layout.addRow("Refresh Rate:", self.refresh_rate_input)
 
+        form_layout.addRow(QLabel("<br><b>Butterfly SNR</b>"))
+
+        self.snr_baseline_input = OptionalRangeWidget(
+            ("Start:", "End:"),
+            suffix=" ms",
+            required=(True, True),
+            range=(None, None),
+            scale=1e-3,
+        )
+        self.snr_response_input = OptionalRangeWidget(
+            ("Start:", "End:"),
+            suffix=" ms",
+            required=(True, True),
+            range=(None, None),
+            scale=1e-3,
+        )
+        for range_widget in (self.snr_baseline_input, self.snr_response_input):
+            for spinbox in (range_widget.low_input, range_widget.high_input):
+                spinbox.setRange(-5000.0, 5000.0)
+                spinbox.setDecimals(1)
+            range_widget.adjust_spinbox_width()
+        form_layout.addRow("Baseline RMS:", self.snr_baseline_input)
+        form_layout.addRow("Response RMS:", self.snr_response_input)
+
         form_layout.addRow(QLabel("<br><b>Real-Time Pre-processing</b>"))
 
         self.art_rem_input = OptionalRangeWidget(
@@ -1465,6 +1492,8 @@ class RealTimeSettingsWidget(QWidget):
         self.bandpass_input.valueChanged.connect(self._emit_settings_changed)
         self.apply_notch.toggled.connect(self._emit_settings_changed)
         self.notch_input.textChanged.connect(self._emit_settings_changed)
+        self.snr_baseline_input.valueChanged.connect(self._emit_settings_changed)
+        self.snr_response_input.valueChanged.connect(self._emit_settings_changed)
         main_layout.addStretch(1)
 
     def _set_amplitude_scale(self, value):
@@ -1488,6 +1517,8 @@ class RealTimeSettingsWidget(QWidget):
 
         return {
             "refresh_rate": self.refresh_rate_input.value(),
+            "snr_baseline": self.snr_baseline_input.value(),
+            "snr_response": self.snr_response_input.value(),
             "art_rem": self.art_rem_input.value(),
             "amplitude_scale": normalize_realtime_amplitude_scale(self.amplitude_scale_combo.currentData()),
             "reference": "average" if self.average_reference_checkbox.isChecked() else "none",
@@ -1503,6 +1534,14 @@ class RealTimeSettingsWidget(QWidget):
         try:
             self.refresh_rate_input.setValue(params.get("refresh_rate"))
             self._set_amplitude_scale(params.get("amplitude_scale", 1.0))
+            self.snr_baseline_input.setValue(
+                params.get("snr_baseline", DEFAULT_SNR_BASELINE_WINDOW)
+                or DEFAULT_SNR_BASELINE_WINDOW
+            )
+            self.snr_response_input.setValue(
+                params.get("snr_response", DEFAULT_SNR_RESPONSE_WINDOW)
+                or DEFAULT_SNR_RESPONSE_WINDOW
+            )
             self.average_reference_checkbox.setChecked(params.get("reference", "average") == "average")
             self.apply_bandpass.setChecked(params.get("apply_bandpass"))
             self.apply_notch.setChecked(params.get("apply_notch"))
@@ -1533,6 +1572,8 @@ class RealTimeSettingsWidget(QWidget):
         """Loads parameters from QSettings, applying defaults, and updates the UI."""
         default_params = {
             "refresh_rate": 24,
+            "snr_baseline": DEFAULT_SNR_BASELINE_WINDOW,
+            "snr_response": DEFAULT_SNR_RESPONSE_WINDOW,
             "art_rem": (-0.005, 0.005),
             "amplitude_scale": 1.0,
             "reference": "average",
@@ -2485,6 +2526,12 @@ class RealTimeERP(QMainWindow):
 
         self.toolbar = self._create_toolbar()
         self.addToolBar(Qt.TopToolBarArea, self.toolbar)
+        self.addToolBarBreak(Qt.TopToolBarArea)
+        self.controls_toolbar = self._create_controls_toolbar()
+        self.addToolBar(Qt.TopToolBarArea, self.controls_toolbar)
+        self._update_montage_dependent_ui()
+        self._update_mep_dependent_ui()
+        self._update_topbar_minimum_width()
         self._restore_default_dock_layout()
         self.refresh_theme()
 
@@ -2514,27 +2561,81 @@ class RealTimeERP(QMainWindow):
 
     def _update_montage_dependent_ui(self):
         has_montage = self._has_visual_montage()
-        self.topo_dock.setVisible(has_montage)
+        if has_montage:
+            if self.dockWidgetArea(self.topo_dock) == Qt.DockWidgetArea.NoDockWidgetArea:
+                self.addDockWidget(Qt.LeftDockWidgetArea, self.topo_dock)
+                self.splitDockWidget(
+                    self.raw_dock,
+                    self.topo_dock,
+                    Qt.Orientation.Horizontal,
+                )
+                self.resizeDocks(
+                    [self.raw_dock, self.topo_dock],
+                    [640, 640],
+                    Qt.Orientation.Horizontal,
+                )
+            self.topo_dock.show()
+        else:
+            self.topo_dock.hide()
         if hasattr(self, "topo_toggle_action"):
             self.topo_toggle_action.setEnabled(has_montage)
             self.topo_toggle_action.setVisible(has_montage)
         if not has_montage and self.topomap_dialog is not None:
             self.topomap_dialog.close()
+        self._schedule_topbar_minimum_width_update()
 
     def _has_mep_channels(self) -> bool:
         return bool(self.emg_names)
 
     def _update_mep_dependent_ui(self):
         has_mep = self._has_mep_channels()
-        self.mep_dock.setVisible(has_mep)
+        if has_mep:
+            if self.dockWidgetArea(self.mep_dock) == Qt.DockWidgetArea.NoDockWidgetArea:
+                self.addDockWidget(Qt.BottomDockWidgetArea, self.mep_dock)
+                self.splitDockWidget(
+                    self.evoked_dock,
+                    self.mep_dock,
+                    Qt.Orientation.Horizontal,
+                )
+                self.resizeDocks(
+                    [self.evoked_dock, self.mep_dock],
+                    [760, 420],
+                    Qt.Orientation.Horizontal,
+                )
+            self.mep_dock.show()
+        else:
+            self.mep_dock.hide()
         if hasattr(self, "mep_toggle_action"):
             self.mep_toggle_action.setEnabled(has_mep)
             self.mep_toggle_action.setVisible(has_mep)
+        for action in getattr(self, "mep_toolbar_actions", ()):
+            action.setVisible(has_mep)
         for attr_name in ("mep_active_label", "mep_active_combo", "mep_reference_label", "mep_reference_combo"):
             if hasattr(self, attr_name):
                 widget = getattr(self, attr_name)
                 widget.setEnabled(has_mep)
                 widget.setVisible(has_mep)
+        self._schedule_topbar_minimum_width_update()
+
+    def _schedule_topbar_minimum_width_update(self):
+        if hasattr(self, "toolbar") and hasattr(self, "controls_toolbar"):
+            QTimer.singleShot(0, self._update_topbar_minimum_width)
+
+    def _update_topbar_minimum_width(self):
+        toolbars = [
+            toolbar
+            for toolbar in (
+                getattr(self, "toolbar", None),
+                getattr(self, "controls_toolbar", None),
+            )
+            if toolbar is not None
+        ]
+        if not toolbars:
+            return
+        for toolbar in toolbars:
+            toolbar.updateGeometry()
+        required_width = max(toolbar.sizeHint().width() for toolbar in toolbars) + 24
+        self.setMinimumWidth(max(900, required_width))
 
     def _restore_default_dock_layout(self):
         for dock in (self.raw_dock, self.evoked_dock):
@@ -2591,6 +2692,9 @@ class RealTimeERP(QMainWindow):
         toolbar = QToolBar(self)
         toolbar.setObjectName("RealTimeToolBar")
         toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setAllowedAreas(Qt.ToolBarArea.TopToolBarArea)
+        toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
 
         self.raw_toggle_action = self.raw_dock.toggleViewAction()
         self.raw_toggle_action.setText("Raw")
@@ -2612,6 +2716,25 @@ class RealTimeERP(QMainWindow):
         toolbar.addAction("Reset Layout").triggered.connect(self._restore_default_dock_layout)
 
         toolbar.addSeparator()
+
+        self.clear_epochs_action = toolbar.addAction("Clear Epochs")
+        self.clear_epochs_action.triggered.connect(self.clear_epochs)
+
+        self.epoch_count_label = QLabel("Epochs: 0")
+        self.epoch_count_label.setObjectName("mutedLabel")
+        toolbar.addWidget(self.epoch_count_label)
+
+        toolbar.addSeparator()
+        toolbar.addAction("Settings").triggered.connect(self.update_settings)
+        return toolbar
+
+    def _create_controls_toolbar(self):
+        toolbar = QToolBar(self)
+        toolbar.setObjectName("RealTimeControlsToolBar")
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setAllowedAreas(Qt.ToolBarArea.TopToolBarArea)
+        toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
 
         self.scale_mode_combo = QComboBox()
         self.scale_mode_combo.addItems(["Global Auto-Scale", "Local Auto-Scale"])
@@ -2636,14 +2759,8 @@ class RealTimeERP(QMainWindow):
         toolbar.addWidget(QLabel(" View Epochs: "))
         toolbar.addWidget(self.display_epoch_spinbox)
 
-        self.clear_epochs_action = toolbar.addAction("Clear Epochs")
-        self.clear_epochs_action.triggered.connect(self.clear_epochs)
-
-        self.epoch_count_label = QLabel("Epochs: 0")
-        self.epoch_count_label.setObjectName("mutedLabel")
-        toolbar.addWidget(self.epoch_count_label)
-
-        toolbar.addSeparator()
+        self.mep_toolbar_actions = []
+        self.mep_toolbar_actions.append(toolbar.addSeparator())
         self.mep_active_label = QLabel(" MEP Active: ")
         self.mep_active_combo = QComboBox()
         self.mep_active_combo.setMinimumWidth(120)
@@ -2652,14 +2769,14 @@ class RealTimeERP(QMainWindow):
         self.mep_reference_combo = QComboBox()
         self.mep_reference_combo.setMinimumWidth(120)
         self.mep_reference_combo.currentTextChanged.connect(self._on_mep_channel_changed)
-        toolbar.addWidget(self.mep_active_label)
-        toolbar.addWidget(self.mep_active_combo)
-        toolbar.addWidget(self.mep_reference_label)
-        toolbar.addWidget(self.mep_reference_combo)
-
-        toolbar.addSeparator()
-        toolbar.addAction("Settings").triggered.connect(self.update_settings)
-        self._update_mep_dependent_ui()
+        self.mep_toolbar_actions.extend(
+            (
+                toolbar.addWidget(self.mep_active_label),
+                toolbar.addWidget(self.mep_active_combo),
+                toolbar.addWidget(self.mep_reference_label),
+                toolbar.addWidget(self.mep_reference_combo),
+            )
+        )
         return toolbar
 
     def _update_epoch_count_label(self):
@@ -3010,6 +3127,7 @@ class RealTimeERP(QMainWindow):
 
         self.raw_dock.configure(self.ch_names, self.colors, stream_duration)
         self.evoked_dock.configure(time_axis_ms, self.ch_names, self.colors)
+        self._apply_snr_windows_to_plot()
         self.mep_dock.configure(time_axis_ms)
         if self._has_visual_montage():
             positions = calculate_mne_style_layout(self.coords_2d)
@@ -3305,6 +3423,14 @@ class RealTimeERP(QMainWindow):
     def _current_live_plot_settings(self) -> dict:
         return {
             "refresh_rate": int(self.params.get("refresh_rate", 24) or 24),
+            "snr_baseline": self.params.get(
+                "snr_baseline",
+                DEFAULT_SNR_BASELINE_WINDOW,
+            ),
+            "snr_response": self.params.get(
+                "snr_response",
+                DEFAULT_SNR_RESPONSE_WINDOW,
+            ),
             "art_rem": self.params.get("art_rem", (-0.005, 0.005)),
             "amplitude_scale": normalize_realtime_amplitude_scale(self.params.get("amplitude_scale", 1.0)),
             "reference": "average" if self.params.get("reference", "average") == "average" else "none",
@@ -3314,11 +3440,36 @@ class RealTimeERP(QMainWindow):
             "notch_freqs": list(self.params.get("notch_freqs", [50.0]) or []),
         }
 
+    @staticmethod
+    def _snr_window_ms(value, default_window) -> tuple[float, float]:
+        window = value or default_window
+        try:
+            start, end = float(window[0]), float(window[1])
+        except (IndexError, TypeError, ValueError):
+            start, end = default_window
+        if not np.isfinite(start) or not np.isfinite(end) or start == end:
+            start, end = default_window
+        return tuple(sorted((start * 1e3, end * 1e3)))
+
+    def _apply_snr_windows_to_plot(self):
+        self.evoked_dock.set_snr_windows(
+            self._snr_window_ms(
+                self.params.get("snr_baseline"),
+                DEFAULT_SNR_BASELINE_WINDOW,
+            ),
+            self._snr_window_ms(
+                self.params.get("snr_response"),
+                DEFAULT_SNR_RESPONSE_WINDOW,
+            ),
+        )
+
     @Slot(dict)
     def apply_live_settings(self, new_params: dict):
         if not new_params:
             return
         self.params.update(new_params)
+        if {"snr_baseline", "snr_response"} & set(new_params):
+            self._apply_snr_windows_to_plot()
         if self._qt_object_alive(self.data_worker):
             self.params_changed.emit(new_params)
 
@@ -3575,7 +3726,7 @@ class RealTimeMainWidget(QWidget):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
-        self.setMinimumWidth(640)
+        self.setMinimumWidth(0)
 
         self.main_container = QWidget()
         self.main_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -3598,13 +3749,17 @@ class RealTimeMainWidget(QWidget):
         live_help.setWordWrap(True)
         live_layout.addWidget(live_help)
 
-        config_row = QHBoxLayout()
-        config_row.setContentsMargins(0, 0, 0, 0)
-        config_row.setSpacing(12)
-        config_row.setAlignment(Qt.AlignmentFlag.AlignTop)
-        config_row.addWidget(self.connection_widget, 2)
-        config_row.addWidget(self.plot_settings_widget, 1, Qt.AlignmentFlag.AlignTop)
-        live_layout.addLayout(config_row)
+        self.config_row = QHBoxLayout()
+        self.config_row.setContentsMargins(0, 0, 0, 0)
+        self.config_row.setSpacing(12)
+        self.config_row.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.config_row.addWidget(self.connection_widget, 2)
+        self.config_row.addWidget(
+            self.plot_settings_widget,
+            1,
+            Qt.AlignmentFlag.AlignTop,
+        )
+        live_layout.addLayout(self.config_row)
 
         self.launch_button = QPushButton("Launch Live Visualizer")
         self.launch_button.setDefault(True)
@@ -3624,6 +3779,29 @@ class RealTimeMainWidget(QWidget):
         layout.addWidget(file_card)
         layout.addStretch()
         main_layout.addWidget(self.main_container, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.set_compact_layout(event.size().width() < 980)
+
+    def set_compact_layout(self, compact: bool):
+        if not hasattr(self, "config_row"):
+            return
+        direction = (
+            QBoxLayout.Direction.TopToBottom
+            if compact
+            else QBoxLayout.Direction.LeftToRight
+        )
+        if self.config_row.direction() != direction:
+            self.config_row.setDirection(direction)
+            self.config_row.setStretch(0, 2 if not compact else 0)
+            self.config_row.setStretch(1, 1 if not compact else 0)
+            self.plot_settings_widget.setSizePolicy(
+                QSizePolicy.Policy.Expanding
+                if compact
+                else QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Maximum,
+            )
 
     def _build_card(self, title: str) -> QFrame:
         card = QFrame()

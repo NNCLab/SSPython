@@ -6,7 +6,16 @@ from pathlib import Path
 import mne
 
 from PySide6.QtCore import Slot
-from PySide6.QtWidgets import QDialog, QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import (
+    QDialog,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+)
 
 from core.processing import TMSEEGAnalysis
 from ui.widgets.evoked_plot import EvokedPlotWidget
@@ -32,6 +41,7 @@ logger = logging.getLogger(__name__)
 class ErpAnalysisPage(BasePage):
     def __init__(self, parent=None):
         super().__init__("Analysis", parent)
+        self.set_content_maximum_width(1360)
         self.main_window = parent
         self.current_dataset = None
         self.tep: TMSEEGAnalysis | None = None
@@ -49,9 +59,13 @@ class ErpAnalysisPage(BasePage):
         self.visualization_group = self._create_visualization_group()
         self.analysis_group = self._create_analysis_group()
 
-        self.add_content(QLabel("<h2>Visualization</h2>"))
+        self.visualization_title = QLabel("Visualization")
+        self.visualization_title.setObjectName("sectionTitle")
+        self.add_content(self.visualization_title)
         self.add_content(self.visualization_group)
-        self.add_content(QLabel("<h2>Analysis Methods</h2>"))
+        self.analysis_title = QLabel("Analysis methods")
+        self.analysis_title.setObjectName("sectionTitle")
+        self.add_content(self.analysis_title)
         self.add_content(self.analysis_group)
 
         self._connect_to_main_window()
@@ -74,32 +88,88 @@ class ErpAnalysisPage(BasePage):
 
         self.topoplot_button = QPushButton("Topoplot")
         self.psd_button = QPushButton("Plot PSD")
-        layout.addWidget(self.topoplot_button)
-        layout.addWidget(self.psd_button)
+        self.topoplot_button.setObjectName("secondaryButton")
+        self.psd_button.setObjectName("secondaryButton")
+        action_row = QHBoxLayout()
+        action_row.addStretch(1)
+        action_row.addWidget(self.topoplot_button)
+        action_row.addWidget(self.psd_button)
+        layout.addLayout(action_row)
         return group
 
     def _create_analysis_group(self) -> QGroupBox:
         group = QGroupBox()
-        layout = QVBoxLayout(group)
+        layout = QGridLayout(group)
+        layout.setHorizontalSpacing(24)
+        layout.setVerticalSpacing(18)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
         self.excitability_button = QPushButton("Response Amplitude Analysis")
         self.nf_button = QPushButton("Natural Frequency Analysis")
         self.tf_button = QPushButton("Compute TFR")
         self.time_frequency_button = QPushButton("Plot TFR")
-        tfr_button_row = QHBoxLayout()
-        tfr_button_row.addWidget(self.tf_button)
-        tfr_button_row.addWidget(self.time_frequency_button)
-
         self.stc_button = QPushButton("Compute STC")
         self.source_estimate_button = QPushButton("Plot STC")
-        stc_button_row = QHBoxLayout()
-        stc_button_row.addWidget(self.stc_button)
-        stc_button_row.addWidget(self.source_estimate_button)
 
-        layout.addWidget(self.excitability_button)
-        layout.addWidget(self.nf_button)
-        layout.addLayout(tfr_button_row)
-        layout.addLayout(stc_button_row)
+        self._add_analysis_method(
+            layout,
+            0,
+            0,
+            "Response amplitude",
+            "Measure response strength over a selected time window.",
+            self.excitability_button,
+        )
+        self._add_analysis_method(
+            layout,
+            0,
+            1,
+            "Natural frequency",
+            "Estimate dominant response frequencies across channels.",
+            self.nf_button,
+        )
+        self._add_analysis_method(
+            layout,
+            1,
+            0,
+            "Time-frequency response",
+            "Compute a TFR derivative or open an existing result.",
+            self.tf_button,
+            self.time_frequency_button,
+        )
+        self._add_analysis_method(
+            layout,
+            1,
+            1,
+            "Source estimate",
+            "Compute and inspect a cortical source estimate.",
+            self.stc_button,
+            self.source_estimate_button,
+        )
         return group
+
+    @staticmethod
+    def _add_analysis_method(layout, row, column, title, description, *buttons):
+        method_layout = QVBoxLayout()
+        method_layout.setContentsMargins(0, 0, 0, 0)
+        method_layout.setSpacing(6)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("analysisMethodTitle")
+        method_layout.addWidget(title_label)
+
+        description_label = QLabel(description)
+        description_label.setObjectName("analysisMethodDescription")
+        description_label.setWordWrap(True)
+        method_layout.addWidget(description_label)
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 2, 0, 0)
+        for button in buttons:
+            button.setProperty("analysisAction", True)
+            button_row.addWidget(button)
+        button_row.addStretch(1)
+        method_layout.addLayout(button_row)
+        layout.addLayout(method_layout, row, column)
 
     def _connect_to_main_window(self):
         if not self.main_window:
@@ -189,6 +259,23 @@ class ErpAnalysisPage(BasePage):
         self.tf_button.setEnabled(has_data)
         self.stc_button.setEnabled(has_data)
         self.evoked_plot_widget.setVisible(has_data)
+        self.visualization_title.setVisible(has_data)
+        self.visualization_group.setVisible(has_data)
+        self.analysis_title.setVisible(has_data)
+        self.analysis_group.setVisible(has_data)
+
+    def release_derivative_resources(self, paths):
+        """Drop analysis objects derived from a file that will be deleted."""
+        if self.tep is None:
+            return
+        target_paths = {Path(path).resolve() for path in paths}
+        if self.tep.data_input.resolve() not in target_paths:
+            return
+
+        self.epochs_info_widget.clear_info()
+        self.evoked_plot_widget.update_plot(None)
+        self.tep = None
+        self._needs_reload = True
 
     @Slot()
     def on_settings_updated(self):

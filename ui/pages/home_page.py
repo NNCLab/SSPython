@@ -1,5 +1,14 @@
 from PySide6.QtCore import Qt, Slot
-from PySide6.QtWidgets import QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from core.pipelines import PipelineDefinition, all_pipelines
 
@@ -11,6 +20,7 @@ class PipelineCard(QFrame):
         super().__init__(parent)
         self.pipeline = pipeline
         self.setObjectName("pipelineCard")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -31,7 +41,6 @@ class PipelineCard(QFrame):
 
         self.button = QPushButton("Set Active Pipeline")
         layout.addWidget(self.button, 0, Qt.AlignmentFlag.AlignLeft)
-        layout.addStretch()
 
     def set_active(self, active: bool):
         self.setProperty("active", active)
@@ -47,10 +56,8 @@ class HomePage(BasePage):
         super().__init__("SSPython", parent)
         self.main_window = parent
         self.cards: dict[str, PipelineCard] = {}
-
-        self.set_page_subtitle(
-            "Get started by selecting a pipeline below. Your choice will tailor the workspace and available analyses."
-        )
+        self.set_header_visible(False)
+        self.set_content_maximum_width(1120)
 
         hero = QFrame()
         hero.setObjectName("heroCard")
@@ -58,12 +65,12 @@ class HomePage(BasePage):
         hero_layout.setContentsMargins(24, 24, 24, 24)
         hero_layout.setSpacing(12)
 
-        hero_title = QLabel("Welcome to SSPython!")
+        hero_title = QLabel("SSPython")
         hero_title.setObjectName("heroTitle")
         hero_layout.addWidget(hero_title)
 
         hero_text = QLabel(
-            "Your open-source EEG analysis toolkit. Streamline your workflow from raw data to insightful results with our powerful and intuitive pipelines."
+            "Open a workspace to continue an EEG workflow, or choose a pipeline before getting started."
         )
         hero_text.setWordWrap(True)
         hero_text.setObjectName("mutedLabel")
@@ -86,10 +93,15 @@ class HomePage(BasePage):
         hero_layout.addLayout(actions)
         self.add_content(hero)
 
-        section_title = QLabel("<h2>Pipelines</h2>")
+        section_title = QLabel("Pipelines")
+        section_title.setObjectName("sectionTitle")
         self.add_content(section_title)
 
         cards_container = QWidget()
+        cards_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
+        )
         cards_layout = QGridLayout(cards_container)
         cards_layout.setContentsMargins(0, 0, 0, 0)
         cards_layout.setHorizontalSpacing(16)
