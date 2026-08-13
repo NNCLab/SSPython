@@ -37,6 +37,7 @@ __pypackages__/
 .env
 .venv
 .venv-build/
+.venv-build-linux/
 env/
 venv/
 ENV/

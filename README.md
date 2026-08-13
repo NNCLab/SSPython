@@ -533,6 +533,24 @@ Useful development options:
 Inno Setup 6 is required unless `-SkipInstaller` is used. Application versions
 are defined once in `core\version.py`.
 
+Linux executable bundles must be built on a Linux host because PyInstaller
+outputs platform-specific binaries:
+
+```bash
+bash packaging/build_linux.sh
+```
+
+The script creates an isolated `.venv-build-linux` environment, runs the unit
+tests, builds and smoke-tests `dist/SSPython/SSPython`, and creates
+`dist/SSPython-<version>-linux-<arch>.tar.gz`.
+
+Useful development options:
+
+```bash
+bash packaging/build_linux.sh --skip-tests
+bash packaging/build_linux.sh --skip-archive --debug-console
+```
+
 ## 18. Known Limitations and Assumptions
 
 - SSPython discovers source datasets only from files ending in `*_raw.fif`.
