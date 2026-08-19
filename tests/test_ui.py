@@ -20,6 +20,7 @@ from ui.widgets.source_estimate_widget import (
 )
 from ui.widgets.time_frequency_widget import (
     ComputeTFRSettingsDialog,
+    ITC_MODE,
     POWER_DB_MODE,
     RAW_POWER_MODE,
     TimeFrequencyDialog,
@@ -593,6 +594,24 @@ class TestUI(unittest.TestCase):
 
         self.assertEqual(filtered.shape, data.shape)
         self.assertTrue(np.isfinite(filtered).all())
+
+    def test_live_frequency_filters_use_third_order_butterworth(self):
+        ranges = [(1.0, 40.0), (1.0, None), (None, 40.0)]
+
+        with patch(
+            "ui.widgets.real_time_widget.signal.butter",
+            return_value=np.ones((1, 6)),
+        ) as butter:
+            for bandpass_range in ranges:
+                build_live_filter_pipeline(
+                    200.0,
+                    {
+                        "apply_bandpass": True,
+                        "bandpass_range": bandpass_range,
+                    },
+                )
+
+        self.assertEqual([call.args[0] for call in butter.call_args_list], [3, 3, 3])
 
     def test_real_time_erp_hides_topology_without_montage_on_init(self):
         app = QApplication.instance()
@@ -1230,6 +1249,34 @@ class TestUI(unittest.TestCase):
         self.assertEqual(display.event_label, "Sham")
         self.assertEqual(display.n_epochs, 1)
 
+    def test_time_frequency_display_preserves_native_itc_values(self):
+        info = mne.create_info(["Cz"], sfreq=1000, ch_types="eeg")
+        epochs = mne.EpochsArray(
+            np.zeros((1, 1, 3)),
+            info,
+            tmin=-0.001,
+            verbose=False,
+        )
+        itc_values = np.array([[[0.2, 0.5, 0.8], [0.1, 0.4, 0.9]]])
+        itc = mne.time_frequency.AverageTFRArray(
+            info,
+            itc_values,
+            epochs.times,
+            np.array([8.0, 12.0]),
+        )
+
+        display = build_time_frequency_display(
+            epochs=epochs,
+            tfr=itc,
+            transform_mode=POWER_DB_MODE,
+            baseline_s=(-0.001, 0.0),
+            apply_baseline=True,
+            is_itc=True,
+        )
+
+        np.testing.assert_allclose(display.values, itc_values[0])
+        self.assertEqual(display.units, ITC_MODE)
+
     def test_time_frequency_widget_updates_tfr_image_when_selected_event_changes(self):
         app = QApplication.instance()
         if app is None:
@@ -1576,6 +1623,12 @@ class TestUI(unittest.TestCase):
         widget.derivative_combo.setCurrentIndex(1)
         app.processEvents()
         self.assertEqual(widget.current_derivative_key, "Inter-trial coherence (ITC)")
+        self.assertEqual(widget.transform_combo.currentText(), ITC_MODE)
+        self.assertFalse(widget.transform_combo.isEnabled())
+        self.assertFalse(widget.baseline_checkbox.isChecked())
+        self.assertFalse(widget.baseline_checkbox.isEnabled())
+        np.testing.assert_allclose(widget.image_artist.get_array(), 0.5)
+        self.assertEqual(widget.display_data.units, ITC_MODE)
 
         widget._set_roi_from_values(0.0, 8.0, 8.0, 12.0, update_controls=True, draw=True)
         self.assertAlmostEqual(widget.roi_time_start_input.value(), 0.0)

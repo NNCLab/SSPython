@@ -878,7 +878,7 @@ def build_live_filter_pipeline(
 
         if low is not None and high is not None and low < high:
             bandpass_sos = signal.butter(
-                4,
+                3,
                 [low, high],
                 btype="bandpass",
                 fs=sfreq,
@@ -886,7 +886,7 @@ def build_live_filter_pipeline(
             )
         elif low is not None:
             bandpass_sos = signal.butter(
-                4,
+                3,
                 low,
                 btype="highpass",
                 fs=sfreq,
@@ -894,7 +894,7 @@ def build_live_filter_pipeline(
             )
         elif high is not None:
             bandpass_sos = signal.butter(
-                4,
+                3,
                 high,
                 btype="lowpass",
                 fs=sfreq,

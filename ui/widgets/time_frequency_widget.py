@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 POWER_DB_MODE = "Power (dB)"
 RAW_POWER_MODE = "Raw power"
 ZSCORE_MODE = "z-score"
+ITC_MODE = "ITC (unitless)"
 
 def parse_tfr_freqs(text: str, *, method: str = "morlet") -> np.ndarray | str:
     cleaned = (text or "").strip().lower()
@@ -645,6 +646,7 @@ def build_time_frequency_display(
     transform_mode: str = POWER_DB_MODE,
     baseline_s: tuple[float | None, float | None] = (None, 0.0),
     apply_baseline: bool = True,
+    is_itc: bool = False,
 ) -> TimeFrequencyDisplayData:
     selected_channels = channel_names if channel_names is not None else channel_name
     times_s, freqs_hz, power, n_epochs, channel_label = _extract_tfr_power(
@@ -652,13 +654,19 @@ def build_time_frequency_display(
         channel_names=selected_channels,
         event_code=event_code,
     )
-    values, units = apply_time_frequency_transform(
-        power,
-        times_s,
-        mode=transform_mode,
-        baseline_s=baseline_s,
-        apply_baseline=apply_baseline,
-    )
+    if is_itc:
+        # ITC is already a normalized, unitless measure in the [0, 1] range.
+        # Applying a power baseline or dB transform changes its meaning.
+        values = np.asarray(power, dtype=float).copy()
+        units = ITC_MODE
+    else:
+        values, units = apply_time_frequency_transform(
+            power,
+            times_s,
+            mode=transform_mode,
+            baseline_s=baseline_s,
+            apply_baseline=apply_baseline,
+        )
     event_lookup = _event_name_lookup(epochs)
     event_label = event_lookup.get(int(event_code), f"Event {event_code}") if event_code is not None else "All events"
     erp_channel_names, erp_full_uV = _erp_traces_uV(
@@ -722,6 +730,8 @@ class TimeFrequencyWidget(QWidget):
         self._roi_drag_start: tuple[float, float] | None = None
         self._roi_drag_active = False
         self._updating_roi_controls = False
+        self._power_transform_mode = POWER_DB_MODE
+        self._power_apply_baseline = True
         self.roi_time_ms: tuple[float, float] | None = None
         self.roi_freq_hz: tuple[float, float] | None = None
 
@@ -935,6 +945,7 @@ class TimeFrequencyWidget(QWidget):
 
     def _populate_selectors(self):
         self._populate_derivative_selector()
+        self._sync_derivative_controls()
         self._populate_channel_selector()
         self._populate_event_selector()
 
@@ -1065,9 +1076,53 @@ class TimeFrequencyWidget(QWidget):
     def _baseline_s(self) -> tuple[float | None, float | None]:
         return (self.baseline_start_input.value() / 1000.0, self.baseline_stop_input.value() / 1000.0)
 
+    def _current_derivative_is_itc(self) -> bool:
+        label = str(self.current_derivative_key or "").casefold()
+        normalized = label.replace("_", " ").replace("-", " ").replace("(", " ").replace(")", " ")
+        return "itc" in normalized.split() or "inter trial coherence" in " ".join(normalized.split())
+
+    def _remember_power_controls(self):
+        if self.transform_combo.currentText() in (POWER_DB_MODE, RAW_POWER_MODE, ZSCORE_MODE):
+            self._power_transform_mode = self.transform_combo.currentText()
+        self._power_apply_baseline = self.baseline_checkbox.isChecked()
+
+    def _sync_derivative_controls(self):
+        is_itc = self._current_derivative_is_itc()
+
+        self.transform_combo.blockSignals(True)
+        self.baseline_checkbox.blockSignals(True)
+        try:
+            self.transform_combo.clear()
+            if is_itc:
+                self.transform_combo.addItem(ITC_MODE)
+                self.baseline_checkbox.setChecked(False)
+            else:
+                self.transform_combo.addItems([POWER_DB_MODE, RAW_POWER_MODE, ZSCORE_MODE])
+                self.transform_combo.setCurrentText(self._power_transform_mode)
+                self.baseline_checkbox.setChecked(self._power_apply_baseline)
+        finally:
+            self.transform_combo.blockSignals(False)
+            self.baseline_checkbox.blockSignals(False)
+
+        self.transform_combo.setEnabled(not is_itc)
+        self.baseline_checkbox.setEnabled(not is_itc)
+        self.baseline_start_input.setEnabled(not is_itc)
+        self.baseline_stop_input.setEnabled(not is_itc)
+        itc_tooltip = "ITC is displayed in its native unitless scale without baseline correction."
+        for control in (
+            self.transform_combo,
+            self.baseline_checkbox,
+            self.baseline_start_input,
+            self.baseline_stop_input,
+        ):
+            control.setToolTip(itc_tooltip if is_itc else "")
+
     def _on_derivative_changed(self):
+        if not self._current_derivative_is_itc():
+            self._remember_power_controls()
         self.current_derivative_key = self.derivative_combo.currentData()
         self.tfr = self.tfr_derivatives.get(self.current_derivative_key)
+        self._sync_derivative_controls()
         self._populate_channel_selector()
         self._populate_event_selector()
         self._clim = None
@@ -1078,6 +1133,8 @@ class TimeFrequencyWidget(QWidget):
         self._render()
 
     def _on_transform_changed(self):
+        if not self._current_derivative_is_itc():
+            self._remember_power_controls()
         self._clim = None
         self._render()
 
@@ -1162,6 +1219,7 @@ class TimeFrequencyWidget(QWidget):
                 transform_mode=self.transform_combo.currentText(),
                 baseline_s=self._baseline_s(),
                 apply_baseline=self.baseline_checkbox.isChecked(),
+                is_itc=self._current_derivative_is_itc(),
             )
         except Exception as exc:
             logger.exception("Could not render time-frequency data.")

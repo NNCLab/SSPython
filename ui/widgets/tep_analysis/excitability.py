@@ -256,7 +256,7 @@ class ExcitabilityApp(QDialog):
 
         if self.mode == AnalysisMode.GMFP:
             data = np.sqrt(np.mean(self.epochs.average().data ** 2, axis=0)) * 1e6
-            auc = np.trapezoid(data[span_idx])
+            auc = np.trapezoid(data[span_idx], x=times_ms[span_idx])
             self.outcome_label.setText(f"AUC (GMFP): {auc:.2f} µV·ms")
             self.outcome_ax.plot(times_ms, data, label="GMFP")
 
@@ -271,7 +271,7 @@ class ExcitabilityApp(QDialog):
                 )
                 * 1e6
             )
-            auc = np.trapezoid(data[span_idx])
+            auc = np.trapezoid(data[span_idx], x=times_ms[span_idx])
             self.outcome_label.setText(f"AUC (LFP): {auc:.2f} µV·ms")
             self.outcome_ax.plot(
                 times_ms, data, label=f"LFP ({', '.join(self.selected_channels)})"

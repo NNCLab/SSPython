@@ -155,7 +155,9 @@ def calculate_nf_data(
         logger.warning(
             "No significant power found. Plotting unmasked power distribution instead."
         )
-        agg_freq = avg_tfr.mean((0, 2))  # Average over channels and times
+        agg_freq = avg_tfr[:, :, response_idx].mean(
+            axis=(0, 2)
+        )  # Average over channels and the response window
     else:
         # 5. Aggregate power over the response window to find the natural frequency
         agg_freq = np.nansum(
