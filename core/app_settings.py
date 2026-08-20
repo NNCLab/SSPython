@@ -10,6 +10,8 @@ SETTINGS_SCHEMA_VERSION = 3
 DEFAULT_THEME = "dark"
 DEFAULT_OUTPUT_ROOT = "derivatives"
 DEFAULT_PIPELINE_ID = "standard"
+DEFAULT_RAW_INSPECT_MAX_SAMPLING_HZ = 1000
+RAW_INSPECT_MAX_SAMPLING_KEY = "appearance/plots/raw/max_sampling_hz"
 
 LEGACY_PIPELINE_ID_ALIASES = {
     "tms_eeg": DEFAULT_PIPELINE_ID,
@@ -211,6 +213,14 @@ class SettingsStore:
 
     def output_root(self) -> str:
         return self.get("workspace/output_root", DEFAULT_OUTPUT_ROOT)
+
+    def raw_inspect_max_sampling_hz(self) -> int:
+        value = self.get(
+            RAW_INSPECT_MAX_SAMPLING_KEY,
+            DEFAULT_RAW_INSPECT_MAX_SAMPLING_HZ,
+            value_type=int,
+        )
+        return value if value > 0 else DEFAULT_RAW_INSPECT_MAX_SAMPLING_HZ
 
     def current_pipeline_id(self) -> str:
         pipeline_id = self.get("workspace/current_pipeline", DEFAULT_PIPELINE_ID)

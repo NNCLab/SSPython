@@ -1,4 +1,5 @@
 import logging
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -16,8 +17,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.processing import Preprocessor
+from core.app_settings import get_settings_store
 from core.pipelines import get_pipeline
+from core.processing import Preprocessor
 from ui.widgets.evoked_plot import EvokedPlotWidget
 from ui.widgets.ica_widget import run_ica_viewer
 from ui.widgets.preprocessing_widgets import (
@@ -89,6 +91,15 @@ def _annotation_counter(annotations) -> Counter:
 
 def _is_bad_annotation(entry: tuple[float, float, str, tuple[str, ...]]) -> bool:
     return entry[2].lower().startswith("bad")
+
+
+def raw_inspection_decimation(sfreq: float, max_display_sfreq: float) -> int:
+    """Return the smallest integer factor that meets the display-rate ceiling."""
+    if sfreq <= 0:
+        raise ValueError("Raw sampling frequency must be greater than zero.")
+    if max_display_sfreq <= 0:
+        raise ValueError("Raw inspection display limit must be greater than zero.")
+    return max(1, math.ceil(sfreq / max_display_sfreq))
 
 
 class ProcessingPage(BasePage):
@@ -550,9 +561,16 @@ class ProcessingPage(BasePage):
             self.original_raw_annotations = self.viz_raw.annotations.copy()
             self._raw_review_pending = True
 
+            max_display_sfreq = get_settings_store().raw_inspect_max_sampling_hz()
+            decimation = raw_inspection_decimation(
+                float(self.viz_raw.info["sfreq"]),
+                max_display_sfreq,
+            )
+
             figure = self.viz_raw.plot(
                 n_channels=len(self.viz_raw.ch_names),
                 duration=10,
+                decim=decimation,
                 use_opengl=None,
                 splash=False,
                 block=False,

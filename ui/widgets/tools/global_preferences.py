@@ -7,11 +7,16 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QLineEdit,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from core.app_settings import DEFAULT_OUTPUT_ROOT, get_settings_store
+from core.app_settings import (
+    DEFAULT_OUTPUT_ROOT,
+    RAW_INSPECT_MAX_SAMPLING_KEY,
+    get_settings_store,
+)
 from core.pipelines import all_pipelines
 
 logger = logging.getLogger(__name__)
@@ -34,11 +39,23 @@ class PlotSettingsWidget(QWidget):
 
         self.matplotlib_style_combo = QComboBox()
         self.cmap_input = QComboBox()
+        self.raw_inspect_max_sampling_input = QSpinBox()
+        self.raw_inspect_max_sampling_input.setRange(1, 100_000)
+        self.raw_inspect_max_sampling_input.setSuffix(" Hz")
+        self.raw_inspect_max_sampling_input.setToolTip(
+            "Maximum sampling rate used to display continuous data in Raw Inspect. "
+            "The viewer uses the smallest integer decimation factor that keeps the "
+            "displayed rate at or below this value."
+        )
 
         self._populate_styles_combo()
 
         form_layout.addRow("Matplotlib Style:", self.matplotlib_style_combo)
         form_layout.addRow("Default Colormap:", self.cmap_input)
+        form_layout.addRow(
+            "Raw Inspect Max Sampling Rate:",
+            self.raw_inspect_max_sampling_input,
+        )
 
         layout.addWidget(groupbox)
 
@@ -68,15 +85,23 @@ class PlotSettingsWidget(QWidget):
         )
         self.matplotlib_style_combo.setCurrentText(display_style)
         self.cmap_input.setCurrentText(params.get("cmap", "turbo"))
+        self.raw_inspect_max_sampling_input.setValue(
+            self.settings_store.raw_inspect_max_sampling_hz()
+        )
 
     def save_settings(self):
         params = self.get_params()
         self.settings_store.set(self.SETTINGS_PATH, params)
         self.settings_store.set("plot_settings/plot_params", params)
+        self.settings_store.set(
+            RAW_INSPECT_MAX_SAMPLING_KEY,
+            self.raw_inspect_max_sampling_input.value(),
+        )
 
     def clear_settings(self):
         self.settings_store.remove(self.SETTINGS_PATH)
         self.settings_store.remove("plot_settings/plot_params")
+        self.settings_store.remove(RAW_INSPECT_MAX_SAMPLING_KEY)
         self.settings_store.sync()
 
     def get_params(self) -> dict[str, Any]:

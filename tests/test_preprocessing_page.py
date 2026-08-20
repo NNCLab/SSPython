@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 from PySide6.QtWidgets import QMessageBox
 
-from ui.pages.preprocessing_page import ProcessingPage
+from ui.pages.preprocessing_page import ProcessingPage, raw_inspection_decimation
 
 
 class _ImmediateWorker:
@@ -95,6 +95,53 @@ class TestICASaving(unittest.TestCase):
 
         self.assertEqual(ica.exclude, [0])
         page._save_ica_changes.assert_not_called()
+
+
+class TestRawInspectionDecimation(unittest.TestCase):
+    def test_uses_smallest_factor_at_or_below_display_ceiling(self):
+        self.assertEqual(raw_inspection_decimation(4800, 1000), 5)
+        self.assertEqual(raw_inspection_decimation(1001, 1000), 2)
+
+    def test_does_not_decimate_data_already_within_ceiling(self):
+        self.assertEqual(raw_inspection_decimation(1000, 1000), 1)
+        self.assertEqual(raw_inspection_decimation(500, 1000), 1)
+
+    def test_raw_viewer_receives_configured_decimation(self):
+        raw = Mock()
+        viz_raw = Mock()
+        raw.copy.return_value = viz_raw
+        viz_raw.info = {"bads": [], "sfreq": 4800.0}
+        viz_raw.ch_names = ["EEG 001", "EEG 002"]
+        viz_raw.annotations.copy.return_value = Mock()
+        figure = Mock()
+        viz_raw.plot.return_value = figure
+
+        settings_store = Mock()
+        settings_store.raw_inspect_max_sampling_hz.return_value = 1000
+        preprocessor = Mock()
+        preprocessor._get_last_continuous.return_value = raw
+        page = SimpleNamespace(
+            preprocessor=preprocessor,
+            _raw_review_pending=False,
+            _raw_review_figure=None,
+            _after_raw_inspected=Mock(),
+        )
+
+        with patch(
+            "ui.pages.preprocessing_page.get_settings_store",
+            return_value=settings_store,
+        ):
+            ProcessingPage.inspect_raw_data(page)
+
+        viz_raw.plot.assert_called_once_with(
+            n_channels=2,
+            duration=10,
+            decim=5,
+            use_opengl=None,
+            splash=False,
+            block=False,
+        )
+        figure.gotClosed.connect.assert_called_once_with(page._after_raw_inspected)
 
 
 if __name__ == "__main__":
