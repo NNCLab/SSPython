@@ -217,5 +217,27 @@ class TestCore(unittest.TestCase):
         preprocessor.run_epoching(tlim=(-0.2, 0.2))
         self.assertTrue(preprocessor.has("epochs"))
 
+    def test_epoching_resample_preserves_inclusive_time_limits(self):
+        """Resampling must not drop the requested final epoch sample."""
+        output_dir = self.test_dir / "derivatives"
+        preprocessor = Preprocessor(self.raw_filepath, output_dir)
+        preprocessor.raw.set_annotations(
+            mne.Annotations(onset=[1], duration=[0.01], description=["TMS"])
+        )
+
+        preprocessor.run_epoching(
+            tlim=(-0.8, 0.8),
+            resample=600,
+            verbose=False,
+        )
+
+        self.assertEqual(preprocessor.epochs.info["sfreq"], 600)
+        self.assertEqual(len(preprocessor.epochs.times), 961)
+        np.testing.assert_allclose(
+            preprocessor.epochs.times[[0, -1]],
+            [-0.8, 0.8],
+        )
+        self.assertEqual(preprocessor.raw.info["sfreq"], 2048)
+
 if __name__ == '__main__':
     unittest.main()

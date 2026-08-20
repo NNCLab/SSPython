@@ -52,8 +52,11 @@ class TopomapWidget(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         self.canvas = MplCanvas(self, figsize=(4, 4), dpi=100)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        update_toolbar_color(self.toolbar)
         self._colorbar = None
         layout.addWidget(self.canvas)
+        layout.addWidget(self.toolbar)
         # Prevent the layout from having extra margins
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)

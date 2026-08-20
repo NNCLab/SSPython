@@ -622,6 +622,16 @@ class Preprocessor:
             )
             raw = continuous_ica.apply(raw)
 
+        if resample is not None:
+            logger.info(f"Resampling continuous data to {resample} Hz...")
+            # Resampling an already-created Epochs object derives its new sample
+            # count from the old one. For inclusive bounds such as (-0.8, 0.8),
+            # that can discard the final target-rate sample (for example, ending
+            # at 0.798333 s at 600 Hz). Resampling first lets MNE construct the
+            # requested inclusive epoch bounds directly on the target grid.
+            raw = raw.copy()
+            raw.resample(resample, npad="auto")
+
         # 3. Branching Logic: Event vs Fixed
         logger.info(f"Epoching mode: {mode}")
 
@@ -677,12 +687,7 @@ class Preprocessor:
                 reject=None, 
             )
 
-        # 4. Common Post-processing (Resample, Save)
-        if resample is not None:
-            logger.info(f"Resampling to {resample} Hz...")
-            epochs.resample(resample, npad="auto")
-
-        # Update metadata description
+        # 4. Update metadata and save
         self.add_description(
             epochs,
             {

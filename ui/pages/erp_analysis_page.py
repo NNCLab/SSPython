@@ -8,6 +8,9 @@ import mne
 from PySide6.QtCore import Slot
 from PySide6.QtWidgets import (
     QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -36,6 +39,66 @@ from utils import Worker
 from .base_page import BasePage
 
 logger = logging.getLogger(__name__)
+
+
+class TopoplotTimeWindowDialog(QDialog):
+    """Collect a time window constrained to the loaded epoch limits."""
+
+    def __init__(self, epochs: mne.BaseEpochs, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Topoplot Time Window")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        times = epochs.times
+        self.time_bounds = (float(times[0]), float(times[-1]))
+        sample_step = 1.0 / float(epochs.info["sfreq"])
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.start_input = self._create_time_input(self.time_bounds[0], sample_step)
+        self.end_input = self._create_time_input(self.time_bounds[1], sample_step)
+        form.addRow("Start:", self.start_input)
+        form.addRow("End:", self.end_input)
+        layout.addLayout(form)
+
+        bounds_label = QLabel(
+            f"Available range: {self.time_bounds[0]:.6f} to "
+            f"{self.time_bounds[1]:.6f} s"
+        )
+        bounds_label.setObjectName("analysisMethodDescription")
+        layout.addWidget(bounds_label)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Plot")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def _create_time_input(self, value: float, step: float) -> QDoubleSpinBox:
+        spinbox = QDoubleSpinBox(self)
+        spinbox.setDecimals(6)
+        spinbox.setRange(*self.time_bounds)
+        spinbox.setSingleStep(step)
+        spinbox.setSuffix(" s")
+        spinbox.setValue(value)
+        return spinbox
+
+    def accept(self):
+        tmin, tmax = self.get_time_window()
+        if tmin >= tmax:
+            QMessageBox.warning(
+                self,
+                "Invalid Time Window",
+                "Start time must be earlier than end time.",
+            )
+            return
+        super().accept()
+
+    def get_time_window(self) -> tuple[float, float]:
+        return float(self.start_input.value()), float(self.end_input.value())
 
 
 class ErpAnalysisPage(BasePage):
@@ -284,12 +347,20 @@ class ErpAnalysisPage(BasePage):
             self.update_ui_state()
 
     def topoplot(self):
-        if not self.tep:
+        if not self.tep or self.tep.epochs is None:
             return
+        dialog = TopoplotTimeWindowDialog(self.tep.epochs, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        tmin, tmax = dialog.get_time_window()
         event_names = list(self.tep.epochs.event_id.keys()) if self.tep.epochs.event_id else []
         if len(event_names) > 1:
             evokeds = [
-                self.tep.epochs[event_name].average().apply_baseline()
+                self.tep.epochs[event_name]
+                .average()
+                .apply_baseline()
+                .crop(tmin=tmin, tmax=tmax)
                 for event_name in event_names
             ]
             colors = [f"C{index % 10}" for index in range(len(evokeds))]
@@ -301,8 +372,11 @@ class ErpAnalysisPage(BasePage):
                 show=True,
             )
         else:
-            figure = self.tep.evoked.copy().apply_baseline().plot_topo(
-                title=self.tep.label
+            figure = (
+                self.tep.evoked.copy()
+                .apply_baseline()
+                .crop(tmin=tmin, tmax=tmax)
+                .plot_topo(title=self.tep.label)
             )
         for axes in figure.axes:
             for line in axes.lines:

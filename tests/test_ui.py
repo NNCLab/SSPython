@@ -6,11 +6,11 @@ import mne
 import numpy as np
 from matplotlib.backend_bases import MouseButton
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QListWidgetItem, QToolButton
+from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem, QToolButton
 from main import MainWindow
 from core.pipelines import DatasetRecord, build_processing_paths, get_pipeline
-from ui.pages.erp_analysis_page import ErpAnalysisPage
-from ui.widgets.evoked_plot import EvokedPlotWidget
+from ui.pages.erp_analysis_page import ErpAnalysisPage, TopoplotTimeWindowDialog
+from ui.widgets.evoked_plot import EvokedPlotWidget, TopomapWidget
 from ui.widgets.psd_plot import PSDPlotSettingsWidget
 from ui.widgets.source_estimate_widget import (
     ComputeSTCSettingsDialog,
@@ -1712,6 +1712,88 @@ class TestUI(unittest.TestCase):
         self.assertEqual(page.source_estimate_button.text(), "Plot STC")
         self.assertIs(page.stc_button.parentWidget(), page.analysis_group)
         self.assertIs(page.source_estimate_button.parentWidget(), page.analysis_group)
+        page.close()
+
+    def test_topoplot_time_window_uses_epoch_bounds(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(["Cz"], sfreq=1000.0, ch_types="eeg")
+        epochs = mne.EpochsArray(
+            np.zeros((1, 1, 501)),
+            info,
+            tmin=-0.2,
+            verbose=False,
+        )
+        dialog = TopoplotTimeWindowDialog(epochs)
+
+        self.assertAlmostEqual(dialog.start_input.minimum(), epochs.times[0])
+        self.assertAlmostEqual(dialog.start_input.maximum(), epochs.times[-1])
+        self.assertAlmostEqual(dialog.start_input.value(), epochs.times[0])
+        self.assertAlmostEqual(dialog.end_input.value(), epochs.times[-1])
+        dialog.close()
+
+    def test_drag_selection_topomap_has_save_toolbar(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        widget = TopomapWidget()
+
+        self.assertIs(widget.toolbar.canvas, widget.canvas)
+        self.assertIn("save_figure", widget.toolbar._actions)
+        self.assertGreater(
+            widget.layout().indexOf(widget.toolbar),
+            widget.layout().indexOf(widget.canvas),
+        )
+        widget.close()
+
+    def test_analysis_page_topoplot_crops_to_selected_time_window(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        info = mne.create_info(["Cz", "Pz"], sfreq=1000.0, ch_types="eeg")
+        events = np.array(
+            [[0, 0, 1], [501, 0, 1], [1002, 0, 2], [1503, 0, 2]],
+            dtype=int,
+        )
+        epochs = mne.EpochsArray(
+            np.zeros((4, 2, 501)),
+            info,
+            events=events,
+            event_id={"first": 1, "second": 2},
+            tmin=-0.2,
+            baseline=None,
+            verbose=False,
+        )
+
+        class FakeAnalysis:
+            label = "Test"
+
+            def __init__(self):
+                self.epochs = epochs
+                self.evoked = epochs.average()
+
+        page = ErpAnalysisPage()
+        page.tep = FakeAnalysis()
+
+        with (
+            patch("ui.pages.erp_analysis_page.TopoplotTimeWindowDialog") as dialog_class,
+            patch("ui.pages.erp_analysis_page.mne.viz.plot_evoked_topo") as plot_topo,
+        ):
+            dialog_class.return_value.exec.return_value = QDialog.DialogCode.Accepted
+            dialog_class.return_value.get_time_window.return_value = (-0.05, 0.1)
+            plot_topo.return_value.axes = []
+
+            page.topoplot()
+
+        plotted_evokeds = plot_topo.call_args.args[0]
+        self.assertEqual(len(plotted_evokeds), 2)
+        for evoked in plotted_evokeds:
+            self.assertAlmostEqual(evoked.times[0], -0.05)
+            self.assertAlmostEqual(evoked.times[-1], 0.1)
         page.close()
 
     def test_preprocessing_settings_widget_supports_average_reference(self):
