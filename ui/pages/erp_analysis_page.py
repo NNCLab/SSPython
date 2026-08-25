@@ -20,6 +20,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from core.mne_compat import (
+    install_mne_brain_empty_label_compat,
+    install_mne_brain_vertex_picker_compat,
+)
 from core.processing import TMSEEGAnalysis
 from ui.widgets.evoked_plot import EvokedPlotWidget
 from ui.widgets.psd_plot import PSDPlotSettingsDialog
@@ -540,7 +544,6 @@ class ErpAnalysisPage(BasePage):
             self.tep.derivatives = self.tep._get_derivatives()
         self._needs_reload = True
         self.update_ui_state()
-        self.plot_source_estimate()
 
     def _forget_source_estimate_dialog(self, dialog: ComputeSTCSettingsDialog):
         if dialog in self.source_estimate_dialogs:
@@ -563,27 +566,37 @@ class ErpAnalysisPage(BasePage):
             )
             return
 
+        def prepare_plot_source_model():
+            source_model = prepare_stc_source_model(source_config)
+            source_spaces = mne.read_source_spaces(source_model.src, verbose=False)
+            return source_model, source_spaces
+
         worker = Worker(
-            lambda: prepare_stc_source_model(source_config),
+            prepare_plot_source_model,
             parent=self,
             add_loggers="mne",
         )
-        source_model = worker.exec_with_dialog(
+        plot_source_model = worker.exec_with_dialog(
             "Please wait",
             "Preparing source model files...",
         )
-        if source_model is None:
+        if plot_source_model is None:
             return
+        source_model, source_spaces = plot_source_model
 
         try:
+            install_mne_brain_vertex_picker_compat()
+            install_mne_brain_empty_label_compat()
             self.source_estimate_brain = stc.plot(
                 subject=source_model.subject,
                 subjects_dir=source_model.subjects_dir,
+                src=source_spaces,
+                backend="pyvistaqt",
                 hemi=self._stc_plot_hemi(stc),
                 colormap="turbo",
                 views="dorsal",
                 initial_time=self._stc_initial_time(stc),
-                time_unit="s",
+                time_unit="ms",
                 size=(800, 800),
                 smoothing_steps=5,
                 time_viewer=True,

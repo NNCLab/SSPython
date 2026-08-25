@@ -81,6 +81,7 @@ class TestFinalEpochsMetadata(unittest.TestCase):
         preprocessor = Preprocessor.__new__(Preprocessor)
         preprocessor._epochs = source_epochs
         preprocessor.paths = {"preprocessed": Path("final-epo.fif")}
+        preprocessor._clear_downstream_files = Mock()
         preprocessor.has = lambda stage: stage == "epochs" or (
             stage == "epochs_ica" and ica is not None
         )
@@ -109,6 +110,10 @@ class TestFinalEpochsMetadata(unittest.TestCase):
         )
 
         ica.apply.assert_called_once_with(final_epochs, verbose=False)
+        preprocessor._clear_downstream_files.assert_called_once_with(
+            "preprocessed",
+            verbose=False,
+        )
         self.assertEqual(
             self._filter_log(final_epochs)["ica"],
             {
@@ -132,6 +137,10 @@ class TestFinalEpochsMetadata(unittest.TestCase):
             verbose=False,
         )
 
+        preprocessor._clear_downstream_files.assert_called_once_with(
+            "preprocessed",
+            verbose=False,
+        )
         self.assertEqual(
             self._filter_log(final_epochs)["ica"],
             {"applied": False, "source_stage": "epochs_ica"},

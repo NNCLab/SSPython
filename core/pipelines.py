@@ -440,6 +440,17 @@ class DatasetRecord:
     def relative_dir(self) -> Path:
         return infer_relative_derivative_dir(self.raw_path)
 
+    @property
+    def analysis_paths(self) -> dict[str, Path]:
+        analysis_input = self.paths.get(self.pipeline.analysis_ready_stage)
+        if analysis_input is None:
+            return {}
+        return build_analysis_paths(
+            analysis_input,
+            self.derivative_root,
+            create_dirs=False,
+        )
+
     def stage_exists(self, stage_id: str) -> bool:
         path = self.paths.get(stage_id)
         return bool(path and path.exists())

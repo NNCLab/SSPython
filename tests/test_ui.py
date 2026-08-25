@@ -8,7 +8,12 @@ from matplotlib.backend_bases import MouseButton
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem, QToolButton
 from main import MainWindow
-from core.pipelines import DatasetRecord, build_processing_paths, get_pipeline
+from core.pipelines import (
+    DatasetRecord,
+    build_analysis_paths,
+    build_processing_paths,
+    get_pipeline,
+)
 from ui.pages.erp_analysis_page import ErpAnalysisPage, TopoplotTimeWindowDialog
 from ui.widgets.evoked_plot import EvokedPlotWidget, TopomapWidget
 from ui.widgets.psd_plot import PSDPlotSettingsWidget
@@ -932,6 +937,13 @@ class TestUI(unittest.TestCase):
             ]
             for stage_id in derivative_stage_ids:
                 paths[stage_id].touch()
+            analysis_paths = build_analysis_paths(
+                paths["preprocessed"],
+                derivative_root,
+                create_dirs=False,
+            )
+            for path in analysis_paths.values():
+                path.touch()
 
             dataset = DatasetRecord(
                 raw_path=raw_path,
@@ -954,7 +966,12 @@ class TestUI(unittest.TestCase):
             delete_paths = panel._existing_derivative_paths_from_stage("epochs")
             self.assertEqual(
                 delete_paths,
-                [paths["epochs"], paths["epochs_ica"], paths["preprocessed"]],
+                [
+                    paths["epochs"],
+                    paths["epochs_ica"],
+                    paths["preprocessed"],
+                    *analysis_paths.values(),
+                ],
             )
 
             errors = panel._delete_derivative_paths(delete_paths)
@@ -967,6 +984,7 @@ class TestUI(unittest.TestCase):
             self.assertFalse(paths["epochs"].exists())
             self.assertFalse(paths["epochs_ica"].exists())
             self.assertFalse(paths["preprocessed"].exists())
+            self.assertTrue(all(not path.exists() for path in analysis_paths.values()))
             self.assertEqual(panel._existing_derivative_paths_from_stage("raw"), [])
             panel.close()
 

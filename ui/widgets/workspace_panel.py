@@ -673,6 +673,19 @@ class DatasetInspectorPanel(QFrame):
             path = self.current_dataset.paths.get(stage.id)
             if path is not None and path.exists() and path.is_file():
                 paths.append(path)
+
+        try:
+            analysis_ready_index = self.current_dataset.pipeline.stage_index(
+                self.current_dataset.pipeline.analysis_ready_stage
+            )
+        except ValueError:
+            analysis_ready_index = -1
+        if start_index <= analysis_ready_index:
+            paths.extend(
+                path
+                for path in self.current_dataset.analysis_paths.values()
+                if path.exists() and path.is_file()
+            )
         return paths
 
     def _confirm_and_delete_derivatives(self, stage_id: str):

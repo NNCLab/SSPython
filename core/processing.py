@@ -186,17 +186,30 @@ class Preprocessor:
         gc.collect()
 
     def existing_downstream_files(self, current_step: str) -> list[tuple[str, Path]]:
-        """Return existing stage files that depend on ``current_step``."""
+        """Return existing processing and analysis files downstream of a stage."""
         try:
             start_index = self.processing_order.index(current_step)
         except ValueError:
             return []
 
-        return [
+        downstream_files = [
             (stage_id, self.paths[stage_id])
             for stage_id in self.processing_order[start_index + 1 :]
             if stage_id != "raw" and self.has(stage_id)
         ]
+        preprocessed_path = self.paths.get("preprocessed")
+        if preprocessed_path is not None:
+            analysis_paths = build_analysis_paths(
+                preprocessed_path,
+                self.output_dir,
+                create_dirs=False,
+            )
+            downstream_files.extend(
+                (derivative_id, path)
+                for derivative_id, path in analysis_paths.items()
+                if path.exists() and path.is_file()
+            )
+        return downstream_files
 
     def _clear_downstream_files(self, current_step: str, verbose: bool = True):
         """
@@ -216,36 +229,30 @@ class Preprocessor:
         stages_to_clear = self.processing_order[start_index:]
         self.release_cached_stages(stages_to_clear, verbose=verbose)
 
-        # Iterate through all steps that come AFTER the current one.
-        for step_to_delete in self.processing_order[start_index + 1 :]:
-            if step_to_delete == "raw":
-                continue
+        for derivative_id, file_path in self.existing_downstream_files(current_step):
+            if verbose:
+                logger.info(
+                    f"Overwriting '{current_step}'. Deleting downstream "
+                    f"derivative '{derivative_id}': {file_path.name}"
+                )
 
-            # --- 2. Delete Physical File ---
-            if self.has(step_to_delete):
-                file_path = self.paths[step_to_delete]
-                if verbose:
-                    logger.info(
-                        f"Overwriting '{step_to_delete}'. Deleting downstream file: {file_path.name}"
-                    )
-
-                # MNE FIF readers can keep file handles alive until their final
-                # references are collected, which prevents deletion on Windows.
+            # MNE FIF readers can keep file handles alive until their final
+            # references are collected, which prevents deletion on Windows.
+            gc.collect()
+            try:
+                os.remove(file_path)
+            except PermissionError:
+                logger.warning(
+                    f"File lock detected on {file_path.name}. Retrying deletion..."
+                )
                 gc.collect()
                 try:
                     os.remove(file_path)
-                except PermissionError:
-                    logger.warning(
-                        f"File lock detected on {file_path.name}. Retrying deletion..."
-                    )
-                    gc.collect()
-                    try:
-                        os.remove(file_path)
-                    except PermissionError as retry_error:
-                        raise PermissionError(
-                            f"Could not delete downstream file '{file_path}'. "
-                            "Close any plot or program using it, then try again."
-                        ) from retry_error
+                except PermissionError as retry_error:
+                    raise PermissionError(
+                        f"Could not delete downstream file '{file_path}'. "
+                        "Close any plot or program using it, then try again."
+                    ) from retry_error
 
     @staticmethod
     def add_description(obj, description: dict):
@@ -977,7 +984,7 @@ class Preprocessor:
             logger.info("Skipping baseline correction for fixed-length epochs.")
             baseline = "skipped"  # For logging purposes
 
-        self.release_cached_stages(["preprocessed"], verbose=False)
+        self._clear_downstream_files("preprocessed", verbose=False)
 
         self.add_description(
             epochs,

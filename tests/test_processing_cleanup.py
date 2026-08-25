@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from PySide6.QtWidgets import QMessageBox
 
+from core.pipelines import build_analysis_paths
 from core.processing import Preprocessor
 from ui.widgets.run_ica_widget import RunICADialog
 
@@ -40,9 +41,17 @@ class TestDownstreamCleanup(unittest.TestCase):
             stage: root / f"{stage}.fif"
             for stage in self.preprocessor.processing_order
         }
+        self.preprocessor.output_dir = root
         self.preprocessor.has = lambda stage: self.preprocessor.paths[stage].exists()
         for stage in ("epochs", "epochs_ica", "preprocessed"):
             self.preprocessor.paths[stage].touch()
+        self.analysis_paths = build_analysis_paths(
+            self.preprocessor.paths["preprocessed"],
+            root,
+            create_dirs=False,
+        )
+        for path in self.analysis_paths.values():
+            path.touch()
 
     def tearDown(self):
         self.temp_directory.cleanup()
@@ -58,6 +67,7 @@ class TestDownstreamCleanup(unittest.TestCase):
         self.assertFalse(hasattr(self.preprocessor, "_epochs"))
         for stage in ("epochs", "epochs_ica", "preprocessed"):
             self.assertFalse(self.preprocessor.paths[stage].exists())
+        self.assertTrue(all(not path.exists() for path in self.analysis_paths.values()))
 
     def test_current_stage_cache_is_released_before_overwrite(self):
         cached_epochs = _CachedStage()
@@ -72,6 +82,7 @@ class TestDownstreamCleanup(unittest.TestCase):
         self.assertTrue(self.preprocessor.paths["epochs"].exists())
         self.assertFalse(self.preprocessor.paths["epochs_ica"].exists())
         self.assertFalse(self.preprocessor.paths["preprocessed"].exists())
+        self.assertTrue(all(not path.exists() for path in self.analysis_paths.values()))
 
     def test_existing_downstream_files_reports_only_later_outputs(self):
         downstream_files = self.preprocessor.existing_downstream_files("epochs")
@@ -81,8 +92,15 @@ class TestDownstreamCleanup(unittest.TestCase):
             [
                 ("epochs_ica", self.preprocessor.paths["epochs_ica"]),
                 ("preprocessed", self.preprocessor.paths["preprocessed"]),
+                *self.analysis_paths.items(),
             ],
         )
+
+    def test_recomputing_preprocessed_file_clears_analysis_derivatives(self):
+        self.preprocessor._clear_downstream_files("preprocessed", verbose=False)
+
+        self.assertTrue(self.preprocessor.paths["preprocessed"].exists())
+        self.assertTrue(all(not path.exists() for path in self.analysis_paths.values()))
 
     def test_locked_file_deletion_is_retried(self):
         real_remove = os.remove
@@ -98,9 +116,11 @@ class TestDownstreamCleanup(unittest.TestCase):
         with patch("core.processing.os.remove", side_effect=remove_after_retry):
             self.preprocessor._clear_downstream_files("continuous_ica", verbose=False)
 
-        self.assertEqual(attempts, 4)
+        expected_deletions = 3 + len(self.analysis_paths)
+        self.assertEqual(attempts, expected_deletions + 1)
         for stage in ("epochs", "epochs_ica", "preprocessed"):
             self.assertFalse(self.preprocessor.paths[stage].exists())
+        self.assertTrue(all(not path.exists() for path in self.analysis_paths.values()))
 
     def test_persistent_file_lock_aborts_cleanup(self):
         locked_path = self.preprocessor.paths["epochs"]
