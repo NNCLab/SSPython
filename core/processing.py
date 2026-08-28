@@ -1,6 +1,10 @@
 # %% Imports
 import gc
 import os
+import platform
+import subprocess
+from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 import mne
 import numpy as np
@@ -20,9 +24,53 @@ from core.pipelines import (
     source_stem_from_derivative,
     source_stem_from_raw,
 )
+from core.version import __version__
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@lru_cache(maxsize=1)
+def _source_identifier() -> str:
+    release = f"v{__version__}"
+    repository = Path(__file__).resolve().parents[1]
+    if not (repository / ".git").exists():
+        return release
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--always", "--dirty"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return release
+    return result.stdout.strip() or release
+
+
+@lru_cache(maxsize=1)
+def _runtime_provenance() -> dict:
+    dependencies = {}
+    for package in ("mne", "numpy", "scipy", "scikit-learn", "statsmodels"):
+        try:
+            dependencies[package] = package_version(package)
+        except PackageNotFoundError:
+            dependencies[package] = None
+
+    return {
+        "release": f"v{__version__}",
+        "source": _source_identifier(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "dependencies": dependencies,
+    }
 
 
 class Preprocessor:
@@ -271,6 +319,18 @@ class Preprocessor:
                 log_list = [parsed]
             else:
                 log_list = [{"description": str(parsed)}]
+
+        provenance = _runtime_provenance()
+        previous_provenance = next(
+            (
+                entry["provenance"]
+                for entry in reversed(log_list)
+                if isinstance(entry, dict) and "provenance" in entry
+            ),
+            None,
+        )
+        if previous_provenance != provenance:
+            log_list.append({"provenance": provenance})
         log_list.append(description)
         obj.info["description"] = json.dumps(log_list, indent=4)
 
@@ -447,7 +507,7 @@ class Preprocessor:
                     "smoothing": smoothing,
                     "span": span,
                     "event_id": event_id,
-                    "date": datetime.now().isoformat(),
+                    "date": _utc_timestamp(),
                 }
             },
         )
@@ -495,7 +555,7 @@ class Preprocessor:
                     "notch": notch,
                     "bandpass": bandpass,
                     "resample": resample,
-                    "date": datetime.now().isoformat(),
+                    "date": _utc_timestamp(),
                 }
             },
         )
@@ -543,7 +603,7 @@ class Preprocessor:
                     "method": method,
                     "extended": bool(fit_params and fit_params.get("extended")),
                     "input_stage": "filtered_raw" if self.has("filtered_raw") else "raw",
-                    "date": datetime.now().isoformat(),
+                    "date": _utc_timestamp(),
                 }
             },
         )
@@ -713,7 +773,7 @@ class Preprocessor:
                     "bandpass": bandpass,
                     "notch": notch,
                     "reference": reference,
-                    "date": datetime.now().isoformat(),
+                    "date": _utc_timestamp(),
                 }
             },
         )
@@ -766,7 +826,7 @@ class Preprocessor:
                     "remaining_epochs": len(epochs),
                     "total_epochs": len(epochs.drop_log),
                     "bad_channels": epochs.info.get("bads", []),
-                    "date": datetime.now().isoformat(),
+                    "date": _utc_timestamp(),
                 }
             },
         )
@@ -800,7 +860,7 @@ class Preprocessor:
                     "bad_channels": reviewed_raw.info.get("bads", []),
                     "bad_annotation_count": bad_annotation_count,
                     "total_annotations": len(reviewed_raw.annotations),
-                    "date": datetime.now().isoformat(),
+                    "date": _utc_timestamp(),
                 }
             },
         )
@@ -823,7 +883,7 @@ class Preprocessor:
                     "rereference": {
                         "reference": reference,
                         "projection_applied": True,
-                        "date": datetime.now().isoformat(),
+                        "date": _utc_timestamp(),
                     }
                 },
             )
@@ -898,7 +958,7 @@ class Preprocessor:
                     "method": method,
                     "extended": bool(fit_params and fit_params.get("extended")),
                     "projection_present": bool(self.epochs.proj),
-                    "date": datetime.now().isoformat(),
+                    "date": _utc_timestamp(),
                 }
             },
         )
@@ -997,7 +1057,7 @@ class Preprocessor:
                     "reference": reference,
                     "baseline": baseline,
                     "ica": ica_log,
-                    "date": datetime.now().isoformat(),
+                    "date": _utc_timestamp(),
                 }
             },
         )

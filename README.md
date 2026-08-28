@@ -340,6 +340,8 @@ The core preprocessing logic lives in [processing.py](/C:/Users/DW60ZF/Documents
 - epoch ICA
 - final epoch filtering and output generation
 
+Saved preprocessing derivatives include the SSPython release, Python and platform identifiers, and core dependency versions in their processing history.
+
 ## 11. Analysis
 
 The analysis page is implemented in [erp_analysis_page.py](/C:/Users/DW60ZF/Documents/SSPython/ui/pages/erp_analysis_page.py).

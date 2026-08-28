@@ -1,13 +1,41 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
 
 import mne
 import numpy as np
 
-from core.processing import Preprocessor
+from core.processing import Preprocessor, _utc_timestamp
+from core.version import __version__
+
+
+class TestProvenanceMetadata(unittest.TestCase):
+    def test_processing_timestamps_are_utc_aware(self):
+        timestamp = datetime.fromisoformat(_utc_timestamp())
+
+        self.assertEqual(timestamp.utcoffset().total_seconds(), 0)
+
+    def test_processing_log_adds_provenance_once(self):
+        instance = Mock()
+        instance.info = {}
+
+        Preprocessor.add_description(instance, {"first": {}})
+        Preprocessor.add_description(instance, {"second": {}})
+
+        descriptions = json.loads(instance.info["description"])
+        provenance = [
+            entry["provenance"] for entry in descriptions if "provenance" in entry
+        ]
+
+        self.assertEqual(len(provenance), 1)
+        self.assertEqual(provenance[0]["release"], f"v{__version__}")
+        self.assertIn("source", provenance[0])
+        self.assertIn("python", provenance[0])
+        self.assertIn("platform", provenance[0])
+        self.assertIn("mne", provenance[0]["dependencies"])
 
 
 class TestInitialEpochsMetadata(unittest.TestCase):
