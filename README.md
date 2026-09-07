@@ -132,7 +132,7 @@ SSPython is workspace-driven. A workspace is simply a directory on disk that con
 - optionally, any original vendor files
 - derivatives written by SSPython under the configured derivative root
 
-Dataset discovery is based on recursive search for `*_raw.fif` files under the selected workspace. Files under the derivative root are excluded from discovery so processed outputs are not mistaken for new source datasets.
+Home and Preprocessing recursively discover `*_raw.fif` source recordings. Analysis instead lists only existing preprocessed Epochs FIF files whose names contain `preprocessed` and end in `_epo.fif` or `-epo.fif` (including `.fif.gz`). A preprocessed file can therefore be opened in Analysis even when its raw recording and earlier pipeline stages are not present in the workspace. Each preprocessed file is listed only once.
 
 ### Workspace Example
 
@@ -346,7 +346,7 @@ Saved preprocessing derivatives include the SSPython release, Python and platfor
 
 The analysis page is implemented in [erp_analysis_page.py](/C:/Users/DW60ZF/Documents/SSPython/ui/pages/erp_analysis_page.py).
 
-It is enabled when a dataset has reached the `preprocessed` stage.
+It is enabled when a dataset has reached the `preprocessed` stage or when a matching preprocessed Epochs FIF file was discovered directly in the workspace.
 
 ### Visualization Tools
 

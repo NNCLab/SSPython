@@ -17,6 +17,18 @@ class _ImmediateWorker:
 
 
 class TestICASaving(unittest.TestCase):
+    def test_analysis_only_dataset_is_not_loaded_as_raw_data(self):
+        page = SimpleNamespace(
+            current_dataset=SimpleNamespace(is_analysis_only=True),
+            preprocessor=Mock(),
+            _needs_reload=True,
+        )
+
+        ProcessingPage._ensure_preprocessor_loaded(page)
+
+        self.assertIsNone(page.preprocessor)
+        self.assertFalse(page._needs_reload)
+
     def test_save_ica_changes_invalidates_downstream_before_saving(self):
         preprocessor = Mock()
         page = SimpleNamespace(preprocessor=preprocessor)

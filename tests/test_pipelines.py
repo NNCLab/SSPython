@@ -10,6 +10,7 @@ from core.pipelines import (
     PipelineStage,
     all_pipelines,
     build_analysis_paths,
+    discover_analysis_datasets,
     discover_datasets,
     get_pipeline,
 )
@@ -51,6 +52,124 @@ class TestPipelines(unittest.TestCase):
             self.assertEqual(len(datasets), 1)
             self.assertEqual(datasets[0].derivative_root, workspace_root / "derivatives" / "tms_eeg")
             self.assertEqual(datasets[0].paths["epochs"], legacy_derivative)
+
+    def test_discovers_preprocessed_epochs_without_raw_source(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace_root = Path(tmp_dir)
+            preprocessed_path = (
+                workspace_root
+                / "imported"
+                / "sub-01_task-tms_desc-preprocessed_epo.fif"
+            )
+            preprocessed_path.parent.mkdir(parents=True)
+            preprocessed_path.touch()
+
+            datasets = discover_analysis_datasets(
+                workspace_root, get_pipeline("standard"), "derivatives"
+            )
+
+            self.assertEqual(len(datasets), 1)
+            self.assertTrue(datasets[0].is_analysis_only)
+            self.assertIsNone(datasets[0].raw_path)
+            self.assertEqual(datasets[0].source_path, preprocessed_path)
+            self.assertTrue(datasets[0].stage_exists("preprocessed"))
+            self.assertEqual(datasets[0].status_text(), "Ready")
+            self.assertEqual(datasets[0].progress_fraction(), 1.0)
+            self.assertEqual(
+                datasets[0].completed_stage_count(),
+                len(datasets[0].pipeline.stages),
+            )
+
+    def test_preprocessed_discovery_accepts_hyphenated_and_compressed_names(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace_root = Path(tmp_dir)
+            paths = [
+                workspace_root / "alpha-preprocessed-epo.fif",
+                workspace_root / "beta_PREPROCESSED_epo.fif.gz",
+            ]
+            for path in paths:
+                path.touch()
+
+            datasets = discover_analysis_datasets(
+                workspace_root, get_pipeline("standard"), "derivatives"
+            )
+
+            self.assertEqual([dataset.source_path for dataset in datasets], paths)
+
+    def test_raw_backed_preprocessed_file_is_not_listed_twice(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace_root = Path(tmp_dir)
+            raw_path = workspace_root / "sub-01" / "eeg" / "sub-01_task-tms_raw.fif"
+            raw_path.parent.mkdir(parents=True)
+            raw_path.touch()
+            pipeline = get_pipeline("standard")
+            derivative_root = pipeline.derivative_root(workspace_root, "derivatives")
+            preprocessed_path = (
+                derivative_root
+                / "sub-01"
+                / "eeg"
+                / "sub-01_task-tms_desc-preprocessed_epo.fif"
+            )
+            preprocessed_path.parent.mkdir(parents=True)
+            preprocessed_path.touch()
+
+            datasets = discover_analysis_datasets(
+                workspace_root, pipeline, "derivatives"
+            )
+
+            self.assertEqual(len(datasets), 1)
+            self.assertFalse(datasets[0].is_analysis_only)
+            self.assertEqual(datasets[0].paths["preprocessed"], preprocessed_path)
+
+    def test_normal_discovery_does_not_include_analysis_only_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace_root = Path(tmp_dir)
+            preprocessed_path = workspace_root / "orphan_desc-preprocessed_epo.fif"
+            preprocessed_path.touch()
+
+            datasets = discover_datasets(
+                workspace_root, get_pipeline("standard"), "derivatives"
+            )
+
+            self.assertEqual(datasets, [])
+
+    def test_normal_discovery_marks_matching_external_preprocessed_file_complete(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace_root = Path(tmp_dir)
+            raw_path = (
+                workspace_root
+                / "sub-01"
+                / "eeg"
+                / "sub-01_ses-baseline_task-ACC_raw.fif"
+            )
+            raw_path.parent.mkdir(parents=True)
+            raw_path.touch()
+            preprocessed_path = (
+                workspace_root
+                / "imports"
+                / "sub-01_ses-baseline_task-ACC_desc-preprocessed_epo.fif"
+            )
+            preprocessed_path.parent.mkdir(parents=True)
+            preprocessed_path.touch()
+
+            datasets = discover_datasets(
+                workspace_root, get_pipeline("standard"), "derivatives"
+            )
+
+            self.assertEqual(len(datasets), 1)
+            self.assertEqual(datasets[0].paths["preprocessed"], preprocessed_path)
+            self.assertTrue(datasets[0].stage_exists("preprocessed"))
+            self.assertEqual(datasets[0].status_text(), "Ready")
+            self.assertEqual(datasets[0].progress_fraction(), 1.0)
+            self.assertEqual(datasets[0].remaining_stage_count(), 0)
+
+            analysis_datasets = discover_analysis_datasets(
+                workspace_root, get_pipeline("standard"), "derivatives"
+            )
+            self.assertEqual(len(analysis_datasets), 1)
+            self.assertEqual(
+                analysis_datasets[0].paths["preprocessed"], preprocessed_path
+            )
 
     def test_custom_pipeline_stage_can_define_derivative_path(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

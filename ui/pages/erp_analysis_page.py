@@ -301,7 +301,7 @@ class ErpAnalysisPage(BasePage):
             self.context_label.setText(
                 "This dataset is not at the preprocessed stage yet. Complete preprocessing first."
             )
-            self.context_label.setToolTip(str(self.current_dataset.raw_path))
+            self.context_label.setToolTip(str(self.current_dataset.source_path))
             self.context_label.show()
         else:
             self.set_page_subtitle(f"{pipeline_name} pipeline · {self.current_dataset.display_name}")

@@ -349,7 +349,7 @@ class ProcessingPage(BasePage):
             self.update_ui_state()
 
     def _ensure_preprocessor_loaded(self):
-        if not self.current_dataset:
+        if not self.current_dataset or self.current_dataset.is_analysis_only:
             self.preprocessor = None
             self._needs_reload = False
             return
@@ -523,7 +523,11 @@ class ProcessingPage(BasePage):
 
     def update_ui_state(self):
         pipeline_name = self.main_window.current_pipeline.name if self.main_window else "Pipeline"
-        if self.current_dataset:
+        if self.current_dataset and self.current_dataset.is_analysis_only:
+            self.set_page_subtitle(
+                f"Analysis-only input · {self.current_dataset.display_name}. Open Analysis to use this file."
+            )
+        elif self.current_dataset:
             self.set_page_subtitle(f"{pipeline_name} pipeline · {self.current_dataset.display_name}")
         else:
             self.set_page_subtitle("Select a dataset in the workspace panel to start preprocessing.")

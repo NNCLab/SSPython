@@ -383,6 +383,8 @@ class MainWindow(QMainWindow):
     def _apply_page_chrome_visibility(self, page_name: str):
         uses_workspace = page_name in {"Home", "Preprocessing", "Analysis"}
         uses_inspector = page_name in {"Preprocessing", "Analysis"}
+        if uses_workspace:
+            self.workspace_panel.set_analysis_mode(page_name == "Analysis")
         show_inspector = uses_inspector and self.current_dataset is not None
         self.workspace_panel.setVisible(uses_workspace)
         self.dataset_inspector_panel.setVisible(show_inspector)

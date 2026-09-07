@@ -331,7 +331,28 @@ def source_stem_from_raw(raw_path: Path) -> str:
 
 def source_stem_from_derivative(derivative_path: Path) -> str:
     stem = strip_extensions(derivative_path)
-    return re.sub(r"_desc-[^_]+_[^_]+$", "", stem)
+    source_stem = re.sub(
+        r"_desc-[^_]+_[^_]+$", "", stem, flags=re.IGNORECASE
+    )
+    return re.sub(
+        r"[-_]preprocessed[-_]epo$", "", source_stem, flags=re.IGNORECASE
+    )
+
+
+def is_preprocessed_epochs_path(file_path: Path) -> bool:
+    """Return whether a filename identifies a preprocessed Epochs FIF file."""
+    name = file_path.name.casefold()
+    return "preprocessed" in name and name.endswith(
+        ("_epo.fif", "-epo.fif", "_epo.fif.gz", "-epo.fif.gz")
+    )
+
+
+def discover_preprocessed_epochs_paths(workspace_root: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in workspace_root.rglob("*")
+        if path.is_file() and is_preprocessed_epochs_path(path)
+    )
 
 
 def infer_relative_derivative_dir(file_path: Path) -> Path:
@@ -423,14 +444,26 @@ def build_analysis_paths(
 
 @dataclass(frozen=True)
 class DatasetRecord:
-    raw_path: Path
+    raw_path: Path | None
     pipeline: PipelineDefinition
     derivative_root: Path
     paths: dict[str, Path]
 
     @property
+    def is_analysis_only(self) -> bool:
+        return self.raw_path is None
+
+    @property
+    def source_path(self) -> Path:
+        if self.raw_path is not None:
+            return self.raw_path
+        return self.paths[self.pipeline.analysis_ready_stage]
+
+    @property
     def source_stem(self) -> str:
-        return source_stem_from_raw(self.raw_path)
+        if self.raw_path is not None:
+            return source_stem_from_raw(self.raw_path)
+        return source_stem_from_derivative(self.source_path)
 
     @property
     def display_name(self) -> str:
@@ -438,7 +471,12 @@ class DatasetRecord:
 
     @property
     def relative_dir(self) -> Path:
-        return infer_relative_derivative_dir(self.raw_path)
+        if self.raw_path is not None:
+            return infer_relative_derivative_dir(self.raw_path)
+        try:
+            return self.source_path.parent.relative_to(self.derivative_root)
+        except ValueError:
+            return infer_relative_derivative_dir(self.source_path)
 
     @property
     def analysis_paths(self) -> dict[str, Path]:
@@ -462,6 +500,9 @@ class DatasetRecord:
         if self.stage_exists(stage_id):
             return "complete"
 
+        if self.is_analysis_only:
+            return "skipped"
+
         stage = self.stage_definition(stage_id)
         stage_index = self.pipeline.stage_index(stage_id)
         later_stages = self.pipeline.stages[stage_index + 1 :]
@@ -481,6 +522,12 @@ class DatasetRecord:
         return path.name
 
     def completed_stage_count(self) -> int:
+        # A saved analysis-ready output is the terminal pipeline result. Earlier
+        # intermediate files may legitimately have been removed or imported
+        # from another workspace, but that must not make a ready dataset appear
+        # partially complete in the workspace progress bar.
+        if self.stage_exists(self.pipeline.analysis_ready_stage):
+            return len(self.pipeline.stages)
         return sum(
             1
             for stage in self.pipeline.stages
@@ -513,12 +560,20 @@ def discover_datasets(
     workspace_root: Path | None,
     pipeline: PipelineDefinition,
     output_root: str,
+    *,
+    preprocessed_paths: list[Path] | None = None,
 ) -> list[DatasetRecord]:
     if workspace_root is None or not workspace_root.exists():
         return []
 
     workspace_root = Path(workspace_root)
     output_root_path = workspace_root / output_root
+    if preprocessed_paths is None:
+        preprocessed_paths = discover_preprocessed_epochs_paths(workspace_root)
+    preprocessed_by_stem: dict[str, list[Path]] = {}
+    for preprocessed_path in preprocessed_paths:
+        source_stem = source_stem_from_derivative(preprocessed_path).casefold()
+        preprocessed_by_stem.setdefault(source_stem, []).append(preprocessed_path)
 
     datasets: list[DatasetRecord] = []
     for raw_path in sorted(workspace_root.rglob("*_raw.fif")):
@@ -534,16 +589,76 @@ def discover_datasets(
             workspace_root,
             output_root,
         )
-        datasets.append(
-            DatasetRecord(
-                raw_path=raw_path,
-                pipeline=pipeline,
-                derivative_root=derivative_root,
-                paths=paths,
+        analysis_ready_path = paths.get(pipeline.analysis_ready_stage)
+        if analysis_ready_path is not None and not analysis_ready_path.exists():
+            matching_paths = preprocessed_by_stem.get(
+                source_stem_from_raw(raw_path).casefold(), []
             )
+            if len(matching_paths) == 1:
+                paths = dict(paths)
+                paths[pipeline.analysis_ready_stage] = matching_paths[0]
+        dataset = DatasetRecord(
+            raw_path=raw_path,
+            pipeline=pipeline,
+            derivative_root=derivative_root,
+            paths=paths,
+        )
+        datasets.append(dataset)
+
+    return sorted(datasets, key=lambda dataset: str(dataset.source_path).casefold())
+
+
+def discover_analysis_datasets(
+    workspace_root: Path | None,
+    pipeline: PipelineDefinition,
+    output_root: str,
+) -> list[DatasetRecord]:
+    """Discover each analysis-ready Epochs file in a workspace exactly once."""
+    if workspace_root is None or not workspace_root.exists():
+        return []
+
+    workspace_root = Path(workspace_root)
+    preprocessed_paths = discover_preprocessed_epochs_paths(workspace_root)
+    raw_datasets = discover_datasets(
+        workspace_root,
+        pipeline,
+        output_root,
+        preprocessed_paths=preprocessed_paths,
+    )
+    datasets_by_preprocessed_path = {
+        path.resolve(): dataset
+        for dataset in raw_datasets
+        if (path := dataset.paths.get(pipeline.analysis_ready_stage)) is not None
+        and path.exists()
+    }
+
+    for preprocessed_path in preprocessed_paths:
+        resolved_path = preprocessed_path.resolve()
+        if resolved_path in datasets_by_preprocessed_path:
+            continue
+
+        derivative_root = pipeline.derivative_root(workspace_root, output_root)
+        for candidate_root in pipeline.derivative_roots(workspace_root, output_root):
+            try:
+                preprocessed_path.relative_to(candidate_root)
+            except ValueError:
+                continue
+            derivative_root = candidate_root
+            break
+
+        datasets_by_preprocessed_path[resolved_path] = DatasetRecord(
+            raw_path=None,
+            pipeline=pipeline,
+            derivative_root=derivative_root,
+            paths={pipeline.analysis_ready_stage: preprocessed_path},
         )
 
-    return datasets
+    return sorted(
+        datasets_by_preprocessed_path.values(),
+        key=lambda dataset: str(
+            dataset.paths[pipeline.analysis_ready_stage]
+        ).casefold(),
+    )
 
 
 def derivative_progress_count(

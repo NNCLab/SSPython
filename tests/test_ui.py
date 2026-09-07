@@ -39,7 +39,7 @@ from ui.widgets.preprocessing_widgets import (
     EpochingSettingsWidget,
     PreprocessingSettingsWidget,
 )
-from ui.widgets.workspace_panel import DatasetInspectorPanel
+from ui.widgets.workspace_panel import DatasetInspectorPanel, WorkspacePanel
 from ui.widgets.tools.conversion_tool import ConvertToolDialog, MergeToolDialog
 from ui.widgets.tools.export_tool import ExportFilesDialog
 from ui.widgets.tools.object_info_widget import (
@@ -180,6 +180,57 @@ class TestUI(unittest.TestCase):
                 [paths["preprocessed"]],
             )
             window.close()
+
+    def test_workspace_panel_uses_page_specific_dataset_catalogs(self):
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        with tempfile.TemporaryDirectory() as temp_directory:
+            workspace_root = Path(temp_directory)
+            raw_path = workspace_root / "sub-01" / "eeg" / "sub-01_raw.fif"
+            raw_path.parent.mkdir(parents=True)
+            raw_path.touch()
+            pipeline = get_pipeline("standard")
+            derivative_root = pipeline.derivative_root(workspace_root, "derivatives")
+            paired_preprocessed = (
+                derivative_root
+                / "sub-01"
+                / "eeg"
+                / "sub-01_desc-preprocessed_epo.fif"
+            )
+            paired_preprocessed.parent.mkdir(parents=True)
+            paired_preprocessed.touch()
+            standalone_preprocessed = (
+                workspace_root / "imports" / "sub-02_desc-preprocessed_epo.fif"
+            )
+            standalone_preprocessed.parent.mkdir(parents=True)
+            standalone_preprocessed.touch()
+
+            panel = WorkspacePanel()
+            selections = []
+            panel.dataset_selected.connect(selections.append)
+            panel.set_context(
+                workspace_root=workspace_root,
+                pipeline=pipeline,
+                output_root="derivatives",
+            )
+
+            self.assertEqual([dataset.raw_path for dataset in panel.datasets], [raw_path])
+
+            panel.set_analysis_mode(True)
+
+            analysis_paths = [
+                dataset.paths["preprocessed"] for dataset in panel.datasets
+            ]
+            self.assertEqual(
+                analysis_paths,
+                sorted([paired_preprocessed, standalone_preprocessed]),
+            )
+            self.assertEqual(len(set(analysis_paths)), 2)
+            self.assertIs(panel.current_dataset, selections[-1])
+            self.assertTrue(panel.current_dataset.stage_exists("preprocessed"))
+            panel.close()
 
     def test_workspace_export_dialog_hands_selected_files_to_worker(self):
         app = QApplication.instance()

@@ -24,7 +24,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.pipelines import DatasetRecord, PipelineDefinition, discover_datasets
+from core.pipelines import (
+    DatasetRecord,
+    PipelineDefinition,
+    discover_analysis_datasets,
+    discover_datasets,
+)
 from ui.widgets.tools.object_info_widget import ObjectDetailsDialog
 from ui.widgets.tools.stage_io import load_stage_object
 from utils import Worker, themed_svg_icon
@@ -42,7 +47,13 @@ def display_name_for_path(path: Path | None, *, strip_extensions: bool = True) -
 
 
 class DatasetProgressBar(QProgressBar):
-    def __init__(self, dataset: DatasetRecord, parent: QWidget | None = None):
+    def __init__(
+        self,
+        dataset: DatasetRecord,
+        parent: QWidget | None = None,
+        *,
+        display_path: Path | None = None,
+    ):
         super().__init__(parent)
         self.dataset = dataset
         self.setObjectName("datasetProgress")
@@ -52,7 +63,8 @@ class DatasetProgressBar(QProgressBar):
         self.setTextVisible(False)
         self.setMinimumHeight(32)
         self.setToolTip(
-            f"{dataset.raw_path}\n{dataset.completed_stage_count()} of {len(dataset.pipeline.stages)} stages satisfied"
+            f"{display_path or dataset.source_path}\n"
+            f"{dataset.completed_stage_count()} of {len(dataset.pipeline.stages)} stages satisfied"
         )
 
     def set_selected(self, selected: bool):
@@ -80,13 +92,21 @@ class DatasetProgressBar(QProgressBar):
 
 
 class DatasetListItemWidget(QFrame):
-    def __init__(self, dataset: DatasetRecord, parent: QWidget | None = None):
+    def __init__(
+        self,
+        dataset: DatasetRecord,
+        parent: QWidget | None = None,
+        *,
+        display_path: Path | None = None,
+    ):
         super().__init__(parent)
         self.dataset = dataset
         self.setObjectName("datasetListItem")
         self.setProperty("selected", False)
-        self.setToolTip(str(dataset.raw_path))
-        self.progress_bar = DatasetProgressBar(dataset, self)
+        self.setToolTip(str(display_path or dataset.source_path))
+        self.progress_bar = DatasetProgressBar(
+            dataset, self, display_path=display_path
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -266,6 +286,7 @@ class WorkspacePanel(QFrame):
         self.output_root = "derivatives"
         self.datasets: list[DatasetRecord] = []
         self.current_dataset: DatasetRecord | None = None
+        self.analysis_mode = False
 
         self._build_ui()
 
@@ -341,21 +362,44 @@ class WorkspacePanel(QFrame):
         if folder_path:
             self.folder_selected.emit(folder_path)
 
+    def set_analysis_mode(self, enabled: bool):
+        enabled = bool(enabled)
+        if self.analysis_mode == enabled:
+            return
+        self.analysis_mode = enabled
+        self.refresh()
+
+    def _catalog_path(self, dataset: DatasetRecord) -> Path:
+        if self.analysis_mode:
+            return dataset.paths[dataset.pipeline.analysis_ready_stage]
+        return dataset.source_path
+
     def refresh(self):
-        selected_raw_path = self.current_dataset.raw_path if self.current_dataset else None
+        selected_source_path = (
+            self._catalog_path(self.current_dataset) if self.current_dataset else None
+        )
 
         if self.pipeline is None:
             self.datasets = []
+        elif self.analysis_mode:
+            self.datasets = discover_analysis_datasets(
+                self.workspace_root, self.pipeline, self.output_root
+            )
         else:
             self.datasets = discover_datasets(self.workspace_root, self.pipeline, self.output_root)
 
         self.populate_list()
 
-        if selected_raw_path is not None:
-            self._restore_selection(selected_raw_path)
-        elif self.list_widget.count():
+        restored = bool(
+            selected_source_path is not None
+            and self._restore_selection(selected_source_path)
+        )
+        if not restored and self.list_widget.count():
             self.list_widget.setCurrentRow(0)
-        else:
+            dataset = self.list_widget.item(0).data(Qt.ItemDataRole.UserRole)
+            if self.current_dataset is not dataset:
+                self._set_current_dataset(dataset)
+        elif not restored:
             self._set_current_dataset(None)
 
     def populate_list(self):
@@ -365,10 +409,11 @@ class WorkspacePanel(QFrame):
 
         visible_count = 0
         for dataset in self.datasets:
+            catalog_path = self._catalog_path(dataset)
             haystack = " ".join(
                 [
                     dataset.display_name.lower(),
-                    dataset.raw_path.name.lower(),
+                    catalog_path.name.lower(),
                     str(dataset.relative_dir).lower(),
                 ]
             )
@@ -379,7 +424,9 @@ class WorkspacePanel(QFrame):
             item.setData(Qt.ItemDataRole.UserRole, dataset)
             item.setSizeHint(QSize(0, 40))
             self.list_widget.addItem(item)
-            self.list_widget.setItemWidget(item, DatasetListItemWidget(dataset))
+            self.list_widget.setItemWidget(
+                item, DatasetListItemWidget(dataset, display_path=catalog_path)
+            )
             visible_count += 1
 
         self.count_label.setText(f"({visible_count} file{'s' if visible_count != 1 else ''})")
@@ -388,13 +435,16 @@ class WorkspacePanel(QFrame):
         if visible_count == 0:
             self._set_current_dataset(None)
 
-    def _restore_selection(self, raw_path: Path):
+    def _restore_selection(self, source_path: Path) -> bool:
         for row in range(self.list_widget.count()):
             item = self.list_widget.item(row)
             dataset = item.data(Qt.ItemDataRole.UserRole)
-            if dataset and dataset.raw_path == raw_path:
+            if dataset and self._catalog_path(dataset) == source_path:
                 self.list_widget.setCurrentRow(row)
-                return
+                if self.current_dataset is not dataset:
+                    self._set_current_dataset(dataset)
+                return True
+        return False
 
     def _on_item_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None):
         previous_widget = self.list_widget.itemWidget(previous) if previous is not None else None
@@ -659,6 +709,8 @@ class DatasetInspectorPanel(QFrame):
 
     def _existing_derivative_paths_from_stage(self, stage_id: str) -> list[Path]:
         if self.current_dataset is None or stage_id == "raw":
+            return []
+        if self.current_dataset.is_analysis_only:
             return []
 
         try:
