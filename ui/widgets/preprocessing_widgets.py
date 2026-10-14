@@ -486,6 +486,8 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         self.show_events_list = show_events_list
         self.event_id_map: dict[str, int] = {}
         self._pending_event_selection: dict[str, int] | list[int] | int | None = None
+        self.boundary_count = 0
+        self.section_label_edits: list[QLineEdit] = []
 
         layout = QVBoxLayout(self)
         self.init_form(layout)
@@ -562,6 +564,14 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         epoching_layout.addRow(self.fixed_overlap_label, self.fixed_overlap_edit)
 
         main_layout.addWidget(epoching_group)
+        self.sections_group = QGroupBox("Recording sections")
+        sections_layout = QVBoxLayout(self.sections_group)
+        self.sections_notice = QLabel()
+        self.sections_notice.setWordWrap(True)
+        sections_layout.addWidget(self.sections_notice)
+        self.section_labels_form = QFormLayout()
+        sections_layout.addLayout(self.section_labels_form)
+        main_layout.addWidget(self.sections_group)
         main_layout.addStretch()
 
     def update_ui_visibility(self, mode_text):
@@ -582,23 +592,48 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         self.fixed_dur_edit.setVisible(not is_event_based)
         self.fixed_overlap_label.setVisible(not is_event_based)
         self.fixed_overlap_edit.setVisible(not is_event_based)
+        self.sections_group.setVisible(not is_event_based and self.boundary_count > 0)
+
+    def populate_section_labels(self, raw_data):
+        """Show one editable condition name per section, in recording order."""
+        boundary_samples = Preprocessor.get_boundary_samples(raw_data)
+        self.boundary_count = len(boundary_samples)
+        while self.section_labels_form.rowCount():
+            self.section_labels_form.removeRow(0)
+        self.section_label_edits.clear()
+        defaults = Preprocessor.resolve_section_labels(self.boundary_count)
+        for index, label in enumerate(defaults, start=1):
+            edit = QLineEdit(label)
+            self.section_label_edits.append(edit)
+            self.section_labels_form.addRow(f"Section {index}:", edit)
+        boundary_word = "boundary" if self.boundary_count == 1 else "boundaries"
+        self.sections_notice.setText(
+            f"Found {self.boundary_count} EDGE {boundary_word}, defining "
+            f"{self.boundary_count + 1} recording sections. "
+            "Choose a unique condition label for each section, in recording order."
+        )
+        self.update_ui_visibility(self.mode_combobox.currentText())
 
     def populate_events_list(self, raw_data):
+        self.populate_section_labels(raw_data)
         if not self.show_events_list or self.events_list is None:
             return
 
-        try:
-            # Safety check: if raw has no annotations, user might BE forced to use Fixed-length
-            if not raw_data.annotations:
-                self.mode_combobox.setCurrentText("Fixed-length (Resting State)")
-                # Optional: Disable the combobox if you want to force it
-                self.mode_combobox.setEnabled(False)
+        self.event_id_map = {}
+        has_event_annotations = any(
+            not str(description).lower().startswith(("bad", "edge"))
+            for description in raw_data.annotations.description
+        )
+        if has_event_annotations:
+            try:
+                _, self.event_id_map = mne.events_from_annotations(raw_data)
+            except Exception as e:
+                logger.warning(f"Could not extract events: {e}")
 
-            events, self.event_id_map = mne.events_from_annotations(raw_data)
-        except Exception as e:
-            # If no events found, we don't crash, just log
-            logger.warning(f"Could not extract events: {e}")
-            return
+        # EDGE/BAD boundaries are not event-related triggers.
+        self.mode_combobox.setEnabled(bool(self.event_id_map))
+        if not self.event_id_map:
+            self.mode_combobox.setCurrentText("Fixed-length (Resting State)")
 
         self.events_list.clear()
         for description in sorted(self.event_id_map.keys()):
@@ -677,6 +712,8 @@ class EpochingSettingsWidget(BaseSettingsWidget):
             ),
             "Event-based",
         )
+        if self.show_events_list and not self.mode_combobox.isEnabled():
+            display_mode = "Fixed-length (Resting State)"
         self.mode_combobox.setCurrentText(display_mode)
         self.resample_edit.setText(to_display_string(params.get("resample")))
         tlim = params.get("tlim")
@@ -712,6 +749,18 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         )
         self._pending_event_selection = params.get("event_id")
         self._apply_event_selection(self._pending_event_selection)
+        for edit, label in zip(
+            self.section_label_edits,
+            Preprocessor.resolve_section_labels(self.boundary_count),
+        ):
+            edit.setText(label)
+
+    def save_settings(self):
+        # Recording-specific labels should not become defaults for other raw files.
+        params = self.get_params()
+        params.pop("section_labels")
+        self.settings_store.set(self.get_settings_path(), params)
+        self.settings_store.sync()
 
     def get_params(self) -> dict:
         mode = self.mode_combobox.currentText()
@@ -729,6 +778,14 @@ class EpochingSettingsWidget(BaseSettingsWidget):
             ),
             "fixed_overlap": (
                 parse_numeric(self.fixed_overlap_edit.text()) if is_fixed else 0.0
+            ),
+            "section_labels": (
+                Preprocessor.resolve_section_labels(
+                    self.boundary_count,
+                    [edit.text() for edit in self.section_label_edits],
+                )
+                if is_fixed and self.boundary_count > 0
+                else None
             ),
             # Common params
             "resample": parse_numeric(self.resample_edit.text()),
@@ -749,12 +806,17 @@ class EpochingDialog(BaseProcessingDialog):
 
         # Populate events if raw data exists
         if self.preprocessor.has("raw"):
-            self.settings_widget.populate_events_list(self.preprocessor.raw)
+            self.settings_widget.populate_events_list(
+                self.preprocessor._get_last_continuous()
+            )
             # Force a visibility refresh after populating data
             current_mode = self.settings_widget.mode_combobox.currentText()
             self.settings_widget.update_ui_visibility(current_mode)
+        min_height = 380
+        if not self.settings_widget.sections_group.isHidden():
+            min_height = min(700, self.settings_widget.sizeHint().height() + 96)
         self._apply_compact_size(
-            min_size=QSize(560, 380),
+            min_size=QSize(560, min_height),
             max_size=QSize(760, 700),
         )
 

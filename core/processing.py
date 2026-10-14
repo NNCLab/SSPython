@@ -626,6 +626,7 @@ class Preprocessor:
         notch: int | None = None,
         reference: list[str] | str | None = None,
         verbose: bool = True,
+        section_labels: list[str] | None = None,
     ):
         """
         Segments the data into epochs.
@@ -645,11 +646,23 @@ class Preprocessor:
             notch (int | None, optional): The notch filter frequency. Defaults to None.
             reference (list[str] | str | None, optional): The reference channels. Defaults to None.
             verbose (bool, optional): The verbosity level. Defaults to True.
+            section_labels (list[str] | None, optional): One unique condition label per
+                resting-state section, in recording order. With EDGE boundaries,
+                defaults to pre/post for two sections or 1, 2, ... for more sections.
         """
+        # Validate section names before invalidating existing derivatives.
+        raw = self._get_last_continuous()
+        resolved_section_labels = []
+        if mode == "fixed":
+            boundary_samples = self.get_boundary_samples(raw)
+            resolved_section_labels = self.resolve_section_labels(
+                len(boundary_samples), section_labels
+            )
+
         self._clear_downstream_files("epochs")
 
         # 1. Load Data
-        raw = self._get_last_continuous().load_data()
+        raw = raw.load_data()
 
         # 2. Common Pre-processing (Reference, Notch, Bandpass, ICA)
         #    These apply to the continuous data regardless of epoching mode.
@@ -723,8 +736,22 @@ class Preprocessor:
                 preload=True,
                 verbose=verbose,
             )
-            # Note: make_fixed_length_epochs does not accept 'detrend' or 'baseline' arguments.
-            # If detrending is required, it is usually handled by the high-pass filter above.
+            if resolved_section_labels:
+                # Use the final sample grid, including any resampling and first_samp.
+                boundary_samples = self.get_boundary_samples(raw)
+                epochs.events[:, 2] = (
+                    np.searchsorted(boundary_samples, epochs.events[:, 0], side="right")
+                    + 1
+                )
+                epochs.event_id = {
+                    label: index + 1
+                    for index, label in enumerate(resolved_section_labels)
+                }
+                logger.info(
+                    "Resting-state sections (%s EDGE boundaries): %s",
+                    len(boundary_samples),
+                    epochs.event_id,
+                )
 
         else:
             # --- Mode B: Event Based (ERP/TMS) ---
@@ -763,7 +790,10 @@ class Preprocessor:
                     "continuous_ica": continuous_ica_log["applied"],
                     "ica": continuous_ica_log,
                     "event_id": (
-                        resolved_event_id if mode == "event" else "N/A"
+                        resolved_event_id if mode == "event" else epochs.event_id
+                    ),
+                    "section_labels": (
+                        resolved_section_labels if mode == "fixed" else "N/A"
                     ),
                     "tlim": tlim if mode == "event" else "N/A",
                     "fixed_duration": fixed_duration if mode == "fixed" else "N/A",
@@ -781,6 +811,41 @@ class Preprocessor:
         logger.info("Saving epochs...")
         epochs.save(self.paths["epochs"], overwrite=True, verbose=verbose)
         self._epochs = epochs
+
+    @staticmethod
+    def get_boundary_samples(raw: mne.io.BaseRaw) -> np.ndarray:
+        """Return distinct EDGE boundary samples in the raw event sample grid."""
+        if "EDGE boundary" not in raw.annotations.description:
+            return np.empty(0, dtype=int)
+        events, _ = mne.events_from_annotations(
+            raw, regexp=r"^EDGE boundary$", verbose=False
+        )
+        return np.unique(events[:, 0])
+
+    @staticmethod
+    def resolve_section_labels(
+        boundary_count: int, section_labels: list[str] | None = None
+    ) -> list[str]:
+        """Default or validate ordered condition labels for resting-state sections."""
+        if section_labels is None:
+            if boundary_count == 0:
+                return []
+            if boundary_count == 1:
+                return ["pre", "post"]
+            return [str(index + 1) for index in range(boundary_count + 1)]
+
+        if isinstance(section_labels, str) or len(section_labels) != boundary_count + 1:
+            raise ValueError(
+                f"Provide one label per resting-state section ({boundary_count + 1} labels)."
+            )
+        if any(
+            not isinstance(label, str) or not label.strip() for label in section_labels
+        ):
+            raise ValueError("Section labels must be non-empty names.")
+        labels = [label.strip() for label in section_labels]
+        if len(set(labels)) != len(labels):
+            raise ValueError("Section labels must be unique.")
+        return labels
 
     @staticmethod
     def _resolve_annotation_event_id(

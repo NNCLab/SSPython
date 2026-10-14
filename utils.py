@@ -8,7 +8,15 @@ from pathlib import Path
 from PySide6.QtCore import QByteArray, QRectF, Signal, Qt, QThread, QObject, QSize
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QApplication, QProgressDialog, QMessageBox, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QPlainTextEdit,
+    QProgressDialog,
+    QVBoxLayout,
+    QWidget,
+)
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 import logging
 import traceback
@@ -314,6 +322,33 @@ class InterruptionRequestedError(Exception):
 
 # ... (rest of the file is the same until the Worker class) ...
 
+class ErrorDialog(QDialog):
+    """Display a complete error message with scrolling and clipboard support."""
+
+    def __init__(self, message: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Error")
+        available = self.screen().availableGeometry()
+        self.resize(
+            min(760, int(available.width() * 0.8)),
+            min(480, int(available.height() * 0.8)),
+        )
+
+        layout = QVBoxLayout(self)
+        message_view = QPlainTextEdit(self)
+        message_view.setReadOnly(True)
+        message_view.setPlainText(message)
+        layout.addWidget(message_view)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        copy_button = buttons.addButton(
+            "Copy error", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(message))
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class Worker(QThread):
     """
     A professional QThread worker for running tasks in the background.
@@ -451,9 +486,7 @@ class Worker(QThread):
 
         if dialog_code == QProgressDialog.DialogCode.Rejected and self._error:
             if not self.isInterruptionRequested() and show_error_msg:
-                QMessageBox.critical(
-                    parent, "Error", f"An error occurred:\n{self._error}"
-                )
+                ErrorDialog(f"An error occurred:\n{self._error}", parent).exec()
             return None
 
         # Workers are usually parented to long-lived pages. Keeping the result
