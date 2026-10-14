@@ -25,6 +25,7 @@ from core.pipelines import (
     source_stem_from_raw,
 )
 from core.version import __version__
+from core.baseline import validate_baseline
 from core.filtering import (
     FilterConfig, NotchConfig, apply_bandpass, apply_notch, validate_resample,
 )
@@ -1043,28 +1044,6 @@ class Preprocessor:
 
         epochs_for_ica = self.epochs.copy()
 
-        # Conditionally apply baseline correction only if the data has a projection
-        # and the baseline period is valid for the data's time range.
-        if self.epochs.proj:
-            baseline = (None, 0)
-            tmin, tmax = epochs_for_ica.times.min(), epochs_for_ica.times.max()
-            baseline_tmin = baseline[0] if baseline[0] is not None else tmin
-            baseline_tmax = baseline[1] if baseline[1] is not None else tmax
-
-            if (
-                baseline_tmin < tmin
-                or baseline_tmax > tmax
-                or baseline_tmin >= baseline_tmax
-            ):
-                logger.warning(
-                    f"Baseline {baseline} is outside of data time range [{tmin:.3f}, {tmax:.3f}]. Skipping baseline correction for ICA fitting."
-                )
-            else:
-                logger.info(
-                    f"Applying baseline correction {baseline} before fitting ICA..."
-                )
-                epochs_for_ica.apply_baseline(baseline)
-
         ica.fit(epochs_for_ica, verbose=verbose)
         self.add_description(
             ica,
@@ -1090,7 +1069,7 @@ class Preprocessor:
         resample: int | None = None,
         interpolate_bad_channels=True,
         reference: list[str] | str | None = None,
-        baseline=(None, 0),
+        baseline=None,
         verbose=True,
         filter_config: FilterConfig | dict | None = None,
     ):
@@ -1098,6 +1077,8 @@ class Preprocessor:
         logger.info("Loading epoched data...")
         validate_resample(resample)
         epochs = self.epochs.load_data().copy()
+        requested_baseline = baseline
+        baseline = validate_baseline(epochs.times, baseline)
 
         ica = self.epochs_ica if self.has("epochs_ica") else None
         ica_log = self._ica_log(ica, "epochs_ica")
@@ -1132,29 +1113,10 @@ class Preprocessor:
             logger.info(f"Resampling to {resample} Hz...")
             epochs.resample(resample, npad="auto")
 
-        # Only apply baseline correction for event-related data
-        if self.epoching_mode == "event":
-            if baseline is not None and baseline != (None, None):
-                tmin, tmax = epochs.times.min(), epochs.times.max()
-                baseline_tmin = baseline[0] if baseline[0] is not None else tmin
-                baseline_tmax = baseline[1] if baseline[1] is not None else tmax
-
-                if (
-                    baseline_tmin < tmin
-                    or baseline_tmax > tmax
-                    or baseline_tmin >= baseline_tmax
-                ):
-                    logger.warning(
-                        f"Baseline {baseline} is outside of data time range [{tmin:.3f}, {tmax:.3f}]. Skipping baseline correction."
-                    )
-                else:
-                    logger.info(
-                        f"Applying baseline correction {baseline} for event-related epochs..."
-                    )
-                    epochs.apply_baseline(baseline=baseline)
-        else:
-            logger.info("Skipping baseline correction for fixed-length epochs.")
-            baseline = "skipped"  # For logging purposes
+        if baseline is not None:
+            baseline = validate_baseline(epochs.times, requested_baseline)
+            logger.info("Applying baseline correction %s after epoch cleanup...", baseline)
+            epochs.apply_baseline(baseline=baseline)
 
         self._clear_downstream_files("preprocessed", verbose=False)
 
@@ -1170,6 +1132,7 @@ class Preprocessor:
                     "interpolate_bad_channels": interpolate_bad_channels,
                     "reference": reference,
                     "baseline": baseline,
+                    "baseline_requested": requested_baseline,
                     "ica": ica_log,
                     "date": _utc_timestamp(),
                 }
@@ -1261,6 +1224,12 @@ class TMSEEGAnalysis:
                 else None
             ),
         }
+        # Keep the pooled result compatible with the numerical analysis API,
+        # while the viewer can select from all saved condition averages.
+        for key in ("tfr", "itc"):
+            if isinstance(all_derivatives[key], list):
+                all_derivatives[f"{key}_events"] = all_derivatives[key]
+                all_derivatives[key] = all_derivatives[key][0]
         return all_derivatives
 
     # ==== Statistics ====
@@ -1668,6 +1637,8 @@ class TMSEEGAnalysis:
         )
         self.derivatives["tfr"] = tfr
         self.derivatives["itc"] = itc
+        self.derivatives.pop("tfr_events", None)
+        self.derivatives.pop("itc_events", None)
         return tfr, itc
 
     def save_tfr_and_itc(self, overwrite=False, verbose=True):
@@ -1684,12 +1655,14 @@ class TMSEEGAnalysis:
 
         logger.info("Saving TFR and ITC data...")
         if not self.has("tfr") or overwrite:
-            self.derivatives["tfr"].save(
-                self.paths["tfr"], overwrite=True, verbose=False
+            mne.time_frequency.write_tfrs(
+                self.paths["tfr"], self.derivatives.get("tfr_events", self.derivatives["tfr"]),
+                overwrite=True, verbose=False,
             )
         if not self.has("itc") or overwrite:
-            self.derivatives["itc"].save(
-                self.paths["itc"], overwrite=True, verbose=False
+            mne.time_frequency.write_tfrs(
+                self.paths["itc"], self.derivatives.get("itc_events", self.derivatives["itc"]),
+                overwrite=True, verbose=False,
             )
         logger.info("TFR and ITC saved successfully.")
 

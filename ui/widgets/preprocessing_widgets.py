@@ -28,9 +28,11 @@ import mne
 from core.processing import Preprocessor
 from utils import parse_numeric, to_display_string, Worker
 from .tools.optional_range_widget import OptionalRangeWidget
+from .tools.baseline_control import BaselineControl
 from .tools.advanced_settings import AdvancedSettings
 from .tools.filter_settings import FilterSettingsWidget
 from core.filtering import validate_bandpass, validate_resample
+from core.baseline import event_baseline_default, validate_baseline
 from pathlib import Path
 
 from core.app_settings import get_settings_store
@@ -1091,14 +1093,7 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
         # --- Other widgets ---
         self.interpolate_bad_channels_check = QCheckBox()
         self.resample_input = QLineEdit()
-        self.baseline_input = OptionalRangeWidget(
-            ("Start:", "Stop:"),
-            suffix="ms",
-            required=(False, False),
-            range=(None, None),
-            parent=self,
-            scale=1e-3,
-        )
+        self.baseline_input = BaselineControl(parent=self)
 
         # --- Add rows to form ---
         form_layout.addRow("Bandpass Filter:", self.bandpass_input)
@@ -1157,8 +1152,41 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
             "interpolate_bad_channels": True,
             "reference": None,
             "resample": None,
-            "baseline": (None, 0),
+            "baseline": event_baseline_default(self.preprocessor.epochs) if self.preprocessor else None,
         }
+
+    def _baseline_settings_path(self):
+        mode = self.preprocessor.epoching_mode if self.preprocessor else "unknown"
+        return f"{self.get_settings_path()}/baseline/{mode}"
+
+    def load_settings(self):
+        saved = self.settings_store.get(
+            self.get_settings_path(), {}, legacy_keys=self.LEGACY_KEYS,
+        )
+        params = self.get_defaults()
+        if isinstance(saved, dict):
+            params.update(saved)
+        mode = self.preprocessor.epoching_mode if self.preprocessor else "unknown"
+        legacy_baseline = params.get("baseline") if mode == "event" else None
+        # The old range-only UI used both unchecked endpoints to mean disabled.
+        if legacy_baseline is not None and tuple(legacy_baseline) == (None, None):
+            legacy_baseline = None
+        params["baseline"] = self.settings_store.get(
+            self._baseline_settings_path(), legacy_baseline,
+        )
+        if self.preprocessor:
+            try:
+                validate_baseline(self.preprocessor.epochs.times, params["baseline"])
+            except ValueError:
+                # A saved interval may belong to epochs with different limits.
+                params["baseline"] = None
+        self.set_params(params)
+
+    def save_settings(self):
+        params = self.get_params()
+        self.settings_store.set(self.get_settings_path(), params)
+        self.settings_store.set(self._baseline_settings_path(), params["baseline"])
+        self.settings_store.sync()
 
     def set_params(self, params: dict):
         self.bandpass_input.setValue(params.get("bandpass"))
@@ -1168,7 +1196,11 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
         self.select_bad_channels_button.setText(_selected_channels_button_text(
             self._selected_bad_channels, "Extra Bad Channels..."
         ))
-        self.baseline_input.setValue(params.get("baseline"))
+        suggested = event_baseline_default(self.preprocessor.epochs) if self.preprocessor else None
+        if suggested is None and self.preprocessor:
+            times = self.preprocessor.epochs.times
+            suggested = (float(times[0]), float(times[-1]))
+        self.baseline_input.setValue(params.get("baseline"), suggested=suggested)
         self.interpolate_bad_channels_check.setChecked(
             params.get("interpolate_bad_channels")
         )
@@ -1206,6 +1238,8 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
                 )
             params["reference"] = self._selected_ref_channels
         params["baseline"] = self.baseline_input.value()
+        if self.preprocessor:
+            validate_baseline(self.preprocessor.epochs.times, params["baseline"])
         params["resample"] = parse_numeric(self.resample_input.text(), int)
         params.update(self.advanced_settings.get_params())
         validate_bandpass(params["bandpass"])

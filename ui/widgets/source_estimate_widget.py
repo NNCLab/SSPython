@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
 )
 
 from ui.widgets.tools.optional_range_widget import OptionalRangeWidget
+from ui.widgets.event_selection import EventSelector
+from core.analysis_events import select_event_epochs
 from utils import Worker
 
 os.environ.setdefault("MNE_QT_BACKEND", "PySide6")
@@ -155,7 +157,7 @@ def compute_stc(
     epochs: mne.BaseEpochs,
     *,
     source_config: STCSourceConfig,
-    condition: str | None,
+    condition: int | str | None,
     pick_eeg: bool,
     set_eeg_reference: bool,
     noise_tmin: float | None,
@@ -172,7 +174,7 @@ def compute_stc(
     verbose: bool = True,
 ) -> tuple[mne.SourceEstimate, STCSourceModel]:
     source_model = prepare_stc_source_model(source_config)
-    analysis_epochs = epochs[condition].copy() if condition else epochs.copy()
+    analysis_epochs = select_event_epochs(epochs, condition).copy()
     if len(analysis_epochs) == 0:
         raise ValueError("No epochs are available for the selected condition.")
 
@@ -296,10 +298,7 @@ class ComputeSTCSettingsDialog(QDialog):
         group = QGroupBox("Data and Noise Covariance")
         form = QFormLayout(group)
 
-        self.condition_combo = QComboBox()
-        self.condition_combo.addItem("All epochs", None)
-        for event_name in self.epochs.event_id or {}:
-            self.condition_combo.addItem(event_name, event_name)
+        self.condition_combo = EventSelector(self.epochs, self)
 
         self.pick_eeg_checkbox = QCheckBox("Use EEG channels only")
         self.pick_eeg_checkbox.setChecked(True)
@@ -329,7 +328,7 @@ class ComputeSTCSettingsDialog(QDialog):
         self.rank_combo = QComboBox()
         self.rank_combo.addItems(list(RANK_VALUES.keys()))
 
-        form.addRow("condition:", self.condition_combo)
+        form.addRow("Event:", self.condition_combo)
         form.addRow(self.pick_eeg_checkbox)
         form.addRow(self.reference_checkbox)
         form.addRow("noise window:", self.noise_window_input)

@@ -24,6 +24,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from ui.dialogs.sensor_selection_dialog import SensorSelectionDialog
+from ui.widgets.event_selection import EventSelector
 from utils import use_plot_style, Worker, parse_tuple
 
 logger = logging.getLogger(__name__)
@@ -223,6 +224,8 @@ class NaturalFrequencyApp(QDialog):
         group = QGroupBox("Parameters")
         layout = QVBoxLayout(group)
         form_layout = QFormLayout()
+        self.event_selector = EventSelector(self.epochs, self)
+        form_layout.addRow("Event:", self.event_selector)
 
         self.roi_button = QPushButton("Select ROI from 2D Layout")
         self.channels_input = QLineEdit()
@@ -254,6 +257,12 @@ class NaturalFrequencyApp(QDialog):
     def _setup_connections(self):
         self.roi_button.clicked.connect(self.select_roi)
         self.run_button.clicked.connect(self.run_analysis)
+        self.event_selector.currentIndexChanged.connect(self._on_event_changed)
+
+    def _on_event_changed(self):
+        self.figure.clear()
+        self.figure.suptitle(f"{self.event_selector.selected_label()} - Run analysis to update")
+        self.canvas.draw()
 
     @Slot()
     def select_roi(self):
@@ -295,9 +304,12 @@ class NaturalFrequencyApp(QDialog):
         try:
             self.run_button.setEnabled(False)
             self.run_button.setText("Running...")
+            self.event_selector.setEnabled(False)
+            selected_epochs = self.event_selector.selected_epochs()
+            self.analysis_event_label = self.event_selector.selected_label()
 
             worker = Worker(
-                lambda: self._update_plot(self.epochs, self.figure), parent=self
+                lambda: self._update_plot(selected_epochs, self.figure), parent=self
             )
             worker.exec_with_dialog("Loading", "Calculating Natural Frequency...")
             self._on_calculation_finished()
@@ -306,11 +318,13 @@ class NaturalFrequencyApp(QDialog):
             logger.error(f"An error occurred during calculation: {e}", exc_info=True)
             self.run_button.setEnabled(True)
             self.run_button.setText("Run Analysis")
+        finally:
+            self.event_selector.setEnabled(self.event_selector.count() > 1)
 
     def _update_plot(self, epochs, figure):
         """Updates the plot with the results from the calculation."""
         data = calculate_nf_data(
-            self.epochs,
+            epochs,
             self.roi,
             self.freqs,
             self.n_cycles,
@@ -327,6 +341,7 @@ class NaturalFrequencyApp(QDialog):
         stat_mask = data["stat_mask"]
         agg_freq = data["agg_freq"]
 
+        figure.clear()
         gs = figure.add_gridspec(
             2, 2, width_ratios=(10, 3), height_ratios=(1, 3), hspace=0.05, wspace=0.05
         )
@@ -339,7 +354,7 @@ class NaturalFrequencyApp(QDialog):
             if not np.isnan(nat_freq)
             else "Natural Frequency: N/A"
         )
-        figure.suptitle(title, fontsize=14)
+        figure.suptitle(f"{title} - {self.analysis_event_label}", fontsize=14)
 
         # --- TEP Plot (Top) ---
         ax_erp.plot(times, data["evoked_all"].T * 1e6, color="black", alpha=0.3, lw=1.5)

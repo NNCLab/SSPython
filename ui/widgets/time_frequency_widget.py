@@ -37,6 +37,14 @@ from PySide6.QtWidgets import (
 )
 
 from ui.dialogs.sensor_selection_dialog import SensorSelectionDialog
+from core.baseline import event_baseline_default, validate_baseline
+from core.analysis_events import (
+    compute_event_tfrs,
+    event_options,
+    select_event_epochs,
+    tfr_event_metadata,
+)
+from ui.widgets.event_selection import EventSelector
 from ui.widgets.tools.optional_range_widget import OptionalRangeWidget
 from utils import Worker, theme_tokens, update_toolbar_color
 
@@ -181,6 +189,7 @@ class ComputeTFRSettingsDialog(QDialog):
     def _create_compute_group(self) -> QGroupBox:
         group = QGroupBox("mne.Epochs.compute_tfr")
         form = QFormLayout(group)
+        self.event_selector = EventSelector(self.epochs, self)
 
         self.method_combo = QComboBox()
         self.method_combo.addItems(["morlet", "multitaper", "stockwell"])
@@ -231,6 +240,7 @@ class ComputeTFRSettingsDialog(QDialog):
         self.verbose_combo = QComboBox()
         self.verbose_combo.addItems(list(self.VERBOSE_VALUES.keys()))
 
+        form.addRow("Event:", self.event_selector)
         form.addRow("method:", self.method_combo)
         form.addRow("freqs:", self.freqs_input)
         form.addRow("time window:", self.time_range_input)
@@ -394,8 +404,19 @@ class TimeFrequencyDisplayData:
     n_epochs: int
 
 
-def _coerce_tfr(tfr: Any):
+def _coerce_tfr(tfr: Any, event_code: int | None = None):
     if isinstance(tfr, (list, tuple)):
+        for derivative in tfr:
+            metadata = tfr_event_metadata(derivative)
+            if metadata is not None and metadata["event_id"] == event_code:
+                return derivative
+        if event_code is not None:
+            for derivative in tfr:
+                events = getattr(derivative, "events", None)
+                if events is not None and np.any(events[:, 2] == event_code):
+                    return derivative
+        if event_code is not None and any(tfr_event_metadata(item) is not None for item in tfr):
+            raise ValueError(f"No TFR is available for event_id={event_code}.")
         return tfr[0] if tfr else None
     return tfr
 
@@ -440,41 +461,42 @@ def _centers_to_extent(values: np.ndarray) -> tuple[float, float]:
 
 
 def _baseline_mask(times_s: np.ndarray, baseline_s: tuple[float | None, float | None]) -> np.ndarray:
-    start, stop = baseline_s
-    start = float(times_s[0]) if start is None else float(start)
-    stop = float(times_s[-1]) if stop is None else float(stop)
-    if start > stop:
-        start, stop = stop, start
-    return (times_s >= start) & (times_s <= stop)
+    interval = validate_baseline(times_s, baseline_s)
+    if interval is None:
+        raise ValueError("Select a reference interval to normalize power.")
+    start, stop = interval
+    return (times_s >= start - 1e-12) & (times_s <= stop + 1e-12)
 
 
 def apply_time_frequency_transform(
     power: np.ndarray,
     times_s: np.ndarray,
     *,
-    mode: str = POWER_DB_MODE,
+    mode: str = RAW_POWER_MODE,
     baseline_s: tuple[float | None, float | None] = (None, 0.0),
-    apply_baseline: bool = True,
+    apply_baseline: bool = False,
 ) -> tuple[np.ndarray, str]:
     """Convert raw MNE power values into display-ready spectrogram values."""
     power = np.asarray(power, dtype=float)
     times_s = np.asarray(times_s, dtype=float)
     eps = np.finfo(float).tiny
+    mask = _baseline_mask(times_s, baseline_s) if apply_baseline else None
 
     if mode == RAW_POWER_MODE:
         values = power * 1e12
         units = "Power (uV^2)"
         if apply_baseline:
-            mask = _baseline_mask(times_s, baseline_s)
-            if np.any(mask):
-                baseline = np.nanmean(values[:, mask], axis=1, keepdims=True)
-                values = values - baseline
-                units = "Power change (uV^2)"
+            baseline = np.nanmean(values[:, mask], axis=1, keepdims=True)
+            values = values - baseline
+            units = "Power change (uV^2)"
         return values, units
 
-    mask = _baseline_mask(times_s, baseline_s) if apply_baseline else np.ones(times_s.shape, dtype=bool)
-    if not np.any(mask):
-        mask = np.ones(times_s.shape, dtype=bool)
+    if mode not in (POWER_DB_MODE, ZSCORE_MODE):
+        raise ValueError(f"Unknown power scale: {mode}.")
+    if not apply_baseline:
+        if mode == ZSCORE_MODE:
+            raise ValueError("A z-score requires an explicit reference interval.")
+        return 10.0 * np.log10(np.clip(power * 1e12, eps, None)), "Power (dB re 1 uV^2)"
 
     baseline_values = power[:, mask]
     baseline_mean = np.nanmean(baseline_values, axis=1, keepdims=True)
@@ -486,7 +508,7 @@ def apply_time_frequency_transform(
         return (power - baseline_mean) / baseline_std, "Power (z-score)"
 
     ratio = np.clip(power, eps, None) / baseline_mean
-    return 10.0 * np.log10(ratio), "Power (dB)"
+    return 10.0 * np.log10(ratio), "Power change (dB)"
 
 
 def _data_channel_names(info: mne.Info, restrict_to: list[str] | None = None) -> list[str]:
@@ -525,17 +547,11 @@ def _pick_indices(ch_names: list[str], channel_names: str | list[str] | None) ->
 
 
 def _event_name_lookup(epochs: mne.BaseEpochs) -> dict[int, str]:
-    lookup: dict[int, str] = {}
-    for name, code in (epochs.event_id or {}).items():
-        lookup.setdefault(int(code), str(name))
-    return lookup
+    return {code: name for code, name, _ in event_options(epochs)}
 
 
 def _subset_epochs(epochs: mne.BaseEpochs, event_code: int | None) -> mne.BaseEpochs:
-    if event_code is None or epochs.events is None:
-        return epochs
-    indices = np.flatnonzero(epochs.events[:, 2] == int(event_code))
-    return epochs[indices]
+    return select_event_epochs(epochs, event_code)
 
 
 def _extract_tfr_power(
@@ -544,7 +560,7 @@ def _extract_tfr_power(
     channel_names: str | list[str] | None,
     event_code: int | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, str]:
-    tfr = _coerce_tfr(tfr)
+    tfr = _coerce_tfr(tfr, event_code)
     if tfr is None:
         raise ValueError("No time-frequency data is loaded.")
 
@@ -554,7 +570,9 @@ def _extract_tfr_power(
     n_epochs = int(getattr(tfr, "nave", 1) or 1)
 
     if data.ndim == 4:
-        if event_code is not None and getattr(tfr, "events", None) is not None:
+        if event_code is not None:
+            if getattr(tfr, "events", None) is None:
+                raise ValueError("This TFR has no trial events to filter.")
             event_mask = np.asarray(tfr.events)[:, 2] == int(event_code)
             data = data[event_mask]
         n_epochs = int(data.shape[0])
@@ -562,6 +580,10 @@ def _extract_tfr_power(
             raise ValueError("No epochs match the selected event.")
         matrix = np.nanmean(data[:, pick_indices, :, :], axis=(0, 1))
     elif data.ndim == 3:
+        if event_code is not None:
+            metadata = tfr_event_metadata(tfr)
+            if metadata is None or metadata["event_id"] != event_code:
+                raise ValueError("This pooled TFR cannot be filtered by event. Recompute it with an event selected.")
         matrix = np.nanmean(data[pick_indices, :, :], axis=0)
     else:
         raise ValueError(f"Unsupported TFR data shape: {data.shape}")
@@ -643,12 +665,16 @@ def build_time_frequency_display(
     channel_name: str | list[str] | None = None,
     channel_names: str | list[str] | None = None,
     event_code: int | None = None,
-    transform_mode: str = POWER_DB_MODE,
+    transform_mode: str = RAW_POWER_MODE,
     baseline_s: tuple[float | None, float | None] = (None, 0.0),
-    apply_baseline: bool = True,
+    apply_baseline: bool = False,
     is_itc: bool = False,
 ) -> TimeFrequencyDisplayData:
     selected_channels = channel_names if channel_names is not None else channel_name
+    tfr = _coerce_tfr(tfr, event_code)
+    metadata = tfr_event_metadata(tfr)
+    if event_code is None and metadata is not None:
+        event_code = metadata["event_id"]
     times_s, freqs_hz, power, n_epochs, channel_label = _extract_tfr_power(
         tfr,
         channel_names=selected_channels,
@@ -730,8 +756,9 @@ class TimeFrequencyWidget(QWidget):
         self._roi_drag_start: tuple[float, float] | None = None
         self._roi_drag_active = False
         self._updating_roi_controls = False
-        self._power_transform_mode = POWER_DB_MODE
-        self._power_apply_baseline = True
+        self._default_baseline = event_baseline_default(epochs)
+        self._power_apply_baseline = self._default_baseline is not None
+        self._power_transform_mode = POWER_DB_MODE if self._power_apply_baseline else RAW_POWER_MODE
         self.roi_time_ms: tuple[float, float] | None = None
         self.roi_freq_hz: tuple[float, float] | None = None
 
@@ -776,11 +803,11 @@ class TimeFrequencyWidget(QWidget):
         for label, derivative in (tfr_derivatives or {}).items():
             coerced = _coerce_tfr(derivative)
             if coerced is not None:
-                derivatives[str(label)] = coerced
+                derivatives[str(label)] = derivative
         if not derivatives:
             coerced = _coerce_tfr(tfr)
             if coerced is not None:
-                derivatives["TFR"] = coerced
+                derivatives["TFR"] = tfr
         return derivatives
 
     def _init_ui(self):
@@ -858,8 +885,8 @@ class TimeFrequencyWidget(QWidget):
         display_form.addRow("Event:", self.event_combo)
         display_form.addRow("Scale:", self.transform_combo)
 
-        self.baseline_checkbox = QCheckBox("Baseline correction")
-        self.baseline_checkbox.setChecked(True)
+        self.baseline_checkbox = QCheckBox("Normalize to reference interval")
+        self.baseline_checkbox.setChecked(self._power_apply_baseline)
         self.baseline_start_input = QDoubleSpinBox()
         self.baseline_stop_input = QDoubleSpinBox()
         for spinbox in (self.baseline_start_input, self.baseline_stop_input):
@@ -986,18 +1013,25 @@ class TimeFrequencyWidget(QWidget):
 
         self.event_combo.blockSignals(True)
         self.event_combo.clear()
-        self.event_combo.addItem("All events", None)
+        tfr = _coerce_tfr(self.tfr)
+        metadata = tfr_event_metadata(tfr)
+        if metadata is None or metadata["event_id"] is None:
+            self.event_combo.addItem("All events", None)
         selected_index = 0
         if event_codes:
             names_by_code = _event_name_lookup(self.epochs)
-            for index, event_code in enumerate(event_codes, start=1):
+            for event_code in event_codes:
                 count = event_counts.get(event_code, 0)
                 label = names_by_code.get(event_code, f"Event {event_code}")
-                self.event_combo.addItem(f"{label} ({count})", event_code)
+                self.event_combo.addItem(f"{label} [event_id={event_code}] ({count} epochs)", event_code)
                 if current_event_code == event_code:
-                    selected_index = index
+                    selected_index = self.event_combo.count() - 1
         self.event_combo.setCurrentIndex(selected_index)
-        self.event_combo.setVisible(self.event_combo.count() > 2)
+        self.event_combo.setEnabled(self.event_combo.count() > 1)
+        self.event_combo.setToolTip(
+            "Select the event to display." if event_codes else
+            "This saved average has no event information. Use Compute TFR to select an event."
+        )
         self.event_combo.blockSignals(False)
 
     def _configure_time_spinboxes(self):
@@ -1009,36 +1043,54 @@ class TimeFrequencyWidget(QWidget):
         for spinbox in (self.baseline_start_input, self.baseline_stop_input):
             spinbox.setRange(tmin, tmax)
 
-        baseline_stop = 0.0 if tmin <= 0.0 <= tmax else min(tmax, tmin + (tmax - tmin) * 0.25)
-        baseline_start = max(tmin, baseline_stop - max(20.0, min(200.0, (tmax - tmin) * 0.2)))
-        if baseline_start >= baseline_stop:
-            baseline_start = tmin
-            baseline_stop = min(tmax, tmin + max(1.0, (tmax - tmin) * 0.25))
-        self.baseline_start_input.setValue(baseline_start)
-        self.baseline_stop_input.setValue(baseline_stop)
+        interval = self._default_baseline
+        baseline_start, baseline_stop = (tmin, tmax) if interval is None else np.asarray(interval) * 1000
+        for spinbox, value in (
+            (self.baseline_start_input, baseline_start),
+            (self.baseline_stop_input, baseline_stop),
+        ):
+            spinbox.blockSignals(True)
+            spinbox.setValue(value)
+            spinbox.blockSignals(False)
+        self._update_baseline_controls()
 
     def _available_channel_names(self) -> list[str]:
-        tfr_channels = list(getattr(self.tfr, "ch_names", [])) if self.tfr is not None else None
+        tfr = _coerce_tfr(self.tfr)
+        tfr_channels = list(getattr(tfr, "ch_names", [])) if tfr is not None else None
         channel_names = _data_channel_names(self.epochs.info, restrict_to=tfr_channels)
         if not channel_names and tfr_channels:
             channel_names = tfr_channels
         return channel_names
 
     def _current_tfr_event_codes(self) -> list[int]:
+        derivatives = self.tfr if isinstance(self.tfr, (list, tuple)) else [self.tfr]
+        codes = {
+            metadata["event_id"]
+            for derivative in derivatives
+            if (metadata := tfr_event_metadata(derivative)) is not None
+            and metadata["event_id"] is not None
+        }
         tfr = _coerce_tfr(self.tfr)
         if tfr is None:
             return []
         data = np.asarray(getattr(tfr, "data", []))
         events = getattr(tfr, "events", None)
         if data.ndim != 4 or events is None or len(events) == 0:
-            return []
+            return sorted(codes)
         return sorted({int(code) for code in np.asarray(events)[:, 2]})
 
     def _current_tfr_event_counts(self) -> dict[int, int]:
+        derivatives = self.tfr if isinstance(self.tfr, (list, tuple)) else [self.tfr]
+        counts = {
+            metadata["event_id"]: int(derivative.nave)
+            for derivative in derivatives
+            if (metadata := tfr_event_metadata(derivative)) is not None
+            and metadata["event_id"] is not None and hasattr(derivative, "nave")
+        }
         tfr = _coerce_tfr(self.tfr)
         events = getattr(tfr, "events", None) if tfr is not None else None
         if events is None or len(events) == 0:
-            return {}
+            return counts
         event_codes = np.asarray(events)[:, 2].astype(int)
         return {int(code): int(np.sum(event_codes == code)) for code in np.unique(event_codes)}
 
@@ -1106,8 +1158,6 @@ class TimeFrequencyWidget(QWidget):
 
         self.transform_combo.setEnabled(not is_itc)
         self.baseline_checkbox.setEnabled(not is_itc)
-        self.baseline_start_input.setEnabled(not is_itc)
-        self.baseline_stop_input.setEnabled(not is_itc)
         itc_tooltip = "ITC is displayed in its native unitless scale without baseline correction."
         for control in (
             self.transform_combo,
@@ -1116,6 +1166,24 @@ class TimeFrequencyWidget(QWidget):
             self.baseline_stop_input,
         ):
             control.setToolTip(itc_tooltip if is_itc else "")
+        self._update_baseline_controls()
+
+    def _update_baseline_controls(self):
+        enabled = not self._current_derivative_is_itc() and self.baseline_checkbox.isChecked()
+        self.baseline_start_input.setEnabled(enabled)
+        self.baseline_stop_input.setEnabled(enabled)
+        index = self.transform_combo.findText(ZSCORE_MODE)
+        if index >= 0:
+            self.transform_combo.model().item(index).setEnabled(enabled)
+            if not enabled and self.transform_combo.currentText() == ZSCORE_MODE:
+                self.transform_combo.blockSignals(True)
+                self.transform_combo.setCurrentText(RAW_POWER_MODE)
+                self.transform_combo.blockSignals(False)
+        if not self._current_derivative_is_itc():
+            self.transform_combo.setToolTip(
+                "With a reference interval, dB shows power change and z-score uses "
+                "reference variability. Without normalization, dB is relative to 1 uV^2."
+            )
 
     def _on_derivative_changed(self):
         if not self._current_derivative_is_itc():
@@ -1133,6 +1201,7 @@ class TimeFrequencyWidget(QWidget):
         self._render()
 
     def _on_transform_changed(self):
+        self._update_baseline_controls()
         if not self._current_derivative_is_itc():
             self._remember_power_controls()
         self._clim = None
@@ -1757,9 +1826,12 @@ class TimeFrequencyWidget(QWidget):
     def _update_header_text(self):
         if self.display_data is None:
             return
+        reference = "none"
+        if not self._current_derivative_is_itc() and self.baseline_checkbox.isChecked():
+            reference = f"{self.baseline_start_input.value():g} to {self.baseline_stop_input.value():g} ms"
         self.context_label.setText(
             f"{self.current_derivative_key or 'TFR'} | {self.display_data.channel_label} | {self.display_data.event_label} | "
-            f"Epochs: {self.display_data.n_epochs} | Units: {self.display_data.units}"
+            f"Epochs: {self.display_data.n_epochs} | Units: {self.display_data.units} | Reference: {reference}"
         )
 
     def _event_to_data(self, event) -> tuple[float, float] | None:
@@ -2008,12 +2080,8 @@ class TimeFrequencyWidget(QWidget):
     @Slot()
     def compute_time_frequency(self):
         event_code = self._selected_event_code()
-        epochs = _subset_epochs(self.epochs, event_code)
-        if len(epochs) == 0:
-            QMessageBox.warning(self, "No Epochs", "No epochs match the selected event.")
-            return
-
-        dialog = ComputeTFRSettingsDialog(epochs, parent=self)
+        dialog = ComputeTFRSettingsDialog(self.epochs, parent=self)
+        dialog.event_selector.setCurrentIndex(dialog.event_selector.findData(event_code))
         selected_channels = self._selected_channels()
         if selected_channels:
             dialog.picks_input.setText(", ".join(selected_channels))
@@ -2021,10 +2089,10 @@ class TimeFrequencyWidget(QWidget):
             return
 
         compute_params = dialog.get_compute_params()
+        event_code = dialog.event_selector.currentData()
 
         def compute():
-            display_epochs = epochs.copy()
-            return display_epochs.compute_tfr(**compute_params)
+            return compute_event_tfrs(self.epochs, event_code=event_code, **compute_params)
 
         worker = Worker(compute, parent=self, add_loggers="mne")
         result = worker.exec_with_dialog("Please wait", "Computing time-frequency display...")

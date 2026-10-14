@@ -27,6 +27,7 @@ from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
 
 from ui.dialogs.sensor_selection_dialog import SensorSelectionDialog
+from ui.widgets.event_selection import EventSelector
 import logging
 from utils import use_plot_style
 
@@ -55,6 +56,7 @@ class ExcitabilityApp(QDialog):
 
         # --- Data ---
         self.epochs = epochs
+        self.source_epochs = epochs
 
         # --- State Parameters ---
         self.span = np.array([20, 200])
@@ -111,6 +113,7 @@ class ExcitabilityApp(QDialog):
 
         # --- Inputs Grid ---
         grid = QGridLayout()
+        self.event_selector = EventSelector(self.source_epochs, self)
         self.time_window_input = QLineEdit()
         self.channels_input = QLineEdit()
         self.xlim_input = QLineEdit()
@@ -122,6 +125,9 @@ class ExcitabilityApp(QDialog):
         grid.addWidget(self.channels_input, 1, 1)
         grid.addWidget(QLabel("Plot limits:"), 2, 0)
         grid.addWidget(self.xlim_input, 2, 1)
+        grid.addWidget(QLabel("Event:"), 3, 0)
+        grid.addWidget(self.event_selector, 3, 1)
+        self.event_selector.currentIndexChanged.connect(self._on_event_changed)
 
         self.time_window_input.returnPressed.connect(self._update_view)
         self.channels_input.returnPressed.connect(self._update_view)
@@ -366,9 +372,15 @@ class ExcitabilityApp(QDialog):
         self.outcome_ax.legend(loc="upper right")
         self.outcome_ax.axvline(0, color="k", linestyle="--", linewidth=1)
         self.ax.axvline(0, color="k", linestyle="--", linewidth=1)
-        self.figure.suptitle("Evoked Potential Analysis")
+        self.figure.suptitle(f"Evoked Potential Analysis - {self.event_selector.selected_label()}")
 
     # --- Event Handlers / Slots ---
+    def _on_event_changed(self):
+        self.epochs = self.event_selector.selected_epochs()
+        self.span_selector.disconnect_events()
+        self.span_selector2.disconnect_events()
+        self._setup_plots()
+
     def _on_span_select(self, xmin: float, xmax: float) -> None:
         """Callback for the Matplotlib SpanSelector."""
         self.time_window_input.setText(f"{xmin:.2f} {xmax:.2f}")

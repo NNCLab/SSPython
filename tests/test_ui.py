@@ -1182,17 +1182,17 @@ class TestUI(unittest.TestCase):
         app.processEvents()
         self.assertFalse(widget.event_selector.isHidden())
         self.assertEqual(widget.event_selector.count(), 3)
-        self.assertEqual(widget.event_selector.currentData()["code"], None)
+        self.assertIsNone(widget.event_selector.currentData())
 
         widget.event_selector.setCurrentIndex(2)
         app.processEvents()
 
         self.assertEqual(widget.selected_event_code, 2)
-        self.assertEqual(widget.selected_event_label, "Sham")
+        self.assertEqual(widget.selected_event_label, "Sham [event_id=2]")
         self.assertIn("Sham", widget.title_label.text())
         widget.close()
 
-    def test_evoked_plot_widget_hides_event_selector_for_single_event(self):
+    def test_evoked_plot_widget_exposes_event_id_for_single_event(self):
         app = QApplication.instance()
         if app is None:
             app = QApplication([])
@@ -1215,9 +1215,12 @@ class TestUI(unittest.TestCase):
         widget = EvokedPlotWidget()
         widget.update_plot(epochs, label="Test")
 
-        self.assertTrue(widget.event_selector.isHidden())
-        self.assertEqual(widget.event_selector.count(), 0)
+        self.assertFalse(widget.event_selector.isHidden())
+        self.assertEqual(widget.event_selector.count(), 2)
         self.assertIsNone(widget.selected_event_code)
+        widget.event_selector.setCurrentIndex(1)
+        self.assertEqual(widget.selected_event_code, 1)
+        self.assertIn("event_id=1", widget.title_label.text())
         widget.close()
 
     def test_psd_plot_settings_widget_builds_epoch_plot_params(self):
@@ -1277,7 +1280,7 @@ class TestUI(unittest.TestCase):
 
         expected = 10.0 * np.log10(power / np.array([[2.0], [2.0]]))
         np.testing.assert_allclose(transformed, expected)
-        self.assertEqual(units, "Power (dB)")
+        self.assertEqual(units, "Power change (dB)")
 
     def test_time_frequency_display_filters_channel_and_event(self):
         info = mne.create_info(["Cz", "Pz"], sfreq=1000, ch_types="eeg")
@@ -1523,7 +1526,7 @@ class TestUI(unittest.TestCase):
 
         dialog = ComputeSTCSettingsDialog(epochs)
         self.assertFalse(dialog.isModal())
-        dialog.condition_combo.setCurrentText("Pulse")
+        dialog.condition_combo.setCurrentIndex(dialog.condition_combo.findData(1))
         dialog.noise_window_input.setValue((-0.01, 0.0))
         dialog.noise_method_input.setText("empirical")
         dialog.rank_combo.setCurrentText("info")
@@ -1540,7 +1543,7 @@ class TestUI(unittest.TestCase):
 
         self.assertIsInstance(params["source_config"], STCSourceConfig)
         self.assertEqual(params["source_config"].mode, "fsaverage")
-        self.assertEqual(params["condition"], "Pulse")
+        self.assertEqual(params["condition"], 1)
         self.assertTrue(params["pick_eeg"])
         self.assertTrue(params["set_eeg_reference"])
         self.assertEqual(params["noise_tmin"], -0.01)
@@ -1854,6 +1857,7 @@ class TestUI(unittest.TestCase):
         ):
             dialog_class.return_value.exec.return_value = QDialog.DialogCode.Accepted
             dialog_class.return_value.get_time_window.return_value = (-0.05, 0.1)
+            dialog_class.return_value.get_event_code.return_value = None
             plot_topo.return_value.axes = []
 
             page.topoplot()

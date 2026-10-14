@@ -389,7 +389,20 @@ It is enabled when a dataset has reached the `preprocessed` stage or when a matc
 
 - Response Amplitude Analysis
 - Natural Frequency Analysis
-- Run Time-Frequency Analysis
+- Compute and plot Time-Frequency (TFR/ITC)
+- Compute and plot Source Estimates (STC)
+
+Each analysis and visualization offers event selection using the numeric `event_id`
+contained in the epochs, with event names and trial counts in the selector. Select
+**All events** to include every trial. Topoplot shows separate event traces when
+all events are selected. Response amplitude updates immediately when the event
+changes; natural frequency requires **Run Analysis** again.
+
+When computing averaged TFR/ITC for all events, the saved file also retains each
+event's average so **Plot TFR** can switch between them. Earlier pooled averages
+without event information must be recomputed to inspect a specific event. STC
+uses the selected event for both noise covariance and the evoked response, and
+its plot title identifies the event used for the saved estimate.
 
 ### Evoked Plot Interactions
 
@@ -401,6 +414,28 @@ The shared evoked plot widget supports:
 - average-reference toggling
 
 This widget is reused across preprocessing and analysis pages.
+
+### Optional Baseline Correction
+
+Final preprocessing and evoked plots have an explicit **Apply baseline correction**
+control. Turning it off preserves the current data. Event-based epoch extraction
+suggests a pre-event interval when one is available; fixed-length resting-state
+epochs and imports with unknown epoching mode default to no correction. Final
+preprocessing baseline preferences are saved separately for each epoching mode.
+ICA fitting adds no baseline correction; an enabled final baseline is applied
+after ICA and the remaining cleanup steps.
+
+Evoked plots preserve the preprocessing baseline choice, and topoplots use the
+evoked viewer's selected display baseline. Display changes operate on copies.
+An already applied baseline is identified in the viewer and cannot be undone by
+turning off additional correction; use the earlier epoch stage to regenerate it.
+
+Time-frequency voltage and power baselines are independent. Resting-state power
+starts in absolute units with **Normalize to reference interval** off. Unnormalized
+dB power uses a fixed reference of 1 uV²; normalized dB shows change relative to
+the selected interval. A z-score requires an enabled reference interval. ITC
+retains its native unitless scale. Invalid or insufficiently sampled intervals
+produce a validation error instead of silently selecting another reference.
 
 ## 12. Real-Time Visualization
 

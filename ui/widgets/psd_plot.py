@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.app_settings import get_settings_store
+from ui.widgets.event_selection import EventSelector
 from ui.widgets.tools.optional_range_widget import OptionalRangeWidget
 
 logger = logging.getLogger(__name__)
@@ -307,6 +308,10 @@ class PSDPlotSettingsDialog(QDialog):
         self.setMinimumWidth(560)
 
         layout = QVBoxLayout(self)
+        event_form = QFormLayout()
+        self.event_selector = EventSelector(epochs, self)
+        event_form.addRow("Event:", self.event_selector)
+        layout.addLayout(event_form)
         self.settings_widget = PSDPlotSettingsWidget(epochs, parent=self)
         layout.addWidget(self.settings_widget)
 
@@ -328,3 +333,6 @@ class PSDPlotSettingsDialog(QDialog):
 
     def get_plot_params(self) -> dict[str, Any]:
         return self.settings_widget.get_plot_params()
+
+    def get_selected_epochs(self) -> mne.BaseEpochs:
+        return self.event_selector.selected_epochs()

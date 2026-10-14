@@ -25,6 +25,14 @@ from core.mne_compat import (
     install_mne_brain_vertex_picker_compat,
 )
 from core.processing import TMSEEGAnalysis
+from core.baseline import validate_baseline
+from core.analysis_events import (
+    compute_event_tfrs,
+    event_label,
+    event_options,
+    select_event_epochs,
+)
+from ui.widgets.event_selection import EventSelector
 from ui.widgets.evoked_plot import EvokedPlotWidget
 from ui.widgets.psd_plot import PSDPlotSettingsDialog
 from ui.widgets.tep_analysis.excitability import ExcitabilityApp
@@ -60,6 +68,8 @@ class TopoplotTimeWindowDialog(QDialog):
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
+        self.event_selector = EventSelector(epochs, self)
+        form.addRow("Event:", self.event_selector)
         self.start_input = self._create_time_input(self.time_bounds[0], sample_step)
         self.end_input = self._create_time_input(self.time_bounds[1], sample_step)
         form.addRow("Start:", self.start_input)
@@ -103,6 +113,9 @@ class TopoplotTimeWindowDialog(QDialog):
 
     def get_time_window(self) -> tuple[float, float]:
         return float(self.start_input.value()), float(self.end_input.value())
+
+    def get_event_code(self) -> int | None:
+        return self.event_selector.currentData()
 
 
 class ErpAnalysisPage(BasePage):
@@ -358,15 +371,25 @@ class ErpAnalysisPage(BasePage):
             return
 
         tmin, tmax = dialog.get_time_window()
-        event_names = list(self.tep.epochs.event_id.keys()) if self.tep.epochs.event_id else []
-        if len(event_names) > 1:
-            evokeds = [
-                self.tep.epochs[event_name]
-                .average()
-                .apply_baseline()
-                .crop(tmin=tmin, tmax=tmax)
-                for event_name in event_names
-            ]
+        event_code = dialog.get_event_code()
+        try:
+            validate_baseline(
+                self.tep.epochs.times, self.evoked_plot_widget.baseline_control.value(),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Baseline", str(exc))
+            return
+        options = event_options(self.tep.epochs)
+        if event_code is None and len(options) > 1:
+            evokeds = []
+            for code, _, _ in options:
+                evoked = (
+                    self.evoked_plot_widget.apply_display_baseline(
+                        select_event_epochs(self.tep.epochs, code).average()
+                    ).crop(tmin=tmin, tmax=tmax)
+                )
+                evoked.comment = event_label(self.tep.epochs, code)
+                evokeds.append(evoked)
             colors = [f"C{index % 10}" for index in range(len(evokeds))]
             figure = mne.viz.plot_evoked_topo(
                 evokeds,
@@ -377,10 +400,11 @@ class ErpAnalysisPage(BasePage):
             )
         else:
             figure = (
-                self.tep.evoked.copy()
-                .apply_baseline()
+                self.evoked_plot_widget.apply_display_baseline(
+                    select_event_epochs(self.tep.epochs, event_code).average()
+                )
                 .crop(tmin=tmin, tmax=tmax)
-                .plot_topo(title=self.tep.label)
+                .plot_topo(title=f"{self.tep.label} - {event_label(self.tep.epochs, event_code)}")
             )
         for axes in figure.axes:
             for line in axes.lines:
@@ -406,7 +430,8 @@ class ErpAnalysisPage(BasePage):
             return
 
         try:
-            self.tep.epochs.plot_psd(**dialog.get_plot_params(), show=True)
+            figure = dialog.get_selected_epochs().plot_psd(**dialog.get_plot_params(), show=True)
+            figure.suptitle(f"{self.tep.label} - {dialog.event_selector.selected_label()}")
         except Exception as exc:
             logger.exception("PSD plotting failed")
             QMessageBox.critical(self, "PSD Plot Failed", str(exc))
@@ -417,9 +442,9 @@ class ErpAnalysisPage(BasePage):
         derivatives = self.tep.derivatives or {}
         available: dict[str, object] = {}
         if derivatives.get("tfr") is not None:
-            available["Power (TFR)"] = derivatives["tfr"]
+            available["Power (TFR)"] = derivatives.get("tfr_events", derivatives["tfr"])
         if derivatives.get("itc") is not None:
-            available["Inter-trial coherence (ITC)"] = derivatives["itc"]
+            available["Inter-trial coherence (ITC)"] = derivatives.get("itc_events", derivatives["itc"])
         return available
 
     def _has_time_frequency_derivatives(self) -> bool:
@@ -471,19 +496,30 @@ class ErpAnalysisPage(BasePage):
             return
 
         compute_params = dialog.get_compute_params()
+        event_code = dialog.event_selector.currentData()
+        analysis = self.tep
 
         def compute_and_save():
-            result = self.tep.epochs.copy().compute_tfr(**compute_params)
+            result = compute_event_tfrs(analysis.epochs, event_code=event_code, **compute_params)
             if isinstance(result, tuple):
                 tfr, itc = result
             else:
                 tfr, itc = result, None
 
-            self.tep.derivatives["tfr"] = tfr
-            tfr.save(self.tep.paths["tfr"], overwrite=True, verbose=False)
+            mne.time_frequency.write_tfrs(analysis.paths["tfr"], tfr, overwrite=True, verbose=False)
+            analysis.derivatives["tfr"] = tfr[0] if isinstance(tfr, list) else tfr
+            analysis.derivatives.pop("tfr_events", None)
+            if isinstance(tfr, list):
+                analysis.derivatives["tfr_events"] = tfr
+            analysis.derivatives.pop("itc_events", None)
             if itc is not None:
-                self.tep.derivatives["itc"] = itc
-                itc.save(self.tep.paths["itc"], overwrite=True, verbose=False)
+                mne.time_frequency.write_tfrs(analysis.paths["itc"], itc, overwrite=True, verbose=False)
+                analysis.derivatives["itc"] = itc[0] if isinstance(itc, list) else itc
+                if isinstance(itc, list):
+                    analysis.derivatives["itc_events"] = itc
+            else:
+                analysis.paths["itc"].unlink(missing_ok=True)
+                analysis.derivatives["itc"] = None
             return result
 
         worker = Worker(
@@ -494,35 +530,40 @@ class ErpAnalysisPage(BasePage):
         worker.exec_with_dialog("Please wait", "Running Time-Frequency Analysis...")
         if getattr(worker, "_error", None):
             return
-        if hasattr(self.tep, "_get_derivatives"):
-            self.tep.derivatives = self.tep._get_derivatives()
-        self._needs_reload = True
-        self.update_ui_state()
-        self.open_time_frequency_widget()
+        if hasattr(analysis, "_get_derivatives"):
+            analysis.derivatives = analysis._get_derivatives()
+        if self.tep is analysis:
+            self._needs_reload = True
+            self.update_ui_state()
+            self.open_time_frequency_widget()
 
     def run_source_estimate(self):
         if not self.tep or self.tep.epochs is None:
             return
-        dialog = ComputeSTCSettingsDialog(self.tep.epochs, parent=self)
-        dialog.accepted.connect(lambda: self._compute_source_estimate_from_dialog(dialog))
+        analysis = self.tep
+        dialog = ComputeSTCSettingsDialog(analysis.epochs, parent=self)
+        dialog.accepted.connect(lambda: self._compute_source_estimate_from_dialog(dialog, analysis))
         dialog.finished.connect(lambda: self._forget_source_estimate_dialog(dialog))
         self.source_estimate_dialogs.append(dialog)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
 
-    def _compute_source_estimate_from_dialog(self, dialog: ComputeSTCSettingsDialog):
-        if not self.tep or self.tep.epochs is None:
+    def _compute_source_estimate_from_dialog(
+        self, dialog: ComputeSTCSettingsDialog, analysis: TMSEEGAnalysis | None = None,
+    ):
+        analysis = analysis if analysis is not None else self.tep
+        if not analysis or analysis.epochs is None:
             return
         compute_params = dialog.get_compute_params()
 
         def compute_and_save():
-            stc, source_model = compute_stc(self.tep.epochs, **compute_params)
-            self.tep.paths["stc"].parent.mkdir(parents=True, exist_ok=True)
-            stc.save(self.tep.paths["stc"], ftype="h5", overwrite=True, verbose=False)
+            stc, source_model = compute_stc(analysis.epochs, **compute_params)
+            analysis.paths["stc"].parent.mkdir(parents=True, exist_ok=True)
+            stc.save(analysis.paths["stc"], ftype="h5", overwrite=True, verbose=False)
 
             metadata = self._stc_metadata(compute_params, source_model)
-            self.tep.paths["stc_metadata"].write_text(
+            analysis.paths["stc_metadata"].write_text(
                 json.dumps(metadata, indent=2),
                 encoding="utf-8",
             )
@@ -538,12 +579,13 @@ class ErpAnalysisPage(BasePage):
             return
 
         stc, metadata = result
-        self.tep.derivatives["stc"] = stc
-        self.tep.derivatives["stc_metadata"] = metadata
-        if hasattr(self.tep, "_get_derivatives"):
-            self.tep.derivatives = self.tep._get_derivatives()
-        self._needs_reload = True
-        self.update_ui_state()
+        analysis.derivatives["stc"] = stc
+        analysis.derivatives["stc_metadata"] = metadata
+        if hasattr(analysis, "_get_derivatives"):
+            analysis.derivatives = analysis._get_derivatives()
+        if self.tep is analysis:
+            self._needs_reload = True
+            self.update_ui_state()
 
     def _forget_source_estimate_dialog(self, dialog: ComputeSTCSettingsDialog):
         if dialog in self.source_estimate_dialogs:
@@ -601,11 +643,25 @@ class ErpAnalysisPage(BasePage):
                 smoothing_steps=5,
                 time_viewer=True,
                 surface="pial",
-                title=self.tep.label,
+                title=self._stc_plot_title(),
             )
         except Exception as exc:
             logger.exception("STC plotting failed")
             QMessageBox.critical(self, "STC Plot Failed", str(exc))
+
+    def _stc_plot_title(self) -> str:
+        metadata = self.tep.derivatives.get("stc_metadata") or {}
+        if "condition" not in metadata.get("compute", {}):
+            return self.tep.label
+        condition = metadata.get("compute", {}).get("condition")
+        epochs = getattr(self.tep, "epochs", None)
+        if epochs is None:
+            return self.tep.label
+        if isinstance(condition, str):
+            if condition not in epochs.event_id:
+                return f"{self.tep.label} - {condition}"
+            condition = epochs.event_id[condition]
+        return f"{self.tep.label} - {event_label(epochs, condition)}"
 
     def _source_config_for_stc_plot(self, stc) -> STCSourceConfig | None:
         derivatives = self.tep.derivatives if self.tep and self.tep.derivatives else {}

@@ -6,7 +6,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QToolBar,
     QRadioButton,
-    QComboBox,
     QSizePolicy,
     QDialog,
     QDialogButtonBox,
@@ -23,6 +22,9 @@ from utils import update_toolbar_color
 import logging
 
 from core.app_settings import get_settings_store
+from core.baseline import event_baseline_default, validate_baseline, voltage_baseline_default
+from ui.widgets.event_selection import EventSelector
+from ui.widgets.tools.baseline_control import BaselineControl
 
 logger = logging.getLogger(__name__)
 
@@ -146,10 +148,11 @@ class EvokedPlotWidget(QWidget):
 
         self.reference_widget = QRadioButton("Average Reference")
         self.event_label = QLabel("Event:")
-        self.event_selector = QComboBox()
+        self.event_selector = EventSelector(parent=self)
         self.event_selector.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToContents
+            EventSelector.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
+        self.event_selector.setMinimumContentsLength(8)
         self.channel_label = QLabel()
 
         self.topbar = QToolBar()
@@ -171,6 +174,11 @@ class EvokedPlotWidget(QWidget):
         self.topbar.addWidget(self.title_label)
 
         layout.addWidget(self.topbar)
+        self.baseline_control = BaselineControl(self)
+        self.baseline_status_label = QLabel("Baseline: none")
+        self.baseline_status_label.setWordWrap(True)
+        layout.addWidget(self.baseline_control)
+        layout.addWidget(self.baseline_status_label)
         layout.addWidget(self.canvas)
         layout.addWidget(self.toolbar)
         self._set_event_selector_visible(False)
@@ -193,7 +201,7 @@ class EvokedPlotWidget(QWidget):
         self.last_update_time = 0
 
         self.default_params = {
-            "baseline": (None, 0),
+            "baseline": None,
             "spatial_colors": True,
             "time_unit": "ms",
             "gfp": False,
@@ -211,6 +219,7 @@ class EvokedPlotWidget(QWidget):
         else:
             stored_params = dict(stored_params)
         stored_params.pop("evoked_xlim", None)
+        stored_params.pop("baseline", None)
         self.params = {
             **self.default_params,
             **stored_params,
@@ -237,9 +246,7 @@ class EvokedPlotWidget(QWidget):
         self.event_selector.setVisible(visible)
 
     def _clear_event_selector(self):
-        blocker = QSignalBlocker(self.event_selector)
-        self.event_selector.clear()
-        del blocker
+        self.event_selector.set_epochs(None)
         self.selected_event_code = None
         self.selected_event_label = None
         self._set_event_selector_visible(False)
@@ -249,59 +256,19 @@ class EvokedPlotWidget(QWidget):
             self._clear_event_selector()
             return
 
-        names_by_code = {}
-        for event_name, event_code in (epochs.event_id or {}).items():
-            names_by_code.setdefault(int(event_code), []).append(str(event_name))
-
-        event_codes = sorted({int(code) for code in epochs.events[:, 2]})
-        if len(event_codes) <= 1:
-            self._clear_event_selector()
-            return
-
-        event_options = [{"label": "All events", "code": None, "title": None}]
-        for event_code in event_codes:
-            names = names_by_code.get(event_code, [])
-            if len(names) == 1 and names[0].isdigit() and int(names[0]) == event_code:
-                event_label = f"Event {event_code}"
-            elif names:
-                event_label = " / ".join(names)
-            else:
-                event_label = f"Event {event_code}"
-            count = int(np.sum(epochs.events[:, 2] == event_code))
-            event_options.append(
-                {
-                    "label": f"{event_label} ({count})",
-                    "code": event_code,
-                    "title": event_label,
-                }
-            )
-
-        blocker = QSignalBlocker(self.event_selector)
-        self.event_selector.clear()
-        preferred_index = 0
-        for index, option in enumerate(event_options):
-            self.event_selector.addItem(option["label"], option)
-            if option["code"] == self.selected_event_code:
-                preferred_index = index
-        self.event_selector.setCurrentIndex(preferred_index)
-        del blocker
-
+        self.event_selector.set_epochs(epochs)
         self._sync_selected_event_from_selector()
         self._set_event_selector_visible(True)
-        self.event_selector.setEnabled(self.event_selector.count() > 0)
 
     def _sync_selected_event_from_selector(self):
-        selected_option = self.event_selector.currentData()
-        if not selected_option:
-            self.selected_event_code = None
-            self.selected_event_label = None
-            return
+        self.selected_event_code = self.event_selector.currentData()
+        self.selected_event_label = (
+            self.event_selector.selected_label()
+            if self.selected_event_code is not None else None
+        )
 
-        self.selected_event_code = selected_option.get("code")
-        self.selected_event_label = selected_option.get("title")
-
-    def _get_epochs_for_display(self, epochs: mne.BaseEpochs) -> mne.BaseEpochs:
-        display_epochs = epochs.copy()
+    def _get_epochs_for_display(self) -> mne.BaseEpochs:
+        display_epochs = self.event_selector.selected_epochs().copy()
         good_channels = [
             channel
             for channel in display_epochs.ch_names
@@ -311,11 +278,6 @@ class EvokedPlotWidget(QWidget):
             if not display_epochs.preload:
                 display_epochs.load_data()
             display_epochs.pick(good_channels)
-        if self.selected_event_code is not None:
-            selected_indices = np.flatnonzero(
-                display_epochs.events[:, 2] == self.selected_event_code
-            )
-            display_epochs = display_epochs[selected_indices]
         return display_epochs
 
     def _resolve_current_evoked(self) -> mne.Evoked | None:
@@ -324,7 +286,9 @@ class EvokedPlotWidget(QWidget):
         if isinstance(self.source_data, mne.Evoked):
             return self.source_data
         if isinstance(self.source_data, mne.BaseEpochs):
-            display_epochs = self._get_epochs_for_display(self.source_data)
+            if self.event_selector.epochs is None:
+                return None
+            display_epochs = self._get_epochs_for_display()
             if len(display_epochs) == 0:
                 return None
             return display_epochs.average()
@@ -362,25 +326,22 @@ class EvokedPlotWidget(QWidget):
                 display_evoked.apply_proj()
         del blocker
 
-        baseline = self.params.get("baseline", (None, 0)) or (None, 0)
-        tmin, tmax = display_evoked.times.min(), display_evoked.times.max()
-        baseline_tmin = baseline[0] if baseline[0] is not None else tmin
-        baseline_tmax = baseline[1] if baseline[1] is not None else tmax
+        return self.apply_display_baseline(display_evoked)
 
-        if (
-            baseline_tmin < tmin
-            or baseline_tmax > tmax
-            or baseline_tmin >= baseline_tmax
-        ):
-            logger.warning(
-                "Baseline %s is outside of data time range [%.3f, %.3f]. Skipping baseline correction.",
-                baseline,
-                tmin,
-                tmax,
-            )
-        else:
+    def apply_display_baseline(self, evoked: mne.Evoked) -> mne.Evoked:
+        """Apply the selected display correction to a copy, including topoplots."""
+        display_evoked = evoked.copy()
+        baseline = validate_baseline(evoked.times, self.baseline_control.value())
+        if baseline is not None:
             display_evoked.apply_baseline(baseline)
-
+        effective_baseline = display_evoked.baseline
+        status = "none"
+        if effective_baseline is not None:
+            start, stop = effective_baseline
+            status = f"{start * 1000:g} to {stop * 1000:g} ms"
+            if baseline is None:
+                status += " (already applied to data)"
+        self.baseline_status_label.setText(f"Voltage baseline: {status}")
         return display_evoked
 
     def _plot_display_evoked(self, evoked: mne.Evoked):
@@ -489,6 +450,7 @@ class EvokedPlotWidget(QWidget):
     def _render_current_view(self):
         self.reference_widget.setEnabled(True)
         self._load_plot_params()
+        self.params["baseline"] = self.baseline_control.value()
         self._reset_canvas()
         self.reapply_style()
 
@@ -499,7 +461,12 @@ class EvokedPlotWidget(QWidget):
 
         self.evoked = evoked
         self.ch_names = list(evoked.ch_names)
-        self.display_evoked = self._prepare_display_evoked(evoked)
+        try:
+            self.display_evoked = self._prepare_display_evoked(evoked)
+        except ValueError as exc:
+            self._show_empty_state()
+            self.baseline_status_label.setText(str(exc))
+            return
 
         self.toolbar.show()
         self.canvas.show()
@@ -522,6 +489,11 @@ class EvokedPlotWidget(QWidget):
         self.source_data = data
         self.label = label
         self.epochs = data if isinstance(data, mne.BaseEpochs) else None
+        baseline = self._explicit_params.get("baseline", voltage_baseline_default(data))
+        suggested = event_baseline_default(data) if data is not None else None
+        if suggested is None and data is not None:
+            suggested = (float(data.times[0]), float(data.times[-1]))
+        self.baseline_control.setValue(baseline, suggested=suggested)
         if self.epochs is not None:
             self._populate_event_selector(self.epochs)
         else:
@@ -536,6 +508,7 @@ class EvokedPlotWidget(QWidget):
         self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
         self.canvas.mpl_connect("scroll_event", lambda e: self.scrolled.emit(e.button))
         self.reference_widget.toggled.connect(self._render_current_view)
+        self.baseline_control.valueChanged.connect(self._render_current_view)
         self.event_selector.currentIndexChanged.connect(
             self._on_event_selection_changed
         )
