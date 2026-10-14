@@ -78,7 +78,9 @@ class TestInitialEpochsMetadata(unittest.TestCase):
             )
             epoching_log = json.loads(saved_epochs.info["description"])[-1]["epoching"]
 
-        ica.apply.assert_called_once_with(raw)
+        ica.apply.assert_called_once()
+        self.assertIsNot(ica.apply.call_args.args[0], raw)
+        np.testing.assert_array_equal(ica.apply.call_args.args[0].get_data(), raw.get_data())
         self.assertTrue(epoching_log["continuous_ica"])
         self.assertEqual(
             epoching_log["ica"],

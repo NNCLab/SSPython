@@ -390,6 +390,7 @@ def build_processing_paths(
     paths = {
         "raw": raw_path,
         "filtered_raw": base_dir / derivative_filename(source_stem, "filtered", "raw", ".fif"),
+        "filter_input_raw": base_dir / derivative_filename(source_stem, "filterinput", "raw", ".fif"),
         "continuous_ica": base_dir / derivative_filename(source_stem, "continuousica", "ica", ".fif"),
         "epochs": base_dir / derivative_filename(source_stem, "epoched", "epo", ".fif"),
         "epochs_ica": base_dir / derivative_filename(source_stem, "epochsica", "ica", ".fif"),

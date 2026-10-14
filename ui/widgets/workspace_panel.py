@@ -725,6 +725,10 @@ class DatasetInspectorPanel(QFrame):
             path = self.current_dataset.paths.get(stage.id)
             if path is not None and path.exists() and path.is_file():
                 paths.append(path)
+            if stage.id == "filtered_raw":
+                checkpoint = self.current_dataset.paths.get("filter_input_raw")
+                if checkpoint is not None and checkpoint.is_file():
+                    paths.append(checkpoint)
 
         try:
             analysis_ready_index = self.current_dataset.pipeline.stage_index(

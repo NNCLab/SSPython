@@ -20,6 +20,7 @@ from .base_page import BasePage
 from ..widgets.ica_widget import ICAPlottingSettingsWidget
 from ..widgets.preprocessing_widgets import (
     ArtifactRemovalSettingsWidget,
+    FilterContinuousWidget,
     EpochingSettingsWidget,
     PreprocessingSettingsWidget,
 )
@@ -96,6 +97,7 @@ class PreferencesPage(BasePage):
         self.global_settings_widget.pipeline_combo.currentIndexChanged.connect(self._sync_pipeline_preview)
 
         self.artifact_widget = ArtifactRemovalSettingsWidget()
+        self.continuous_filter_widget = FilterContinuousWidget()
         self.epoching_widget = EpochingSettingsWidget()
         self.apply_widget = PreprocessingSettingsWidget()
         self.ica_continuous_widget = ICASettingsWidget("continuous")
@@ -108,6 +110,7 @@ class PreferencesPage(BasePage):
         self.add_settings_category(
             "Preprocessing Defaults",
             self.artifact_widget,
+            self.continuous_filter_widget,
             self.epoching_widget,
             self.apply_widget,
         )

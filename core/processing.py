@@ -25,6 +25,9 @@ from core.pipelines import (
     source_stem_from_raw,
 )
 from core.version import __version__
+from core.filtering import (
+    FilterConfig, NotchConfig, apply_bandpass, apply_notch, validate_resample,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -207,6 +210,60 @@ class Preprocessor:
             return self.filtered_raw
         else:
             return self.raw
+
+    @staticmethod
+    def _processing_log(raw):
+        try:
+            entries = json.loads(raw.info.get("description") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return []
+        return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
+
+    def _reviewed_source_raw(self):
+        """Copy the original samples and retain the latest channel/annotation edits."""
+        raw = self.raw.load_data().copy()
+        if self.has("filtered_raw"):
+            reviewed = self.filtered_raw
+            self._copy_raw_review(raw, reviewed)
+        return raw
+
+    def _copy_raw_review(self, raw, reviewed):
+        raw.pick(reviewed.ch_names)
+        raw.info["bads"] = list(reviewed.info["bads"])
+        annotations = reviewed.annotations.copy()
+        if annotations.orig_time is None:
+            annotations.onset -= reviewed.first_time
+        raw.set_annotations(annotations)
+        review = next((entry for entry in reversed(self._processing_log(reviewed))
+                       if "raw_review" in entry), None)
+        if review:
+            self.add_description(raw, review)
+
+    def _continuous_filter_input(self):
+        """Return a stable, unfiltered copy, including earlier artifact interpolation."""
+        input_path = self.paths["filter_input_raw"]
+        if not self.has("filtered_raw"):
+            return self.raw.load_data().copy()
+        if input_path.exists():
+            with mne.io.read_raw_fif(input_path, preload=True, verbose=False) as saved:
+                return saved.copy()
+        previous = self.filtered_raw
+        history = self._processing_log(previous)
+        if not any("filter_continuous" in entry for entry in history):
+            return previous.load_data().copy()
+
+        # Older derivatives have no checkpoint. Reconstruct their interpolation
+        # from provenance using original samples, rather than filter them again.
+        raw = self._reviewed_source_raw()
+        for entry in history:
+            if "artifact_removal" in entry:
+                params = entry["artifact_removal"]
+                raw = self.interpolate_tms_pulse(raw, **{
+                    key: params[key] for key in ("window", "smoothing", "span", "event_id")
+                    if key in params
+                }, verbose=False)
+                self.add_description(raw, entry)
+        return raw
 
     def release_cached_stages(self, stage_ids, verbose: bool = True):
         """Release file-backed MNE objects cached for the given stages."""
@@ -486,10 +543,8 @@ class Preprocessor:
         event_id: list[int] | None = None,
         verbose=True,
     ):
-        """Applies the TMS pulse interpolation to the latest continuous raw data."""
-        self._clear_downstream_files("filtered_raw")
-
-        raw = self._get_last_continuous().load_data()
+        """Apply interpolation to original samples, retaining raw inspection edits."""
+        raw = self._reviewed_source_raw()
 
         interpolated_raw = self.interpolate_tms_pulse(
             raw,
@@ -512,6 +567,8 @@ class Preprocessor:
             },
         )
 
+        self._clear_downstream_files("filtered_raw")
+        interpolated_raw.save(self.paths["filter_input_raw"], overwrite=True, verbose=False)
         interpolated_raw.save(self.paths["filtered_raw"], overwrite=True)
         self._filtered_raw = interpolated_raw
 
@@ -520,29 +577,15 @@ class Preprocessor:
         notch: int | None = None,
         bandpass: tuple[float, float] | None = None,
         resample: int | None = None,
+        filter_config: FilterConfig | dict | None = None,
+        notch_config: NotchConfig | dict | None = None,
     ):
-        self._clear_downstream_files("filtered_raw")
-
-        raw = self._get_last_continuous().load_data()
-
-        if notch is not None:
-            notch_freqs = np.arange(
-                notch, self.raw.info["sfreq"] / 2, notch
-            )  # Harmonics up until sfreq / 2 (Nyquist)
-            logger.info(f"Applying notch filter {notch}")
-            raw.notch_filter(notch_freqs)
-
-        if bandpass is not None and bandpass != (None, None):
-            logger.info(
-                f"Applying filter {bandpass[0] if bandpass[0] is not None else '-∞'} - {bandpass[1] if bandpass[1] is not None else '∞'} Hz..."
-            )
-            raw.filter(
-                l_freq=bandpass[0],
-                h_freq=bandpass[1],
-                method="iir",
-                iir_params=dict(order=3, ftype="butter", phase="zero-double"),
-                verbose=False,
-            )
+        validate_resample(resample)
+        source = self._continuous_filter_input()
+        raw = source.copy()
+        notch_log = apply_notch(raw, notch, notch_config)
+        filter_log = apply_bandpass(raw, bandpass, filter_config)
+        input_sfreq = raw.info["sfreq"]
 
         if resample is not None:
             logger.info(f"Resampling to {resample} Hz...")
@@ -555,11 +598,18 @@ class Preprocessor:
                     "notch": notch,
                     "bandpass": bandpass,
                     "resample": resample,
+                    "filter_config": filter_log,
+                    "filter_input_sfreq": input_sfreq,
+                    "notch_config": notch_log,
                     "date": _utc_timestamp(),
                 }
             },
         )
 
+        # A failed design must leave existing derivatives and the input intact.
+        if not self.paths["filter_input_raw"].exists() or not self.has("filtered_raw"):
+            source.save(self.paths["filter_input_raw"], overwrite=True, verbose=False)
+        self._clear_downstream_files("filtered_raw")
         raw.save(self.paths["filtered_raw"], overwrite=True, verbose=False)
         self._filtered_raw = raw
 
@@ -627,6 +677,8 @@ class Preprocessor:
         reference: list[str] | str | None = None,
         verbose: bool = True,
         section_labels: list[str] | None = None,
+        filter_config: FilterConfig | dict | None = None,
+        notch_config: NotchConfig | dict | None = None,
     ):
         """
         Segments the data into epochs.
@@ -659,10 +711,9 @@ class Preprocessor:
                 len(boundary_samples), section_labels
             )
 
-        self._clear_downstream_files("epochs")
-
         # 1. Load Data
-        raw = raw.load_data()
+        validate_resample(resample)
+        raw = raw.load_data().copy()
 
         # 2. Common Pre-processing (Reference, Notch, Bandpass, ICA)
         #    These apply to the continuous data regardless of epoching mode.
@@ -675,24 +726,10 @@ class Preprocessor:
             else:
                 raw.set_eeg_reference(reference)
 
-        if notch is not None:
-            # Harmonics up until sfreq / 2 (Nyquist)
-            notch_freqs = np.arange(notch, raw.info["sfreq"] / 2, notch)
-            logger.info(f"Applying notch filter {notch} Hz...")
-            raw.notch_filter(notch_freqs)
+        notch_log = apply_notch(raw, notch, notch_config)
+        filter_log = apply_bandpass(raw, bandpass, filter_config)
 
-        if bandpass is not None and bandpass != (None, None):
-            l_freq = bandpass[0] if bandpass[0] is not None else 0
-            h_freq = bandpass[1] if bandpass[1] is not None else raw.info["sfreq"] / 2
-            logger.info(f"Applying filter {l_freq} - {h_freq} Hz...")
-
-            raw.filter(
-                l_freq=bandpass[0],
-                h_freq=bandpass[1],
-                method="iir",
-                iir_params=dict(order=3, ftype="butter", phase="zero-double"),
-                verbose=False,
-            )
+        input_sfreq = raw.info["sfreq"]
 
         continuous_ica = self.continuous_ica if self.has("continuous_ica") else None
         continuous_ica_log = self._ica_log(continuous_ica, "continuous_ica")
@@ -802,13 +839,17 @@ class Preprocessor:
                     "pick_eeg_only": pick_eeg_only,
                     "bandpass": bandpass,
                     "notch": notch,
+                    "filter_config": filter_log,
+                    "notch_config": notch_log,
                     "reference": reference,
+                    "filter_input_sfreq": input_sfreq,
                     "date": _utc_timestamp(),
                 }
             },
         )
 
         logger.info("Saving epochs...")
+        self._clear_downstream_files("epochs")
         epochs.save(self.paths["epochs"], overwrite=True, verbose=verbose)
         self._epochs = epochs
 
@@ -929,6 +970,19 @@ class Preprocessor:
                 }
             },
         )
+        input_path = self.paths["filter_input_raw"]
+        if input_path.exists():
+            with mne.io.read_raw_fif(input_path, preload=True, verbose=False) as saved:
+                filter_input = saved.copy()
+            # A source-file review can restore channels dropped in a derivative.
+            # Reconstruct interpolation from the source in that case.
+            if set(reviewed_raw.ch_names).issubset(filter_input.ch_names):
+                self._copy_raw_review(filter_input, reviewed_raw)
+                filter_input.save(input_path, overwrite=True, verbose=False)
+            else:
+                input_path.unlink()
+        elif not any("filter_continuous" in entry for entry in self._processing_log(reviewed_raw)):
+            reviewed_raw.save(input_path, overwrite=True, verbose=False)
         reviewed_raw.save(target_path, overwrite=True, verbose=False)
         self._filtered_raw = reviewed_raw
 
@@ -1038,9 +1092,11 @@ class Preprocessor:
         reference: list[str] | str | None = None,
         baseline=(None, 0),
         verbose=True,
+        filter_config: FilterConfig | dict | None = None,
     ):
 
         logger.info("Loading epoched data...")
+        validate_resample(resample)
         epochs = self.epochs.load_data().copy()
 
         ica = self.epochs_ica if self.has("epochs_ica") else None
@@ -1057,17 +1113,8 @@ class Preprocessor:
         if bads is not None and len(bads) > 0:
             epochs.info["bads"] = list(set(epochs.info["bads"]).union(set(bads)))
 
-        if bandpass[0] is not None or bandpass[1] is not None:
-            logger.info(
-                f"Applying filter {bandpass[0] if bandpass[0] is not None else '-∞'}-{bandpass[1] if bandpass[1] is not None else '∞'} Hz..."
-            )
-            epochs.filter(
-                l_freq=bandpass[0],
-                h_freq=bandpass[1],
-                method="iir",
-                iir_params=dict(order=3, ftype="butter", phase="zero-double"),
-                verbose=False,
-            )
+        filter_log = apply_bandpass(epochs, bandpass, filter_config)
+        input_sfreq = epochs.info.get("sfreq")
 
         if interpolate_bad_channels:
             logger.info("Interpolating bad channels...")
@@ -1117,7 +1164,9 @@ class Preprocessor:
                 "filter_epochs": {
                     "bads": bads,
                     "bandpass": bandpass,
+                    "filter_config": filter_log,
                     "resample": resample,
+                    "filter_input_sfreq": input_sfreq,
                     "interpolate_bad_channels": interpolate_bad_channels,
                     "reference": reference,
                     "baseline": baseline,

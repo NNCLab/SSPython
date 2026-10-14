@@ -24,6 +24,7 @@ from pathlib import Path
 import logging
 
 from core.app_settings import get_settings_store
+from .tools.advanced_settings import AdvancedSettings
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +81,10 @@ class ICASettingsWidget(QWidget):
         self.random_state_input = QLineEdit()
         self.random_state_input.setPlaceholderText("Integer or 'None'")
         self.max_iter_input = QSpinBox()
-        self.max_iter_input.setRange(100, 10000)
+        self.max_iter_input.setRange(1, 2_147_483_647)
         self.max_iter_input.setSingleStep(50)
+        self.max_iter_input.setKeyboardTracking(False)
+        self.max_iter_input.setToolTip("Maximum ICA iterations. Enter any positive whole number.")
 
         if self.max_components is not None:
             self.n_components_input.setRange(1, self.max_components)
@@ -95,10 +98,12 @@ class ICASettingsWidget(QWidget):
         form_layout.addRow(self.auto_n_components_checkbox)
         if self.max_components is not None:
             form_layout.addRow(QLabel("Number of Components:"), self.n_components_input)
-        form_layout.addRow(QLabel("Random State:"), self.random_state_input)
-        form_layout.addRow(QLabel("Max Iterations:"), self.max_iter_input)
-        form_layout.addRow(QLabel("Method:"), self.ica_method_input)
         group.setLayout(form_layout)
+        self.advanced_settings = AdvancedSettings()
+        self.advanced_settings.form.addRow("Random State:", self.random_state_input)
+        self.advanced_settings.form.addRow("Max Iterations:", self.max_iter_input)
+        self.advanced_settings.form.addRow("Method:", self.ica_method_input)
+        layout.addWidget(self.advanced_settings)
         layout.addStretch()
 
     def load_settings(self):
@@ -138,6 +143,8 @@ class ICASettingsWidget(QWidget):
 
     def get_params(self) -> dict:
         """Parses UI controls to get ICA parameters."""
+
+        self.max_iter_input.interpretText()
 
         if self.auto_n_components_checkbox.isChecked():
             n_components = None

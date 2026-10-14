@@ -9,6 +9,17 @@ QWidget:disabled {
     color: #728087;
 }
 
+QToolButton#advancedSettingsToggle {
+    background: transparent;
+    border: none;
+    padding: 4px 0;
+    color: #96c5cf;
+}
+
+QToolButton#advancedSettingsToggle:hover {
+    color: #e7ecef;
+}
+
 QLabel, QCheckBox, QRadioButton {
     background: transparent;
 }

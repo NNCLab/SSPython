@@ -40,6 +40,7 @@ import logging
 from dataclasses import dataclass, asdict
 
 from core.app_settings import get_settings_store
+from .tools.advanced_settings import AdvancedSettings
 
 logger = logging.getLogger(__file__)
 
@@ -78,14 +79,12 @@ class ICAPlottingSettingsWidget(QWidget):
         self.decimate_input.setToolTip(
             "Downsample the inst data to reduce memory and improve plotting speed."
         )
-        plot_layout.addRow("Decimate Factor:", self.decimate_input)
 
         self.cmap_input = QComboBox()
         self.cmap_input.addItems(
             ["turbo", "viridis", "plasma", "inferno", "magma", "cividis", "RdBu_r"]
         )
         self.cmap_input.setToolTip("Colormap for topography plots.")
-        plot_layout.addRow("Colormap (cmap):", self.cmap_input)
 
         self.psd_input = OptionalRangeWidget(
             suffix="Hz", required=(True, False), parent=self
@@ -106,7 +105,11 @@ class ICAPlottingSettingsWidget(QWidget):
         self.plot_type_input.setToolTip(
             "Type of plot to display on the (overlay, side-by-side)."
         )
-        plot_layout.addRow("Plot Type:", self.plot_type_input)
+        self.advanced_settings = AdvancedSettings()
+        self.advanced_settings.form.addRow("Decimate Factor:", self.decimate_input)
+        self.advanced_settings.form.addRow("Colormap:", self.cmap_input)
+        self.advanced_settings.form.addRow("Plot Type:", self.plot_type_input)
+        layout.addWidget(self.advanced_settings)
 
     def get_settings(self):
         """Returns the settings as a dictionary."""
@@ -621,8 +624,6 @@ class ICAViewer(QDialog):
         super().__init__(parent)
         self.ica = ica
         self.params = params
-        self.source_inst = inst.copy()
-        self._source_figures = []
         self.setModal(True)
         self.setWindowTitle("ICA Viewer")
         self.baseline = (None, 0)
@@ -702,9 +703,6 @@ class ICAViewer(QDialog):
 
         # Buttons
         button_box = QDialogButtonBox()
-        self.inspect_sources_button = button_box.addButton(
-            "Inspect Sources", QDialogButtonBox.ActionRole
-        )
         self.home_button = button_box.addButton("🏠 Home", QDialogButtonBox.ResetRole)
         self.accept_button = button_box.addButton(
             "✔ Accept", QDialogButtonBox.AcceptRole
@@ -712,7 +710,6 @@ class ICAViewer(QDialog):
         self.cancel_button = button_box.addButton(
             "✖ Cancel", QDialogButtonBox.RejectRole
         )
-        left_layout.addWidget(self.inspect_sources_button)
         left_layout.addWidget(self.home_button)
         left_layout.addStretch(1)
         left_layout.addWidget(self.accept_button)
@@ -755,7 +752,6 @@ class ICAViewer(QDialog):
         self.home_page.component_status_toggled.connect(
             self.toggle_component_status_from_click
         )
-        self.inspect_sources_button.clicked.connect(self.inspect_sources)
         self.home_button.clicked.connect(self.show_home_view)
         self.accept_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
@@ -900,18 +896,6 @@ class ICAViewer(QDialog):
                 item.setSelected(True)
                 target_list.scrollToItem(item)
                 break
-
-    def inspect_sources(self):
-        figure = open_ica_sources_view(self.ica, self.source_inst, self)
-        if figure is None:
-            return
-        self._source_figures.append(figure)
-        if hasattr(figure, "gotClosed"):
-            figure.gotClosed.connect(
-                lambda fig=figure: self._source_figures.remove(fig)
-                if fig in self._source_figures
-                else None
-            )
 
     def closeEvent(self, event):
         self.accept()

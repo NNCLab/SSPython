@@ -310,6 +310,37 @@ Final output:
 
 - Apply ICA and Final Filters
 
+### Advanced Settings
+
+Continuous filtering, epoch segmentation, and final filtering each offer a collapsed
+**Advanced filter settings** section. Basic cutoff, notch-frequency (where available),
+and resampling controls remain visible. Advanced options include FIR/IIR method,
+phase, IIR family and order, FIR length/window/design and transition widths, and
+notch width and transition width. Only options relevant to the selected method
+are shown. Disable both cutoff checkboxes to bypass the high-pass/low-pass filter.
+
+Existing settings keep their previous behavior: a third-order Butterworth IIR
+bandpass with zero-phase filtering and FIR notch filtering. Each pipeline and
+processing step keeps separate defaults. **Apply** uses the current filter settings
+for this run; **Save as defaults** explicitly saves them for future runs.
+**Restore defaults** restores the built-in values in the dialog without replacing
+saved defaults. The same editors are available under Preferences.
+
+Other infrequently changed settings are available under **Advanced settings**:
+
+- Artifact removal: smoothing and span.
+- ICA fitting: random state, maximum iterations, and method.
+- ICA inspection: decimation factor, colormap, and plot type.
+
+Collapsing a section retains its values. Saved derivatives record filter designs
+and notch frequencies in their processing history. Invalid filter settings leave
+existing outputs intact. Continuous filtering uses a `*_desc-filterinput_raw.fif`
+checkpoint to retain interpolation and review edits while allowing filters and
+resampling to be rerun from the same input. Keep this checkpoint with the dataset's
+derivatives; it occupies additional space comparable to an unfiltered recording.
+For older derivatives without a checkpoint, the application reconstructs recorded
+artifact interpolation from the original recording and processing history.
+
 ### Pipeline Stages
 
 The current pipeline model tracks the following stages:

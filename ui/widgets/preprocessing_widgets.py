@@ -28,6 +28,9 @@ import mne
 from core.processing import Preprocessor
 from utils import parse_numeric, to_display_string, Worker
 from .tools.optional_range_widget import OptionalRangeWidget
+from .tools.advanced_settings import AdvancedSettings
+from .tools.filter_settings import FilterSettingsWidget
+from core.filtering import validate_bandpass, validate_resample
 from pathlib import Path
 
 from core.app_settings import get_settings_store
@@ -153,20 +156,23 @@ class BaseProcessingDialog(QDialog):
         self.apply_button = QPushButton("Apply")
         self.apply_button.setDefault(True)
         self.cancel_button = QPushButton("Cancel")
-        self.reset_button = QPushButton("Reset")
+        self.reset_button = QPushButton("Restore defaults")
+        self.save_defaults_button = QPushButton("Save as defaults")
 
         hbox.addStretch()
         hbox.addWidget(self.reset_button)
+        hbox.addWidget(self.save_defaults_button)
         hbox.addWidget(self.cancel_button)
         hbox.addWidget(self.apply_button)
         layout.addLayout(hbox)
 
         self.apply_button.clicked.connect(self.run_process)
         self.cancel_button.clicked.connect(self.reject)
-        if hasattr(self.settings_widget, "load_settings"):
-            self.reset_button.clicked.connect(self.settings_widget.load_settings)
+        if hasattr(self.settings_widget, "restore_defaults"):
+            self.reset_button.clicked.connect(self.settings_widget.restore_defaults)
         else:
             self.reset_button.hide()
+        self.save_defaults_button.clicked.connect(self._save_defaults)
 
         self._apply_compact_size()
 
@@ -191,6 +197,12 @@ class BaseProcessingDialog(QDialog):
     def run_process(self):
         """To be implemented by subclasses to perform the actual processing logic."""
         raise NotImplementedError("Subclasses must implement run_process()")
+
+    def _save_defaults(self):
+        try:
+            self.settings_widget.save_settings()
+        except ValueError as error:
+            QMessageBox.critical(self, "Invalid Input", str(error))
 
 
 class BaseSettingsWidget(QWidget):
@@ -241,6 +253,9 @@ class BaseSettingsWidget(QWidget):
         """Returns a dictionary of default parameters."""
         return {}
 
+    def restore_defaults(self):
+        self.set_params(self.get_defaults())
+
 
 # Artifact Removal
 class ArtifactRemovalSettingsWidget(BaseSettingsWidget):
@@ -284,8 +299,6 @@ class ArtifactRemovalSettingsWidget(BaseSettingsWidget):
         self.span_spinbox.setRange(1, 100)
 
         artifact_layout.addRow("Window:", self.window_edit)
-        artifact_layout.addRow("Smoothing:", self.smoothing_edit)
-        artifact_layout.addRow("Span (samples):", self.span_spinbox)
 
         if self.show_events_list:
             self.events_list = QListWidget()
@@ -295,6 +308,10 @@ class ArtifactRemovalSettingsWidget(BaseSettingsWidget):
             self.events_list = None
 
         main_layout.addWidget(artifact_group)
+        self.advanced_settings = AdvancedSettings()
+        self.advanced_settings.form.addRow("Smoothing:", self.smoothing_edit)
+        self.advanced_settings.form.addRow("Span (samples):", self.span_spinbox)
+        main_layout.addWidget(self.advanced_settings)
 
     def populate_events_list(self, raw_data):
         """Discover events from the raw data and populate the checklist."""
@@ -390,6 +407,8 @@ class ArtifactRemovalDialog(BaseProcessingDialog):
             add_loggers="tqdm",
         )
         worker.exec_with_dialog("Please wait", "Running Artifact Removal")
+        if worker._error is not None:
+            return
         self.accept()
 
 
@@ -418,6 +437,8 @@ class FilterContinuousWidget(BaseSettingsWidget):
         filter_layout.addRow("Resample (Hz)", self.resample_edit)
 
         main_layout.addWidget(filter_group)
+        self.advanced_settings = FilterSettingsWidget(notch=True)
+        main_layout.addWidget(self.advanced_settings)
 
     def get_defaults(self) -> dict:
         return {"notch": None, "bandpass": (0.5, None), "resample": None}
@@ -426,6 +447,7 @@ class FilterContinuousWidget(BaseSettingsWidget):
         self.notch_edit.setText(to_display_string(params.get("notch")))
         self.filter_edit.setValue(params.get("bandpass"))
         self.resample_edit.setText(to_display_string(params.get("resample")))
+        self.advanced_settings.set_params(params)
 
     def get_params(self) -> dict:
         """Returns a dictionary of the current settings from the UI."""
@@ -433,7 +455,10 @@ class FilterContinuousWidget(BaseSettingsWidget):
             "notch": parse_numeric(self.notch_edit.text()),
             "bandpass": self.filter_edit.value(),
             "resample": parse_numeric(self.resample_edit.text()),
+            **self.advanced_settings.get_params(),
         }
+        validate_bandpass(params["bandpass"])
+        validate_resample(params["resample"])
         logger.info(f"params:{params}")
         return params
 
@@ -446,17 +471,16 @@ class FilterContinuousDialog(BaseProcessingDialog):
     def run_process(self):
         try:
             params = self.settings_widget.get_params()
-            self.settings_widget.save_settings()
-            logger.info(f"Running epoching with parameters: {params}")
+            logger.info(f"Running continuous filtering with parameters: {params}")
         except ValueError as e:
             QMessageBox.critical(self, "Invalid Input", str(e))
             return
 
-        if self.preprocessor.has("epochs"):
+        if self.preprocessor.has("continuous_ica") or self.preprocessor.has("epochs"):
             reply = QMessageBox.question(
                 self,
                 "Warning",
-                "Epochs data already exists. Overwrite?",
+                "Dependent ICA or epochs data already exists. Overwrite?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -465,7 +489,9 @@ class FilterContinuousDialog(BaseProcessingDialog):
         worker = Worker(
             lambda: self.preprocessor.filter_continuous(**params), parent=self.parent()
         )
-        worker.exec_with_dialog("Please wait", "Running Epoching")
+        worker.exec_with_dialog("Please wait", "Filtering and resampling...")
+        if worker._error is not None:
+            return
         self.accept()
 
 
@@ -572,6 +598,8 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         self.section_labels_form = QFormLayout()
         sections_layout.addLayout(self.section_labels_form)
         main_layout.addWidget(self.sections_group)
+        self.advanced_settings = FilterSettingsWidget(notch=True)
+        main_layout.addWidget(self.advanced_settings)
         main_layout.addStretch()
 
     def update_ui_visibility(self, mode_text):
@@ -744,6 +772,7 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         self.pick_eeg_only_checkbox.setChecked(params.get("pick_eeg_only"))
         self.notch_input.setText(to_display_string(params.get("notch")))
         self.bandpass_input.setValue(params.get("bandpass"))
+        self.advanced_settings.set_params(params)
         self.average_reference_checkbox.setChecked(
             params.get("reference") == "average"
         )
@@ -767,6 +796,11 @@ class EpochingSettingsWidget(BaseSettingsWidget):
         mode_value = self.mode_map[mode]
         is_fixed = mode_value == "fixed"
 
+        bandpass = self.bandpass_input.value()
+        resample = parse_numeric(self.resample_edit.text())
+        validate_bandpass(bandpass)
+        validate_resample(resample)
+
         return {
             "mode": mode_value,
             # Event based params
@@ -788,11 +822,12 @@ class EpochingSettingsWidget(BaseSettingsWidget):
                 else None
             ),
             # Common params
-            "resample": parse_numeric(self.resample_edit.text()),
+            "resample": resample,
             "detrend": self.detrend_map[self.detrend_combobox.currentText()],
             "pick_eeg_only": self.pick_eeg_only_checkbox.isChecked(),
             "notch": parse_numeric(self.notch_input.text()),
-            "bandpass": self.bandpass_input.value(),
+            "bandpass": bandpass,
+            **self.advanced_settings.get_params(),
             "reference": (
                 "average" if self.average_reference_checkbox.isChecked() else None
             ),
@@ -844,7 +879,6 @@ class EpochingDialog(BaseProcessingDialog):
                         "Time limits start must be before stop for event-based epoching."
                     )
 
-            self.settings_widget.save_settings()  # Save for next time
             logger.info(f"Running epoching: {params}")
         except ValueError as e:
             QMessageBox.critical(self, "Invalid Input", str(e))
@@ -865,6 +899,8 @@ class EpochingDialog(BaseProcessingDialog):
             lambda: self.preprocessor.run_epoching(**params), parent=self.parent()
         )
         worker.exec_with_dialog("Please wait", "Running Epoching")
+        if worker._error is not None:
+            return
         self.accept()
 
 
@@ -1074,6 +1110,8 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
         form_layout.addRow("Baseline Correction:", self.baseline_input)
 
         layout.addWidget(groupbox)
+        self.advanced_settings = FilterSettingsWidget()
+        layout.addWidget(self.advanced_settings)
 
     def quick_plot_evoked(self):
         dialog = EvokedPlotDialog(parent=self)
@@ -1124,6 +1162,12 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
 
     def set_params(self, params: dict):
         self.bandpass_input.setValue(params.get("bandpass"))
+        self.advanced_settings.set_params(params)
+        self._selected_bad_channels = list(params.get("bads") or [])
+        self._selected_ref_channels = []
+        self.select_bad_channels_button.setText(_selected_channels_button_text(
+            self._selected_bad_channels, "Extra Bad Channels..."
+        ))
         self.baseline_input.setValue(params.get("baseline"))
         self.interpolate_bad_channels_check.setChecked(
             params.get("interpolate_bad_channels")
@@ -1163,6 +1207,9 @@ class PreprocessingSettingsWidget(BaseSettingsWidget):
             params["reference"] = self._selected_ref_channels
         params["baseline"] = self.baseline_input.value()
         params["resample"] = parse_numeric(self.resample_input.text(), int)
+        params.update(self.advanced_settings.get_params())
+        validate_bandpass(params["bandpass"])
+        validate_resample(params["resample"])
         return params
 
 
@@ -1194,8 +1241,11 @@ class ApplyPreprocessingDialog(BaseProcessingDialog):
 
     def run_process(self):
         """Validates input and starts the background worker."""
-        params = self.settings_widget.get_params()
-        self.settings_widget.save_settings()
+        try:
+            params = self.settings_widget.get_params()
+        except ValueError as error:
+            QMessageBox.critical(self, "Invalid Input", str(error))
+            return
 
         if self.preprocessor.has("preprocessed"):
             reply = QMessageBox.question(
@@ -1219,6 +1269,8 @@ class ApplyPreprocessingDialog(BaseProcessingDialog):
             lambda: self.preprocessor.filter_epochs(**params), parent=self.parent()
         )
         worker.exec_with_dialog("Loading", "Applying final preprocessing steps...")
+        if worker._error is not None:
+            return
         self.finished.emit()
         self.accept()
 
