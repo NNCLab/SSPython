@@ -104,6 +104,12 @@ def load_conversion_info(source_path: Path) -> mne.Info:
     source_path = Path(source_path)
     raw = None
     try:
+        info = mne.io.read_info(source_path, verbose="error")
+        return validate_conversion_info(info)
+    except Exception:
+        pass
+
+    try:
         raw = mne.io.read_raw(source_path, preload=False, verbose="error")
         return validate_conversion_info(raw.info.copy())
     except Exception as exc:

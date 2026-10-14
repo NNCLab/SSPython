@@ -25,7 +25,6 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QLabel,
     QSpinBox,
-    QProgressDialog,
     QGroupBox,
     QFileDialog,
     QCheckBox,
@@ -46,7 +45,7 @@ from scipy import signal
 from scipy.spatial import distance
 
 from core.app_settings import get_settings_store
-from utils import apply_theme, current_theme_name, theme_tokens
+from utils import LoadingDialog, apply_theme, current_theme_name, theme_tokens
 
 
 DEFAULT_LIVE_EVENT_ID_MAX = 65535
@@ -3021,8 +3020,9 @@ class RealTimeERP(QMainWindow):
         self.conn_thread.destroyed.connect(lambda *_: self._clear_qt_attr("conn_thread"))
         self.conn_worker.destroyed.connect(lambda *_: self._clear_qt_attr("conn_worker"))
 
-        self.progress_dialog = QProgressDialog("Connecting to LSL stream...", "Cancel", 0, 0, self)
-        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog = LoadingDialog(
+            "Connecting to LSL stream...", "Connecting", self, cancellable=True
+        )
         self.progress_dialog.destroyed.connect(lambda *_: self._clear_qt_attr("progress_dialog"))
 
         self.conn_thread.started.connect(self.conn_worker.run)

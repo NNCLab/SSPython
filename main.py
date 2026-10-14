@@ -49,6 +49,7 @@ from ui.pages.preferences_page import PreferencesPage
 from ui.pages.preprocessing_page import ProcessingPage
 from ui.pages.real_time_page import RealTimePage
 from ui.widgets.tools.conversion_tool import ConvertToolDialog, MergeToolDialog
+from ui.widgets.tools.create_info_dialog import CreateInfoDialog
 from ui.widgets.tools.export_tool import ExportFilesDialog
 from ui.widgets.tools.qss_helper import QSSEditorDialog
 from ui.widgets.workspace_panel import DatasetInspectorPanel, WorkspacePanel
@@ -267,6 +268,7 @@ class MainWindow(QMainWindow):
 
         self.file_menu = menu_bar.addMenu("&File")
         self._add_action(self.file_menu, "Open Workspace", self.workspace_panel.select_folder, "Ctrl+O")
+        self._add_action(self.file_menu, "Create INFO", self._open_create_info_tool)
         self.file_menu.addSeparator()
         self.export_menu = self.file_menu.addMenu("Export")
         self._add_action(
@@ -551,6 +553,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._write_window_state()
         super().closeEvent(event)
+
+    @Slot()
+    def _open_create_info_tool(self):
+        dialog = CreateInfoDialog(parent=self, output_directory=self.current_folder)
+        dialog.exec()
 
     @Slot()
     def _open_convert_tool(self):

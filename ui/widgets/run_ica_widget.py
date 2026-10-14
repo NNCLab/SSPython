@@ -276,7 +276,7 @@ class RunICADialog(QDialog):
                 parent=self.parent(),
                 add_loggers="mne",
             )
-        worker.exec_with_dialog("Processing", "Running ICA...")
+        worker.exec_with_dialog("Processing", "Running ICA...", dialog_parent=self)
         if worker._error is not None:
             return
         QMessageBox.information(self, "Done", "Finished running ICA.")

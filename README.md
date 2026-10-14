@@ -170,6 +170,32 @@ The dialog is implemented in [conversion_tool.py](/C:/Users/DW60ZF/Documents/SSP
 
 > Figure Placeholder 2. Conversion dialog showing source folder selection, montage configuration, per-file output names, and merge selection columns.
 
+### Creating MNE Info
+
+Open `File > Create INFO` to create an `mne.Info` object without an existing
+recording. Set the sampling frequency and add channels in the same order as the
+recording or stream. Drag channel names to reorder rows, double-click a name to
+edit it, and choose its MNE type in the table. Select one or more rows and use
+**Remove Selected** to remove channels. Names and types move together, and the
+saved Info preserves the displayed channel order.
+
+Choose any of MNE's built-in montages or select an `electrodes.tsv` file with
+tab-separated `name`, `x`, `y`, and `z` columns. **Add Montage Channels** adds
+the montage's channels as EEG channels, preserving existing rows and avoiding
+duplicate names. Adjust their types and remove unused channels as needed.
+
+For TSV files, explicitly select meters, centimeters, or millimeters. Positions
+must already use MNE head coordinates (x right, y forward, z up); the dialog does
+not read `coordsystem.json` or transform other coordinate systems. Rows whose
+coordinates are all `n/a` are excluded. See the [MNE montage documentation](https://mne.tools/stable/generated/mne.channels.make_dig_montage.html)
+for coordinate requirements and the [BIDS electrode format](https://bids-specification.readthedocs.io/en/stable/modality-specific-files/electroencephalography.html)
+for TSV columns and coordinate metadata.
+
+**Create and Save INFO** validates channel names, types, and montage coverage,
+then saves a standalone Info FIF file. It can be selected with **Select Info
+Source** in conversion or used as the Info source for real-time input. The
+sampling frequency and channel order must match the data it will describe.
+
 ### What the Conversion Tool Does
 
 - Scans a folder recursively.

@@ -5,7 +5,7 @@ import inspect
 from functools import lru_cache, wraps
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QRectF, Signal, Qt, QThread, QObject, QSize
+from PySide6.QtCore import QByteArray, QRectF, Signal, Slot, Qt, QThread, QObject, QSize, QTimer
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -349,6 +349,53 @@ class ErrorDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class LoadingDialog(QProgressDialog):
+    """A window-modal loading dialog with busy progress unless opted out."""
+
+    def __init__(
+        self,
+        label: str,
+        title: str = "Please wait",
+        parent: QWidget | None = None,
+        *,
+        determinate: bool = False,
+        cancellable: bool = False,
+    ):
+        if parent is None:
+            parent = QApplication.activeModalWidget() or QApplication.activeWindow()
+        if parent is not None:
+            parent = parent.window()
+
+        super().__init__(label, "Cancel", 0, 100 if determinate else 0, parent)
+        self.setWindowTitle(title)
+        self.setMinimumDuration(500)
+        self.setAutoClose(False)
+        self.setAutoReset(False)
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        if not cancellable:
+            self.setCancelButton(None)
+        if determinate:
+            self.setValue(0)
+
+    @Slot(int)
+    def update_progress(self, value: int):
+        # Internal tqdm stages may report percentages even when the total
+        # operation has an unknown duration. Keep those operations busy.
+        if self.maximum() > self.minimum():
+            self.setValue(value)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Native window creation/order can finish after showEvent on macOS.
+        QTimer.singleShot(0, self, self._raise_when_visible)
+
+    @Slot()
+    def _raise_when_visible(self):
+        if self.isVisible():
+            self.raise_()
+            self.activateWindow()
+
+
 class Worker(QThread):
     """
     A professional QThread worker for running tasks in the background.
@@ -451,38 +498,53 @@ class Worker(QThread):
         label: str = "Starting task...",
         is_cancellable: bool | None = None,
         show_error_msg: bool = True,
+        *,
+        dialog_parent: QWidget | None = None,
+        determinate: bool = False,
     ) -> Any:
         """
         Convenience method to run the worker and show a modal progress dialog.
         The cancel button is only shown if the task is cancellable.
+        Set determinate=True only when progress describes the whole operation.
+        The dialog's owner can differ from the worker's lifetime owner.
         """
-        parent = self.parent()
-        if not isinstance(parent, QWidget):
-            parent = None
+        parent = dialog_parent
+        if parent is None:
+            parent = QApplication.activeModalWidget()
+        if parent is None and isinstance(self.parent(), QWidget):
+            parent = self.parent()
 
         show_cancel_button = self._is_cancellable
         if is_cancellable is not None:
             show_cancel_button = is_cancellable and self._is_cancellable
 
-        dialog = QProgressDialog(label, "Cancel", 0, 100, parent)
-        dialog.setWindowTitle(title)
-        dialog.setMinimumDuration(500)
-        dialog.setAutoClose(False)
-        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog = LoadingDialog(
+            label,
+            title,
+            parent,
+            determinate=determinate,
+            cancellable=show_cancel_button,
+        )
+        parent = dialog.parentWidget()
+        connections = [
+            (self.progress, dialog.update_progress),
+            (self.progress_text, dialog.setLabelText),
+            (self.finished, dialog.accept),
+            (self.error, dialog.reject),
+            (self.cancelled, dialog.reject),
+        ]
+        if show_cancel_button:
+            connections.append((dialog.canceled, self.requestInterruption))
+        for signal, slot in connections:
+            signal.connect(slot)
 
-        if not show_cancel_button:
-            dialog.setCancelButton(None)
-        else:
-            dialog.canceled.connect(self.requestInterruption)
-
-        self.progress.connect(dialog.setValue)
-        self.progress_text.connect(dialog.setLabelText)
-        self.finished.connect(dialog.accept)
-        self.error.connect(dialog.reject)
-        self.cancelled.connect(dialog.reject)
-
-        self.start()
-        dialog_code = dialog.exec()
+        try:
+            self.start()
+            dialog_code = dialog.exec()
+        finally:
+            for signal, slot in connections:
+                signal.disconnect(slot)
+            dialog.deleteLater()
 
         if dialog_code == QProgressDialog.DialogCode.Rejected and self._error:
             if not self.isInterruptionRequested() and show_error_msg:

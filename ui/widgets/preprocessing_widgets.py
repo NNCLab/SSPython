@@ -408,7 +408,7 @@ class ArtifactRemovalDialog(BaseProcessingDialog):
             parent=self.parent(),
             add_loggers="tqdm",
         )
-        worker.exec_with_dialog("Please wait", "Running Artifact Removal")
+        worker.exec_with_dialog("Please wait", "Running Artifact Removal", dialog_parent=self)
         if worker._error is not None:
             return
         self.accept()
@@ -491,7 +491,7 @@ class FilterContinuousDialog(BaseProcessingDialog):
         worker = Worker(
             lambda: self.preprocessor.filter_continuous(**params), parent=self.parent()
         )
-        worker.exec_with_dialog("Please wait", "Filtering and resampling...")
+        worker.exec_with_dialog("Please wait", "Filtering and resampling...", dialog_parent=self)
         if worker._error is not None:
             return
         self.accept()
@@ -900,7 +900,7 @@ class EpochingDialog(BaseProcessingDialog):
         worker = Worker(
             lambda: self.preprocessor.run_epoching(**params), parent=self.parent()
         )
-        worker.exec_with_dialog("Please wait", "Running Epoching")
+        worker.exec_with_dialog("Please wait", "Running Epoching", dialog_parent=self)
         if worker._error is not None:
             return
         self.accept()
@@ -1022,7 +1022,7 @@ class ReReferenceDialog(BaseProcessingDialog):
         worker = Worker(
             lambda: self.preprocessor.run_rereferencing(**params), parent=self.parent()
         )
-        worker.exec_with_dialog("Please wait", "Running Re-referencing")
+        worker.exec_with_dialog("Please wait", "Running Re-referencing", dialog_parent=self)
         self.accept()
 
 
@@ -1295,14 +1295,16 @@ class ApplyPreprocessingDialog(BaseProcessingDialog):
         if not self.preprocessor.epochs.preload:
             Worker(
                 lambda: self.preprocessor.epochs.load_data(), parent=self.parent()
-            ).exec_with_dialog("Loading...", "Loading epoched data...")
+            ).exec_with_dialog("Loading...", "Loading epoched data...", dialog_parent=self)
 
         logger.info(f"Running preprocessing with params: {params}")
 
         worker = Worker(
             lambda: self.preprocessor.filter_epochs(**params), parent=self.parent()
         )
-        worker.exec_with_dialog("Loading", "Applying final preprocessing steps...")
+        worker.exec_with_dialog(
+            "Loading", "Applying final preprocessing steps...", dialog_parent=self
+        )
         if worker._error is not None:
             return
         self.finished.emit()
