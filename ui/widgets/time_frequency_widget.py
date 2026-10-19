@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QScrollArea,
     QSplitter,
     QSpinBox,
     QVBoxLayout,
@@ -44,6 +45,7 @@ from core.analysis_events import (
     select_event_epochs,
     tfr_event_metadata,
 )
+from core.tfr_statistics import compute_tfr_statistics, matching_tfr_mask
 from ui.widgets.event_selection import EventSelector
 from ui.widgets.tools.optional_range_widget import OptionalRangeWidget
 from utils import Worker, theme_tokens, update_toolbar_color
@@ -168,8 +170,16 @@ class ComputeTFRSettingsDialog(QDialog):
         self.setMinimumWidth(660)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self._create_compute_group())
-        layout.addWidget(self._create_method_group())
+        contents = QWidget()
+        contents_layout = QVBoxLayout(contents)
+        contents_layout.addWidget(self._create_compute_group())
+        contents_layout.addWidget(self._create_method_group())
+        contents_layout.addWidget(self._create_statistics_group())
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(contents)
+        layout.addWidget(scroll)
+        self.resize(700, 780)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -183,6 +193,7 @@ class ComputeTFRSettingsDialog(QDialog):
         self.output_combo.currentTextChanged.connect(self._sync_output_constraints)
         self.average_checkbox.toggled.connect(self._sync_output_constraints)
         self.return_itc_checkbox.toggled.connect(self._sync_output_constraints)
+        self.statistics_group.toggled.connect(self._sync_output_constraints)
         self._sync_method_fields()
         self._sync_output_constraints()
 
@@ -304,6 +315,66 @@ class ComputeTFRSettingsDialog(QDialog):
         label.setVisible(visible)
         widget.setVisible(visible)
 
+    def _create_statistics_group(self):
+        self.statistics_group = QGroupBox("Run bootstrap statistics (power only)")
+        self.statistics_group.setCheckable(True)
+        self.statistics_group.setChecked(False)
+        form = QFormLayout(self.statistics_group)
+        times = np.asarray(self.epochs.times)
+        start, stop = max(float(times[0]), -0.5), min(float(times[-1]), -0.1)
+        if stop <= start:
+            start, stop = float(times[0]), min(float(times[-1]), 0.0)
+        if stop <= start:
+            start, stop = float(times[0]), float(times[-1])
+        self.statistics_baseline_input = OptionalRangeWidget(
+            labels=("start:", "stop:"), suffix=" s", range=(start, stop), parent=self,
+        )
+        for spinbox in (self.statistics_baseline_input.low_input, self.statistics_baseline_input.high_input):
+            spinbox.setDecimals(4)
+            spinbox.setRange(float(times[0]), float(times[-1]))
+        self.statistics_baseline_input.setValue((start, stop))
+        self.statistics_baseline_input.adjust_spinbox_width()
+        self.permutations_input = QSpinBox()
+        self.permutations_input.setRange(1, 1_000_000)
+        self.permutations_input.setValue(500)
+        self.alpha_input = QDoubleSpinBox()
+        self.alpha_input.setDecimals(4)
+        self.alpha_input.setRange(0.0001, 0.9999)
+        self.alpha_input.setSingleStep(0.01)
+        self.alpha_input.setValue(0.05)
+        self.fdr_checkbox = QCheckBox("Apply FDR correction")
+        self.fdr_checkbox.setChecked(True)
+        self.seed_checkbox = QCheckBox("Set seed")
+        self.seed_input = QSpinBox()
+        self.seed_input.setRange(0, 2_147_483_647)
+        self.seed_input.setEnabled(False)
+        self.seed_checkbox.toggled.connect(self.seed_input.setEnabled)
+        seed_row = QWidget()
+        seed_layout = QHBoxLayout(seed_row)
+        seed_layout.setContentsMargins(0, 0, 0, 0)
+        seed_layout.addWidget(self.seed_checkbox)
+        seed_layout.addWidget(self.seed_input)
+        form.addRow("Statistics baseline:", self.statistics_baseline_input)
+        form.addRow("Permutations:", self.permutations_input)
+        form.addRow("Alpha:", self.alpha_input)
+        form.addRow(self.fdr_checkbox)
+        form.addRow("Random seed:", seed_row)
+        note = QLabel("Resample baseline times with replacement, separately for each event and channel.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        return self.statistics_group
+
+    def get_statistics_params(self):
+        if not self.statistics_group.isChecked():
+            return None
+        return {
+            "baseline": self.statistics_baseline_input.value(),
+            "n_permutations": self.permutations_input.value(),
+            "alpha": self.alpha_input.value(),
+            "fdr_correction": self.fdr_checkbox.isChecked(),
+            "random_state": self.seed_input.value() if self.seed_checkbox.isChecked() else None,
+        }
+
     def _sync_method_fields(self):
         method = self.method_combo.currentText()
         is_stockwell = method == "stockwell"
@@ -321,10 +392,12 @@ class ComputeTFRSettingsDialog(QDialog):
             self.freqs_input.setText("8:45:1")
 
     def _sync_output_constraints(self):
+        power_only = self.return_itc_checkbox.isChecked() or self.statistics_group.isChecked()
         if self.return_itc_checkbox.isChecked():
             self.average_checkbox.setChecked(True)
+        if power_only:
             self.output_combo.setCurrentText("power")
-        self.output_combo.setEnabled(not self.return_itc_checkbox.isChecked())
+        self.output_combo.setEnabled(not power_only)
 
     def _validation_error(self) -> str | None:
         try:
@@ -349,6 +422,19 @@ class ComputeTFRSettingsDialog(QDialog):
             return "return_itc requires average=True."
         if params["average"] and params["output"] != "power":
             return "average=True is only compatible with output='power'."
+        statistics = self.get_statistics_params()
+        if statistics is not None:
+            if params["output"] != "power":
+                return "Bootstrap statistics require power output."
+            times = np.asarray(self.epochs.times)
+            if tmin is not None:
+                times = times[times >= tmin - 1e-12]
+            if tmax is not None:
+                times = times[times <= tmax + 1e-12]
+            try:
+                validate_baseline(times[::params["decim"]], statistics["baseline"])
+            except ValueError as exc:
+                return f"Invalid statistics baseline: {exc}"
         return None
 
     def accept(self):
@@ -394,6 +480,8 @@ class TimeFrequencyDisplayData:
     times_ms: np.ndarray
     freqs_hz: np.ndarray
     values: np.ndarray
+    summary_values: np.ndarray
+    image_alpha: np.ndarray | None
     erp_uV: np.ndarray
     erp_channel_uV: np.ndarray
     erp_channel_names: list[str]
@@ -559,6 +647,7 @@ def _extract_tfr_power(
     *,
     channel_names: str | list[str] | None,
     event_code: int | None,
+    average_channels: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, str]:
     tfr = _coerce_tfr(tfr, event_code)
     if tfr is None:
@@ -578,15 +667,17 @@ def _extract_tfr_power(
         n_epochs = int(data.shape[0])
         if n_epochs == 0:
             raise ValueError("No epochs match the selected event.")
-        matrix = np.nanmean(data[:, pick_indices, :, :], axis=(0, 1))
+        matrix = np.nanmean(data[:, pick_indices, :, :], axis=0)
     elif data.ndim == 3:
         if event_code is not None:
             metadata = tfr_event_metadata(tfr)
             if metadata is None or metadata["event_id"] != event_code:
                 raise ValueError("This pooled TFR cannot be filtered by event. Recompute it with an event selected.")
-        matrix = np.nanmean(data[pick_indices, :, :], axis=0)
+        matrix = data[pick_indices, :, :]
     else:
         raise ValueError(f"Unsupported TFR data shape: {data.shape}")
+    if average_channels:
+        matrix = np.nanmean(matrix, axis=0)
 
     if channel_names is None:
         channel_label = "All data channels"
@@ -669,6 +760,7 @@ def build_time_frequency_display(
     baseline_s: tuple[float | None, float | None] = (None, 0.0),
     apply_baseline: bool = False,
     is_itc: bool = False,
+    stat_mask: np.ndarray | None = None,
 ) -> TimeFrequencyDisplayData:
     selected_channels = channel_names if channel_names is not None else channel_name
     tfr = _coerce_tfr(tfr, event_code)
@@ -693,6 +785,26 @@ def build_time_frequency_display(
             baseline_s=baseline_s,
             apply_baseline=apply_baseline,
         )
+    summary_values = values
+    image_alpha = None
+    if not is_itc and stat_mask is not None:
+        indices = _pick_indices(list(tfr.ch_names), selected_channels)
+        mask = np.asarray(stat_mask, dtype=bool)[indices]
+        _, _, channel_power, _, _ = _extract_tfr_power(
+            tfr, channel_names=selected_channels, event_code=event_code,
+            average_channels=False,
+        )
+        if mask.shape != channel_power.shape:
+            raise ValueError("The statistical mask does not match the selected TFR.")
+        # Normalize each channel before masking, as in natural frequency.
+        channel_values = np.stack([
+            apply_time_frequency_transform(
+                channel, times_s, mode=transform_mode,
+                baseline_s=baseline_s, apply_baseline=apply_baseline,
+            )[0] for channel in channel_power
+        ])
+        summary_values = np.nanmean(np.where(mask, channel_values, 0.0), axis=0)
+        image_alpha = 0.25 + 0.75 * mask.mean(axis=0)
     event_lookup = _event_name_lookup(epochs)
     event_label = event_lookup.get(int(event_code), f"Event {event_code}") if event_code is not None else "All events"
     erp_channel_names, erp_full_uV = _erp_traces_uV(
@@ -708,11 +820,13 @@ def build_time_frequency_display(
     else:
         erp_channel_uV = np.empty((0, len(times_s)), dtype=float)
         erp_uV = np.full_like(times_s, np.nan, dtype=float)
-    spectrum = np.nanmean(values, axis=1)
+    spectrum = np.nanmean(summary_values, axis=1)
     return TimeFrequencyDisplayData(
         times_ms=times_s * 1000.0,
         freqs_hz=freqs_hz,
         values=values,
+        summary_values=summary_values,
+        image_alpha=image_alpha,
         erp_uV=erp_uV,
         erp_channel_uV=erp_channel_uV,
         erp_channel_names=erp_channel_names,
@@ -734,12 +848,15 @@ class TimeFrequencyWidget(QWidget):
         label: str | None = None,
         tfr: Any = None,
         tfr_derivatives: dict[str, Any] | None = None,
+        tfr_statistics: dict[str, Any] | None = None,
         parent=None,
     ):
         super().__init__(parent)
         self.epochs = epochs
         self.label = label or "Time-Frequency"
         self.tfr_derivatives = self._normalize_tfr_derivatives(tfr_derivatives, tfr)
+        self.tfr_statistics = dict(tfr_statistics or {})
+        self._power_apply_mask = False
         self.current_derivative_key = next(iter(self.tfr_derivatives), None)
         self.tfr = self.tfr_derivatives.get(self.current_derivative_key)
         self.display_data: TimeFrequencyDisplayData | None = None
@@ -896,6 +1013,9 @@ class TimeFrequencyWidget(QWidget):
         display_form.addRow(self.baseline_checkbox)
         display_form.addRow("Baseline start:", self.baseline_start_input)
         display_form.addRow("Baseline stop:", self.baseline_stop_input)
+        self.mask_checkbox = QCheckBox("Use statistical mask")
+        self.mask_checkbox.setEnabled(False)
+        display_form.addRow(self.mask_checkbox)
         layout.addWidget(display_group)
 
         color_group = QGroupBox("Color Limits")
@@ -950,6 +1070,7 @@ class TimeFrequencyWidget(QWidget):
         self.baseline_checkbox.toggled.connect(self._on_transform_changed)
         self.baseline_start_input.valueChanged.connect(self._on_transform_changed)
         self.baseline_stop_input.valueChanged.connect(self._on_transform_changed)
+        self.mask_checkbox.toggled.connect(self._on_mask_toggled)
         self.clim_min_input.valueChanged.connect(self._on_clim_spinbox_changed)
         self.clim_max_input.valueChanged.connect(self._on_clim_spinbox_changed)
         self.auto_clim_button.clicked.connect(self._auto_scale_clim)
@@ -1200,6 +1321,35 @@ class TimeFrequencyWidget(QWidget):
         self._clim = None
         self._render()
 
+    def _on_mask_toggled(self, checked):
+        self._power_apply_mask = bool(checked)
+        self._render()
+
+    def _sync_mask_control(self):
+        mask = None
+        if not self._current_derivative_is_itc():
+            mask = matching_tfr_mask(
+                self.tfr_statistics.get(self.current_derivative_key),
+                _coerce_tfr(self.tfr, self._selected_event_code()), self._selected_event_code(),
+            )
+        self.mask_checkbox.blockSignals(True)
+        self.mask_checkbox.setEnabled(mask is not None)
+        self.mask_checkbox.setChecked(mask is not None and self._power_apply_mask)
+        self.mask_checkbox.blockSignals(False)
+        tooltip = "No matching power statistics are available for this event."
+        if self._current_derivative_is_itc():
+            tooltip = "Statistical masking is available only for power TFR, not ITC."
+        elif mask is not None:
+            settings = self.tfr_statistics[self.current_derivative_key]["settings"]
+            tooltip = (
+                "Fade nonsignificant values to 25% opacity. Summaries zero them per channel "
+                "before averaging, retaining the full channel/time/frequency denominator. "
+                f"Statistics baseline: {settings['baseline']} s; alpha: {settings['alpha']}; "
+                f"permutations: {settings['n_permutations']}; FDR: {settings['fdr_correction']}."
+            )
+        self.mask_checkbox.setToolTip(tooltip)
+        return mask if self.mask_checkbox.isChecked() else None
+
     def _on_transform_changed(self):
         self._update_baseline_controls()
         if not self._current_derivative_is_itc():
@@ -1280,6 +1430,7 @@ class TimeFrequencyWidget(QWidget):
             return
 
         try:
+            stat_mask = self._sync_mask_control()
             self.display_data = build_time_frequency_display(
                 epochs=self.epochs,
                 tfr=self.tfr,
@@ -1289,6 +1440,7 @@ class TimeFrequencyWidget(QWidget):
                 baseline_s=self._baseline_s(),
                 apply_baseline=self.baseline_checkbox.isChecked(),
                 is_itc=self._current_derivative_is_itc(),
+                stat_mask=stat_mask,
             )
         except Exception as exc:
             logger.exception("Could not render time-frequency data.")
@@ -1451,6 +1603,7 @@ class TimeFrequencyWidget(QWidget):
             extent=[time_extent[0], time_extent[1], freq_extent[0], freq_extent[1]],
             vmin=self._clim[0],
             vmax=self._clim[1],
+            alpha=self.display_data.image_alpha,
         )
         self.main_ax.axvline(0.0, color=tokens["muted"], linestyle="--", linewidth=1.0)
         self.main_ax.set_ylabel("Frequency (Hz)")
@@ -1702,7 +1855,7 @@ class TimeFrequencyWidget(QWidget):
         ):
             return
         time_mask, freq_mask = self._roi_masks()
-        values = self.display_data.values
+        values = self.display_data.summary_values
         spectrum = np.nanmean(values[:, time_mask], axis=1)
         time_power = np.nanmean(values[freq_mask, :], axis=0)
         roi_values = values[np.ix_(freq_mask, time_mask)]
@@ -1832,6 +1985,7 @@ class TimeFrequencyWidget(QWidget):
         self.context_label.setText(
             f"{self.current_derivative_key or 'TFR'} | {self.display_data.channel_label} | {self.display_data.event_label} | "
             f"Epochs: {self.display_data.n_epochs} | Units: {self.display_data.units} | Reference: {reference}"
+            + (" | Statistical mask on" if self.mask_checkbox.isChecked() else "")
         )
 
     def _event_to_data(self, event) -> tuple[float, float] | None:
@@ -2089,15 +2243,23 @@ class TimeFrequencyWidget(QWidget):
             return
 
         compute_params = dialog.get_compute_params()
+        statistics_params = dialog.get_statistics_params()
         event_code = dialog.event_selector.currentData()
 
         def compute():
-            return compute_event_tfrs(self.epochs, event_code=event_code, **compute_params)
+            result = compute_event_tfrs(self.epochs, event_code=event_code, **compute_params)
+            power = result[0] if isinstance(result, tuple) else result
+            statistics = None if statistics_params is None else compute_tfr_statistics(
+                self.epochs, power, event_code=event_code,
+                compute_params=compute_params, settings=statistics_params,
+            )
+            return result, statistics
 
         worker = Worker(compute, parent=self, add_loggers="mne")
         result = worker.exec_with_dialog("Please wait", "Computing time-frequency display...")
         if result is None:
             return
+        result, statistics = result
         if isinstance(result, tuple):
             power, itc = result
             self.tfr_derivatives["Computed power"] = power
@@ -2109,6 +2271,7 @@ class TimeFrequencyWidget(QWidget):
             self.tfr_derivatives[label] = result
             self.current_derivative_key = label
             self.tfr = result
+        self.tfr_statistics[self.current_derivative_key] = statistics
         self._populate_selectors()
         self._clim = None
         self._render()
@@ -2122,6 +2285,7 @@ class TimeFrequencyDialog(QDialog):
         label: str | None = None,
         tfr: Any = None,
         tfr_derivatives: dict[str, Any] | None = None,
+        tfr_statistics: dict[str, Any] | None = None,
         widget: TimeFrequencyWidget | None = None,
         parent=None,
     ):
@@ -2141,6 +2305,7 @@ class TimeFrequencyDialog(QDialog):
                 label=label,
                 tfr=tfr,
                 tfr_derivatives=tfr_derivatives,
+                tfr_statistics=tfr_statistics,
                 parent=self,
             )
         else:

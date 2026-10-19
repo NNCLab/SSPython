@@ -163,6 +163,18 @@ QSplitter#shellSplitter::handle:hover {
     background: #eef4f6;
 }
 
+#sidebarToggle {
+    min-width: 52px;
+    max-width: 52px;
+    min-height: 52px;
+    max-height: 52px;
+}
+
+#sidebarToggle[collapsed="true"] {
+    min-width: 60px;
+    max-width: 60px;
+}
+
 #inspectorToggle[collapsed="true"] {
     min-height: 0;
     padding: 0;
@@ -180,8 +192,13 @@ QSplitter#shellSplitter::handle:hover {
     background: transparent;
     border: none;
     border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
     margin: 0;
-    padding: 12px 14px;
+    padding: 8px 10px;
+}
+
+#navList[collapsed="true"]::item {
+    padding: 0;
 }
 
 #navList::item:hover {
@@ -199,9 +216,15 @@ QSplitter#shellSplitter::handle:hover {
     color: #16242a;
     border: none;
     border-left: 3px solid transparent;
+    border-right: 3px solid transparent;
     border-radius: 0;
-    padding: 12px 14px;
+    padding: 8px 10px;
     text-align: left;
+}
+
+#sidebarActionButton[collapsed="true"] {
+    padding: 0;
+    text-align: center;
 }
 
 #sidebarActionButton:hover {

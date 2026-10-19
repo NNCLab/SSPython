@@ -9,7 +9,6 @@ from pathlib import Path
 import mne
 import numpy as np
 from typing import Literal, Optional
-from statsmodels.stats.multitest import fdrcorrection
 import scipy
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -26,6 +25,7 @@ from core.pipelines import (
 )
 from core.version import __version__
 from core.baseline import validate_baseline
+from core.tfr_statistics import bootstrap_power, load_tfr_statistics
 from core.filtering import (
     FilterConfig, NotchConfig, apply_bandpass, apply_notch, validate_resample,
 )
@@ -1198,6 +1198,7 @@ class TMSEEGAnalysis:
                 if self.has("tfr_mask")
                 else None
             ),
+            "tfr_statistics": load_tfr_statistics(self.paths["tfr_statistics"]),
             "itc": (
                 mne.time_frequency.read_tfrs(self.paths["itc"], verbose=False)
                 if self.has("itc")
@@ -1365,62 +1366,17 @@ class TMSEEGAnalysis:
         n_permutations: int = 500,
         fdr_correction: bool = True,
         verbose: bool = True,
+        random_state: int | None = None,
     ) -> np.ndarray:
-        """Performs a permutation test on Time-Frequency Representation (TFR) data."""
+        """Baseline resampling shared with natural frequency and exploratory TFR."""
         data = tfr.data
-        times = tfr.times
-        baseline_samples = np.where(
-            (times >= (baseline[0] or -np.inf)) & (times <= (baseline[1] or np.inf))
-        )[0]
-
         if data.ndim == 3:
-            data = data[np.newaxis, :, :, :]
-        _, n_channels, n_freqs, n_times = data.shape
-
-        mask = np.zeros((n_channels, n_freqs, n_times), dtype=bool)
-
-        pbar = tqdm(
-            range(n_channels),
-            total=n_channels,
-            desc="Bootstrapping",
-            leave=False,
-            disable=not verbose,
-        )
-        for ch in pbar:
-            ch_data = data[:, ch, :, :]
-            avg_data = np.mean(ch_data, axis=0)
-
-            # Bootstrap distribution
-            n_trials = ch_data.shape[0]
-            boots = np.zeros((n_permutations, n_freqs, 2))
-            for n in range(n_permutations):
-                resampled_data = np.zeros((n_trials, n_freqs, len(baseline_samples)))
-                for t in range(n_trials):
-                    rand_idx = np.random.choice(
-                        baseline_samples, len(baseline_samples), replace=True
-                    )
-                    resampled_data[t, :, :] = ch_data[t, :, rand_idx].T
-
-                boot_mean = np.mean(resampled_data, axis=0)
-                boots[n, :, 0] = np.max(boot_mean, axis=1)
-                boots[n, :, 1] = np.min(boot_mean, axis=1)
-
-            # P-values
-            pvals = np.zeros_like(avg_data)
-            for d in range(n_freqs):
-                for t in range(n_times):
-                    p1 = (np.sum(boots[:, d, 0] >= avg_data[d, t])) / n_permutations
-                    p2 = (np.sum(boots[:, d, 1] <= avg_data[d, t])) / n_permutations
-                    pvals[d, t] = min(p1, p2)
-
-            # Correction
-            if fdr_correction:
-                _, pvals_corrected = fdrcorrection(pvals.ravel(), alpha=alpha / 2)
-                pvals = pvals_corrected.reshape(pvals.shape)
-
-            mask[ch, :, :] = pvals < alpha
-
-        return np.squeeze(mask)
+            data = data[np.newaxis]
+        return bootstrap_power(
+            data, tfr.times, baseline=baseline, alpha=alpha,
+            n_permutations=n_permutations, fdr_correction=fdr_correction,
+            random_state=random_state, verbose=verbose,
+        ).squeeze()
 
     # ==== Field Power ====
     @staticmethod

@@ -429,6 +429,7 @@ def build_analysis_paths(
     paths = {
         "tfr": base_dir / derivative_filename(source_stem, "tfr", "tfr", ".h5"),
         "tfr_mask": base_dir / derivative_filename(source_stem, "tfrmask", "mask", ".npy"),
+        "tfr_statistics": base_dir / derivative_filename(source_stem, "tfrstats", "mask", ".npz"),
         "itc": base_dir / derivative_filename(source_stem, "itc", "itc", ".h5"),
         "itc_mask": base_dir / derivative_filename(source_stem, "itcmask", "mask", ".npy"),
         "masked_ave": base_dir / derivative_filename(source_stem, "maskedave", "ave", ".fif"),

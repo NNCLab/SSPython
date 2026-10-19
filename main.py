@@ -30,6 +30,9 @@ from PySide6.QtWidgets import (
     QSplitter,
     QSplashScreen,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QVBoxLayout,
     QWidget,
 )
@@ -108,6 +111,26 @@ def _validate_frozen_dependencies() -> None:
         raise RuntimeError("The bundled PyVista/VTK backend did not initialize.")
 
 
+class NavigationDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        if not self.parent().property("collapsed"):
+            super().paint(painter, option, index)
+            return
+
+        option = QStyleOptionViewItem(option)
+        super().initStyleOption(option, index)
+        icon = QIcon(option.icon)
+        option.icon = QIcon()
+        option.text = ""
+        style = self.parent().style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, self.parent())
+        icon_rect = QStyle.alignedRect(
+            option.direction, Qt.AlignmentFlag.AlignCenter, option.decorationSize, option.rect
+        )
+        mode = QIcon.Mode.Normal if option.state & QStyle.StateFlag.State_Enabled else QIcon.Mode.Disabled
+        icon.paint(painter, icon_rect, Qt.AlignmentFlag.AlignCenter, mode)
+
+
 class MainWindow(QMainWindow):
     current_folder_changed = Signal(object)
     current_pipeline_changed = Signal(object)
@@ -121,16 +144,14 @@ class MainWindow(QMainWindow):
 
     NAV_LIST_OBJECT_NAME = "navList"
     SIDEBAR_OBJECT_NAME = "sidebar"
+    SIDEBAR_ICON_SIZE = 32
+    SIDEBAR_ROW_HEIGHT = 52
 
     PAGE_DEFINITIONS = [
-        ("assets/icon.png", "Home", HomePage),
-        None,
+        ("assets/icons/home.svg", "Home", HomePage),
         ("assets/icons/realtime.svg", "Real-Time", RealTimePage),
-        None,
         ("assets/icons/erp_preprocess.svg", "Preprocessing", ProcessingPage),
-        None,
         ("assets/icons/erp_analysis.svg", "Analysis", ErpAnalysisPage),
-        None,
         ("assets/icons/settings.svg", "Preferences", PreferencesPage),
     ]
 
@@ -151,8 +172,8 @@ class MainWindow(QMainWindow):
         self.output_root = self.settings_store.output_root()
         self.current_pipeline = get_pipeline(self.settings_store.current_pipeline_id())
         self.current_dataset = None
-        self.sidebar_expanded_width = 236
-        self.sidebar_collapsed_width = 84
+        self.sidebar_expanded_width = 208
+        self.sidebar_collapsed_width = 60
         self.sidebar_collapsed = self.settings_store.get(
             self.SIDEBAR_COLLAPSED_SETTING,
             False,
@@ -228,8 +249,8 @@ class MainWindow(QMainWindow):
         sidebar_widget.setObjectName(self.SIDEBAR_OBJECT_NAME)
 
         sidebar_layout = QVBoxLayout(sidebar_widget)
-        sidebar_layout.setContentsMargins(14, 18, 14, 18)
-        sidebar_layout.setSpacing(12)
+        sidebar_layout.setContentsMargins(0, 12, 0, 12)
+        sidebar_layout.setSpacing(8)
 
         chrome_row = QHBoxLayout()
         chrome_row.setContentsMargins(0, 0, 0, 0)
@@ -237,6 +258,7 @@ class MainWindow(QMainWindow):
 
         self.sidebar_brand = QLabel("SSPython")
         self.sidebar_brand.setObjectName("sidebarBrand")
+        self.sidebar_brand.setContentsMargins(12, 0, 0, 0)
         chrome_row.addWidget(self.sidebar_brand, 1)
 
         self.toggle_sidebar_button = QPushButton("")
@@ -247,17 +269,21 @@ class MainWindow(QMainWindow):
 
         self.nav_list = QListWidget()
         self.nav_list.setObjectName(self.NAV_LIST_OBJECT_NAME)
-        self.nav_list.setIconSize(QSize(20, 20))
+        self.nav_list.setItemDelegate(NavigationDelegate(self.nav_list))
+        self.nav_list.setIconSize(QSize(self.SIDEBAR_ICON_SIZE, self.SIDEBAR_ICON_SIZE))
         self.nav_list.setSpacing(0)
         sidebar_layout.addWidget(self.nav_list, 1)
 
         self.theme_button = QPushButton("Theme")
         self.theme_button.setObjectName("sidebarActionButton")
+        self.theme_button.setFixedHeight(self.SIDEBAR_ROW_HEIGHT)
+        self.theme_button.setToolTip("Toggle light/dark theme")
         self.theme_button.clicked.connect(self.toggle_theme)
         sidebar_layout.addWidget(self.theme_button)
 
         self.sidebar_footer = QLabel("Navigate, analyze, and visualize\nyour EEG data with ease. \nMade by: Couto, BAN.")
         self.sidebar_footer.setObjectName("sidebarFooter")
+        self.sidebar_footer.setContentsMargins(12, 0, 12, 0)
         self.sidebar_footer.setWordWrap(True)
         sidebar_layout.addWidget(self.sidebar_footer)
 
@@ -322,13 +348,6 @@ class MainWindow(QMainWindow):
 
     def _populate_navigation(self):
         for page_def in self.PAGE_DEFINITIONS:
-            if page_def is None:
-                separator = QListWidgetItem("")
-                separator.setFlags(Qt.ItemFlag.NoItemFlags)
-                separator.setSizeHint(QSize(0, 12))
-                self.nav_list.addItem(separator)
-                continue
-
             icon_path, name, page_class = page_def
 
             if page_class == PreferencesPage:
@@ -341,7 +360,8 @@ class MainWindow(QMainWindow):
             self.stacked_widget.addWidget(page_widget)
 
             item = QListWidgetItem(name)
-            item.setSizeHint(QSize(0, 44))
+            item.setSizeHint(QSize(0, self.SIDEBAR_ROW_HEIGHT))
+            item.setToolTip(name)
             item.setData(self.PageWidgetRole, page_widget)
             item.setData(self.PageIconRole, icon_path)
             self.nav_list.addItem(item)
@@ -473,10 +493,11 @@ class MainWindow(QMainWindow):
         return QIcon(get_path(icon_path))
 
     def _refresh_icons(self):
-        self.toggle_sidebar_button.setIcon(themed_svg_icon("assets/icons/menu.svg", size=20))
-        self.toggle_sidebar_button.setIconSize(QSize(20, 20))
-        self.theme_button.setIcon(themed_svg_icon("assets/icons/theme.svg", size=20))
-        self.theme_button.setIconSize(QSize(20, 20))
+        icon_size = QSize(self.SIDEBAR_ICON_SIZE, self.SIDEBAR_ICON_SIZE)
+        self.toggle_sidebar_button.setIcon(themed_svg_icon("assets/icons/menu.svg", size=icon_size))
+        self.toggle_sidebar_button.setIconSize(icon_size)
+        self.theme_button.setIcon(themed_svg_icon("assets/icons/theme.svg", size=icon_size))
+        self.theme_button.setIconSize(icon_size)
 
         for row in range(self.nav_list.count()):
             item = self.nav_list.item(row)
@@ -484,13 +505,21 @@ class MainWindow(QMainWindow):
                 continue
             icon_path = item.data(self.PageIconRole)
             if icon_path:
-                item.setIcon(self._icon_for_path(icon_path, size=20))
+                icon = self._icon_for_path(icon_path, size=self.SIDEBAR_ICON_SIZE)
+                icon.addPixmap(icon.pixmap(icon_size), QIcon.Mode.Selected)
+                item.setIcon(icon)
 
         if hasattr(self.dataset_inspector_panel, "refresh_icons"):
             self.dataset_inspector_panel.refresh_icons()
 
     def _apply_sidebar_state(self, *, animated: bool):
         target_width = self.sidebar_collapsed_width if self.sidebar_collapsed else self.sidebar_expanded_width
+        for widget in (self.nav_list, self.theme_button, self.toggle_sidebar_button):
+            widget.setProperty("collapsed", self.sidebar_collapsed)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.update()
+        self.nav_list.doItemsLayout()
         self.sidebar_brand.setVisible(not self.sidebar_collapsed)
         self.sidebar_footer.setVisible(not self.sidebar_collapsed)
         self.theme_button.setText("" if self.sidebar_collapsed else "Theme")
@@ -533,6 +562,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_settings_saved(self):
+        self._refresh_icons()
         updated_output_root = self.settings_store.output_root()
         updated_pipeline = get_pipeline(self.settings_store.current_pipeline_id())
 

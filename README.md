@@ -424,11 +424,41 @@ contained in the epochs, with event names and trial counts in the selector. Sele
 all events are selected. Response amplitude updates immediately when the event
 changes; natural frequency requires **Run Analysis** again.
 
+Natural frequency offers MNE's `mean`, `ratio`, `logratio`, `percent`, `zscore`,
+and `zlogratio` baseline correction modes, plus no correction. Mean subtraction
+is the default. Correction is applied to mean trial power per channel before
+the ROI is combined, affecting both the frequency estimate and its plot. The
+baseline interval remains necessary for statistics even with correction off.
+
 When computing averaged TFR/ITC for all events, the saved file also retains each
 event's average so **Plot TFR** can switch between them. Earlier pooled averages
 without event information must be recomputed to inspect a specific event. STC
 uses the selected event for both noise covariance and the evoked response, and
 its plot title identifies the event used for the saved estimate.
+
+In **Compute TFR**, enable **Run bootstrap statistics (power only)** to select
+the statistics baseline, permutation count, alpha, FDR correction, and optional
+random seed. Natural frequency and TFR share the historical analysis method:
+baseline time samples are resampled with replacement within each trial, and
+per-frequency minima/maxima of the trial average provide the reference
+distribution. The historical tail-probability and FDR threshold conventions are
+preserved. Statistics always use raw trial power, including when the saved TFR
+is averaged. Stockwell obtains trial powers by transforming each trial separately.
+
+Masks are saved alongside the TFR in a `desc-tfrstats_mask.npz` derivative, with
+one channel × frequency × time mask per numeric `event_id` and a separate pooled
+mask for **All events**. The archive also stores the statistics settings and
+channel, frequency, and time coordinates. A saved result identifier prevents a
+mask from being applied to another computation. Replacing a TFR without running
+statistics removes its previous masks.
+
+In **Plot TFR**, **Use statistical mask** is available only when matching power
+statistics exist for the selected event. Nonsignificant heatmap values fade to
+25% opacity; opacity increases with the fraction of significant selected
+channels. The spectrum, time-power trace, and ROI mean use corrected channel
+power with nonsignificant contributions set to zero before averaging, retaining
+the full averaging denominator. The heatmap values and ERP traces are unchanged.
+Turn masking off to restore unmasked summaries. ITC never uses power masks.
 
 ### Evoked Plot Interactions
 

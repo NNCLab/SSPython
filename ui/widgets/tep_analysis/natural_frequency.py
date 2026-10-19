@@ -4,9 +4,9 @@ import logging
 import traceback
 from typing import List, Dict
 from tqdm import tqdm
-from statsmodels.stats.multitest import fdrcorrection
 from PySide6.QtWidgets import (
     QDialog,
+    QComboBox,
     QHBoxLayout,
     QSplitter,
     QFrame,
@@ -26,42 +26,9 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from ui.dialogs.sensor_selection_dialog import SensorSelectionDialog
 from ui.widgets.event_selection import EventSelector
 from utils import use_plot_style, Worker, parse_tuple
+from core.tfr_statistics import bootstrap_power
 
 logger = logging.getLogger(__name__)
-
-
-# --- Statistical Functions ---
-def bootstr2(
-    tf_data: np.ndarray,
-    basesamps: np.ndarray,
-    nperm: int = 1000,
-    ch_name: str = None,
-    verbose=True,
-) -> np.ndarray:
-    """bootstraps by shuffling temporal samples."""
-    n_trials, n_freqs, _ = np.shape(tf_data)
-    boots = np.zeros((nperm, n_freqs, 2))
-    x = np.zeros([n_trials, n_freqs, len(basesamps)])
-
-    pbar = tqdm(
-        range(nperm),
-        total=nperm,
-        desc=f"Running permutations{' for ' + ch_name if ch_name is not None else ''}...",
-        disable=not verbose,
-    )
-    for n in pbar:
-        for t in range(n_trials):
-            np.random.shuffle(basesamps)
-            x[t, :, :] = tf_data[t, :, basesamps].T
-
-        boots[n, :, 0] = np.max((np.mean(x, axis=0)), axis=1)
-        boots[n, :, 1] = np.min((np.mean(x, axis=0)), axis=1)
-
-    for f in range(n_freqs):
-        boots[:, f, 0] = np.sort(boots[:, f, 0])
-        boots[:, f, 1] = np.sort(boots[:, f, 1])
-
-    return boots
 
 
 def TFstat(
@@ -75,27 +42,11 @@ def TFstat(
     verbose=True,
 ) -> np.ndarray:
     """Compute statistical mask for time-frequency power representation."""
-    nTrials, nFreq, nTimes = TF_trials.shape
-    TF_avg = np.mean(TF_trials, axis=0)
-    baseline_idxs = np.where((times >= baseline[0]) & (times <= baseline[1]))[0]
-
-    boots = bootstr2(
-        TF_trials, baseline_idxs, nperm=n_permutations, verbose=verbose, ch_name=ch_name
-    )
-
-    pvals = np.zeros_like(TF_avg)
-    for f in range(nFreq):
-        for t in range(nTimes):
-            p1 = np.sum(boots[:, f, 0] >= TF_avg[f, t]) / n_permutations
-            p2 = np.sum(boots[:, f, 1] <= TF_avg[f, t]) / n_permutations
-            pvals[f, t] = min(p1, p2)
-
-    if fdr_correction:
-        rejected, pvals_corrected = fdrcorrection(pvals.ravel(), alpha=alpha / 2)
-        pvals = pvals_corrected.reshape(pvals.shape)
-
-    mask = (pvals < alpha).astype(int)
-    return mask
+    return bootstrap_power(
+        TF_trials[:, np.newaxis], times, baseline=baseline, alpha=alpha,
+        n_permutations=n_permutations, fdr_correction=fdr_correction,
+        verbose=verbose,
+    )[0]
 
 
 def calculate_nf_data(
@@ -106,13 +57,13 @@ def calculate_nf_data(
     baseline: List[float],
     response: List[float],
     n_permutations: int,
+    baseline_mode: str | None = "mean",
 ) -> Dict:
     """
     Calculates the natural frequency and returns all data required for plotting.
     MODIFIED to align with the logic of the provided class methods.
     """
     times = epochs.times
-    baseline_idx = np.where((times >= baseline[0]) & (times <= baseline[1]))[0]
 
     # 1. Compute TFR only on the selected ROI
     ep_roi = epochs.copy().pick(roi, verbose=False)
@@ -143,9 +94,10 @@ def calculate_nf_data(
         )
 
     avg_tfr = tfr.data.mean(axis=0)  # (n_channels, n_freqs, n_times)
-    avg_tfr -= avg_tfr[:, :, baseline_idx].mean(
-        axis=-1, keepdims=True
-    )  # baseline correction
+    if baseline_mode is not None:
+        avg_tfr = mne.baseline.rescale(
+            avg_tfr, times, baseline, mode=baseline_mode, copy=False, verbose=False,
+        )
 
     response_idx = np.where((times >= response[0]) & (times <= response[1]))[0]
     masked_tfr = avg_tfr * stat_mask  # (n_channels, n_freqs, n_times)
@@ -233,7 +185,18 @@ class NaturalFrequencyApp(QDialog):
         form_layout.addRow(self.roi_button)
         form_layout.addRow("Selected Channels:", self.channels_input)
 
-        self.baseline_input = QLineEdit("-500, -50")
+        start = max(float(self.epochs.times[0]), -0.5)
+        stop = min(float(self.epochs.times[-1]), -0.05)
+        if stop <= start:
+            start, stop = float(self.epochs.times[0]), float(self.epochs.times[-1])
+        self.baseline_input = QLineEdit(f"{start * 1000:g}, {stop * 1000:g}")
+        self.baseline_mode_combo = QComboBox()
+        self.baseline_mode_combo.addItems(["mean", "ratio", "logratio", "percent", "zscore", "zlogratio"])
+        self.baseline_mode_combo.addItem("None", None)
+        self.baseline_mode_combo.setToolTip(
+            "MNE baseline correction applied to mean trial power per channel. "
+            "The baseline interval is also required for statistics."
+        )
         self.response_input = QLineEdit("20, 120")
         self.freqs_input = QLineEdit("8, 45")
         self.n_cycles_input = QLineEdit("3.5")
@@ -241,6 +204,7 @@ class NaturalFrequencyApp(QDialog):
         self.n_perms_input = QLineEdit("500")
 
         form_layout.addRow("Baseline (ms):", self.baseline_input)
+        form_layout.addRow("Baseline correction:", self.baseline_mode_combo)
         form_layout.addRow("Response Window (ms):", self.response_input)
         form_layout.addRow("Frequencies (Hz):", self.freqs_input)
         form_layout.addRow("Morlet Cycles:", self.n_cycles_input)
@@ -293,6 +257,8 @@ class NaturalFrequencyApp(QDialog):
         self.response = parse_tuple(self.response_input.text(), scale=1e-3)
         self.fig_xlim = parse_tuple(self.fig_xlim_input.text(), scale=1e-3)
         self.n_permutations = int(self.n_perms_input.text())
+        self.baseline_mode = (None if self.baseline_mode_combo.currentText() == "None"
+                              else self.baseline_mode_combo.currentText())
 
         if (
             len(self.baseline) != 2
@@ -331,6 +297,7 @@ class NaturalFrequencyApp(QDialog):
             self.baseline,
             self.response,
             self.n_permutations,
+            self.baseline_mode,
         )
 
         nat_freq = data["nat_freq"]
@@ -423,7 +390,8 @@ class NaturalFrequencyApp(QDialog):
 
         divider = make_axes_locatable(ax_power)
         cax = divider.append_axes("right", size="5%", pad=0.1)
-        figure.colorbar(im, cax=cax, label="Power Change")
+        mode = self.baseline_mode or "uncorrected"
+        figure.colorbar(im, cax=cax, label=f"Power ({mode})")
 
     def _on_calculation_finished(self):
         logger.info("Calculation finished, received result. Now updating plot.")

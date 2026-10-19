@@ -26,6 +26,7 @@ from core.mne_compat import (
 )
 from core.processing import TMSEEGAnalysis
 from core.baseline import validate_baseline
+from core.tfr_statistics import compute_tfr_statistics, save_tfr_statistics
 from core.analysis_events import (
     compute_event_tfrs,
     event_label,
@@ -473,6 +474,7 @@ class ErpAnalysisPage(BasePage):
             self.tep.epochs,
             label=self.tep.label,
             tfr_derivatives=tfr_derivatives,
+            tfr_statistics={"Power (TFR)": self.tep.derivatives.get("tfr_statistics")},
             parent=self,
         )
         dialog.finished.connect(lambda: self._forget_time_frequency_dialog(dialog))
@@ -496,6 +498,7 @@ class ErpAnalysisPage(BasePage):
             return
 
         compute_params = dialog.get_compute_params()
+        statistics_params = dialog.get_statistics_params()
         event_code = dialog.event_selector.currentData()
         analysis = self.tep
 
@@ -506,7 +509,17 @@ class ErpAnalysisPage(BasePage):
             else:
                 tfr, itc = result, None
 
+            statistics = None if statistics_params is None else compute_tfr_statistics(
+                analysis.epochs, tfr, event_code=event_code,
+                compute_params=compute_params, settings=statistics_params,
+            )
+
             mne.time_frequency.write_tfrs(analysis.paths["tfr"], tfr, overwrite=True, verbose=False)
+            save_tfr_statistics(analysis.paths["tfr_statistics"], statistics)
+            analysis.derivatives["tfr_statistics"] = statistics
+            for key in ("tfr_mask", "itc_mask"):
+                analysis.paths[key].unlink(missing_ok=True)
+                analysis.derivatives[key] = None
             analysis.derivatives["tfr"] = tfr[0] if isinstance(tfr, list) else tfr
             analysis.derivatives.pop("tfr_events", None)
             if isinstance(tfr, list):

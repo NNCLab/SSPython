@@ -62,7 +62,7 @@ def compute_event_tfrs(epochs, *, event_code=None, **params):
     """Preserve condition averages alongside the pooled average and ITC."""
     selected = select_event_epochs(epochs, event_code)
     codes = [event_code]
-    if params.get("average", False) and event_code is None:
+    if (params.get("average", False) or params.get("method") == "stockwell") and event_code is None:
         options = event_options(selected)
         if len(options) > 1:
             codes.extend(code for code, _, _ in options)
