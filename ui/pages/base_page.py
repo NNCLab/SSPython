@@ -5,8 +5,10 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QLayout,
     QFrame,
+    QHBoxLayout,
 )
 from PySide6.QtCore import Qt
+from ui.widgets.layout_helpers import InspectionLink
 
 
 class BasePage(QWidget):
@@ -47,19 +49,23 @@ class BasePage(QWidget):
         self.header_frame = QFrame()
         self.header_frame.setObjectName("pageHeader")
         header_layout = QVBoxLayout(self.header_frame)
-        header_layout.setContentsMargins(18, 16, 18, 16)
-        header_layout.setSpacing(4)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(6)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
 
         self.title_label = QLabel(title)
         self.title_label.setObjectName("pageTitle")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        header_layout.addWidget(self.title_label)
+        title_row.addWidget(self.title_label, 1)
+        header_layout.addLayout(title_row)
 
-        self.subtitle_label = QLabel("")
+        self.subtitle_link = InspectionLink()
+        self.subtitle_label = self.subtitle_link.label
         self.subtitle_label.setObjectName("pageSubtitle")
         self.subtitle_label.setWordWrap(True)
-        self.subtitle_label.hide()
-        header_layout.addWidget(self.subtitle_label)
+        self.subtitle_link.hide()
+        header_layout.addWidget(self.subtitle_link)
 
         self.content_layout.addWidget(self.header_frame)
 
@@ -97,10 +103,10 @@ class BasePage(QWidget):
     def set_page_subtitle(self, subtitle: str | None):
         if subtitle:
             self.subtitle_label.setText(subtitle)
-            self.subtitle_label.show()
+            self.subtitle_link.show()
         else:
             self.subtitle_label.clear()
-            self.subtitle_label.hide()
+            self.subtitle_link.hide()
 
     def update_ui_state(self):
         """Updates the UI state. Can be overridden by subclasses."""

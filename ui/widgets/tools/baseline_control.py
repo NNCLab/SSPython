@@ -33,9 +33,7 @@ class BaselineControl(QWidget):
         self._resize_inputs()
 
     def _resize_inputs(self):
-        for spinbox in (self.interval.low_input, self.interval.high_input):
-            width = spinbox.fontMetrics().horizontalAdvance(spinbox.text()) + 32
-            spinbox.setMinimumWidth(max(104, width))
+        self.interval.adjust_spinbox_width()
 
     def _on_toggled(self, enabled):
         self.interval.setEnabled(enabled)

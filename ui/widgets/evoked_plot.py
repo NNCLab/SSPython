@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QDialog,
     QDialogButtonBox,
+    QToolButton,
 )
 from PySide6.QtCore import Qt, Signal, QSignalBlocker
 import time
@@ -136,7 +137,7 @@ class EvokedPlotWidget(QWidget):
         self.selected_channel_name = None
         self.open_topomaps = []
 
-        self.setMinimumSize(400, 500)
+        self.setMinimumSize(0, 430)
 
         self.init_ui()
         self.init_params()
@@ -145,6 +146,8 @@ class EvokedPlotWidget(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
 
         self.reference_widget = QRadioButton("Average Reference")
         self.event_label = QLabel("Event:")
@@ -167,19 +170,34 @@ class EvokedPlotWidget(QWidget):
         self.topbar.addWidget(spacer)
 
         self.title_label = QLabel("Waiting for data...")
+        self.title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
         self.canvas = MplCanvas(self, figsize=self.figsize, dpi=self.dpi)
         self.toolbar = NavigationToolbar(self.canvas, self)
 
-        self.topbar.addWidget(self.title_label)
+        self.title_label_action = self.topbar.addWidget(self.title_label)
+        self.baseline_toggle = QToolButton()
+        self.baseline_toggle.setText("Baseline")
+        self.baseline_toggle.setObjectName("plotOptionsToggle")
+        self.baseline_toggle.setCheckable(True)
+        self.baseline_toggle.setToolTip("Show baseline correction settings")
+        self.topbar.addWidget(self.baseline_toggle)
 
         layout.addWidget(self.topbar)
         self.baseline_control = BaselineControl(self)
         self.baseline_status_label = QLabel("Baseline: none")
         self.baseline_status_label.setWordWrap(True)
-        layout.addWidget(self.baseline_control)
-        layout.addWidget(self.baseline_status_label)
-        layout.addWidget(self.canvas)
+        self.baseline_options = QWidget()
+        baseline_layout = QVBoxLayout(self.baseline_options)
+        baseline_layout.setContentsMargins(0, 0, 0, 0)
+        baseline_layout.addWidget(self.baseline_control)
+        baseline_layout.addWidget(self.baseline_status_label)
+        self.baseline_options.hide()
+        self.baseline_toggle.toggled.connect(self.baseline_options.setVisible)
+        layout.addWidget(self.baseline_options)
+        self.canvas.setMinimumSize(0, 300)
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        layout.addWidget(self.canvas, 1)
         layout.addWidget(self.toolbar)
         self._set_event_selector_visible(False)
         self.channel_label_action.setVisible(False)
@@ -342,6 +360,7 @@ class EvokedPlotWidget(QWidget):
             if baseline is None:
                 status += " (already applied to data)"
         self.baseline_status_label.setText(f"Voltage baseline: {status}")
+        self.baseline_toggle.setToolTip(self.baseline_status_label.text())
         return display_evoked
 
     def _plot_display_evoked(self, evoked: mne.Evoked):
@@ -361,6 +380,8 @@ class EvokedPlotWidget(QWidget):
         axes.set_title("")
         axes.set_xlabel(f'Time ({self.params.get("time_unit", "ms")})')
         axes.set_ylabel(r"Amplitude ($\mu$V)")
+        # Keep tick labels and the time-axis caption inside compact plot areas.
+        self.canvas.figure.subplots_adjust(bottom=0.18)
         axes.margins(x=0.01)
         for spine in ("top", "right"):
             axes.spines[spine].set_visible(False)
@@ -721,6 +742,9 @@ class EvokedPlotWidget(QWidget):
 
         # Update the toolbar's colors (your existing utility function)
         update_toolbar_color(self.toolbar)
+
+    def refresh_theme(self):
+        self._render_current_view()
 
 
 class EvokedPlotDialog(QDialog):

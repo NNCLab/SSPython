@@ -22,7 +22,7 @@ from ui.widgets.preprocessing_widgets import (
     FilterContinuousWidget, PreprocessingSettingsWidget,
 )
 from ui.widgets.run_ica_widget import ICASettingsWidget
-from ui.widgets.workspace_panel import DatasetInspectorPanel
+from ui.widgets.dataset_files import DatasetFileController
 
 
 def signal_raw():
@@ -262,13 +262,13 @@ class TestAdvancedSettingsUI(unittest.TestCase):
         })
         dataset.paths["filtered_raw"].touch()
         dataset.paths["filter_input_raw"].touch()
-        panel = DatasetInspectorPanel()
+        panel = DatasetFileController()
         panel.current_dataset = dataset
         self.assertEqual(panel._existing_derivative_paths_from_stage("filtered_raw"), [
             dataset.paths["filtered_raw"], dataset.paths["filter_input_raw"],
         ])
         self.assertEqual(panel._existing_derivative_paths_from_stage("epochs"), [])
-        panel.close()
+        panel.deleteLater()
 
     def test_applying_filter_does_not_silently_save_defaults(self):
         processor = Mock()

@@ -39,7 +39,8 @@ from ui.widgets.preprocessing_widgets import (
     EpochingSettingsWidget,
     PreprocessingSettingsWidget,
 )
-from ui.widgets.workspace_panel import DatasetInspectorPanel, WorkspacePanel
+from ui.widgets.workspace_panel import WorkspacePanel
+from ui.widgets.dataset_files import DatasetFileController
 from ui.widgets.tools.conversion_tool import ConvertToolDialog, MergeToolDialog
 from ui.widgets.tools.export_tool import ExportFilesDialog
 from ui.widgets.tools.object_info_widget import (
@@ -965,7 +966,7 @@ class TestUI(unittest.TestCase):
         merge_dialog.close()
         window.close()
 
-    def test_dataset_inspector_deletes_selected_and_subsequent_derivatives(self):
+    def test_file_actions_delete_selected_and_subsequent_derivatives(self):
         app = QApplication.instance()
         if app is None:
             app = QApplication([])
@@ -1003,7 +1004,7 @@ class TestUI(unittest.TestCase):
                 paths=paths,
             )
 
-            panel = DatasetInspectorPanel()
+            panel = DatasetFileController()
             panel.set_dataset(dataset)
 
             released_paths = []
@@ -1037,7 +1038,7 @@ class TestUI(unittest.TestCase):
             self.assertFalse(paths["preprocessed"].exists())
             self.assertTrue(all(not path.exists() for path in analysis_paths.values()))
             self.assertEqual(panel._existing_derivative_paths_from_stage("raw"), [])
-            panel.close()
+            panel.deleteLater()
 
     def test_epoching_settings_preserve_selected_event_mapping(self):
         app = QApplication.instance()
@@ -1773,15 +1774,15 @@ class TestUI(unittest.TestCase):
             list(page._available_time_frequency_derivatives().keys()),
             ["Power (TFR)"],
         )
-        self.assertEqual(page.tf_button.text(), "Compute TFR")
-        self.assertEqual(page.time_frequency_button.text(), "Plot TFR")
+        self.assertEqual(page.tf_button.text(), "Compute time-frequency")
+        self.assertEqual(page.time_frequency_button.text(), "Plot time-frequency")
         self.assertIs(page.tf_button.parentWidget(), page.analysis_group)
         self.assertIs(page.time_frequency_button.parentWidget(), page.analysis_group)
 
         page.tep.derivatives = {"stc": object(), "stc_metadata": None}
         self.assertTrue(page._has_source_estimate_derivative())
-        self.assertEqual(page.stc_button.text(), "Compute STC")
-        self.assertEqual(page.source_estimate_button.text(), "Plot STC")
+        self.assertEqual(page.stc_button.text(), "Compute source estimate")
+        self.assertEqual(page.source_estimate_button.text(), "Plot source estimate")
         self.assertIs(page.stc_button.parentWidget(), page.analysis_group)
         self.assertIs(page.source_estimate_button.parentWidget(), page.analysis_group)
         page.close()

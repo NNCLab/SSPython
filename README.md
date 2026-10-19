@@ -8,7 +8,7 @@ The pipeline system is structured so future custom pipelines can define differen
 
 The software is currently in a pre-release stage. Validate all outputs before using them for publication, regulatory work, or clinical interpretation.
 
-> Figure Placeholder 1. Main application window showing the navigation sidebar, workspace panel, central analysis page, and derivative inspector.
+> Figure Placeholder 1. Main application window showing the navigation sidebar, workspace panel, and central analysis page.
 
 ## Table of Contents
 
@@ -270,12 +270,11 @@ If the merge selection is incompatible, conversion or concatenation will fail wi
 
 ## 9. Main Interface Overview
 
-The main UI is composed of four primary regions:
+The main UI is composed of three primary regions:
 
 - navigation sidebar
 - workspace panel
 - central page area
-- derivative inspector
 
 ### Navigation Sidebar
 
@@ -289,6 +288,16 @@ The sidebar provides access to:
 
 ### Workspace Panel
 
+The workspace browser stays visible on Home, Preprocessing, and Analysis,
+keeping the current project and selected dataset in view. Its width can be
+adjusted with the splitter. Navigation compacts to an icon rail on smaller
+windows; `Ctrl+B` expands or collapses it manually.
+Dataset rows show the exact filename stem and wrap long names to keep them
+visible. File extensions are omitted from labels, including `.fif.gz`; full
+filenames and paths remain available in tooltips. Analysis identifies the
+actual preprocessed input. Home offers recent workspaces and
+a context-sensitive action to continue preprocessing or open Analysis.
+
 The workspace panel:
 
 - opens a workspace folder
@@ -297,9 +306,15 @@ The workspace panel:
 - shows per-dataset progress
 - emits the currently selected dataset to the active analysis page
 
-### Derivative Inspector
+### File Information
 
-The derivative inspector shows the current dataset's stage-by-stage status and allows stage objects to be inspected.
+Click a saved preprocessing step's name or its ⓘ button to inspect that file.
+The input filename on Analysis and the filenames above preprocessing previews
+open the same information dialog. The dialog shows the exact filename stem,
+full path, metadata, and processing history, with actions to open the file
+location or delete that step and its dependent derivatives after confirmation.
+Source recordings and analysis-only inputs cannot be deleted through this action.
+Pending and skipped steps keep their status labels without offering file inspection.
 
 ## 10. Preprocessing Workflow
 
@@ -310,6 +325,14 @@ It organizes work into three sections:
 - Continuous Processing
 - Epoching and ICA
 - Preprocessed Output
+
+All stage operations are visible in flat rows, grouped by continuous processing,
+epoching and ICA, and final output. Run an available operation directly with one
+click; status labels identify saved, skipped, and pending stages. Metadata and
+derivative inspection are available directly from saved step names. Available previews appear below
+the operations and identify the derivative filename stem. **Open Analysis**
+appears above the workflow when a final output exists. Before selecting a
+recording, the page offers workspace selection and EEG conversion actions.
 
 > Figure Placeholder 3. Preprocessing page showing workflow stages, object summaries, and the evoked preview widget for the current dataset.
 
@@ -407,6 +430,12 @@ It is enabled when a dataset has reached the `preprocessed` stage or when a matc
 
 ### Visualization Tools
 
+Analysis displays a compact dataset summary above the evoked plot. The plot's
+**Baseline** button reveals display-baseline controls without changing their
+values when collapsed. All visualization and analysis operations are visible
+in the **Analysis tools** toolbar above the plot. Event selection and the
+original data are preserved when toggling derivative details.
+
 - evoked plot
 - topoplot button
 - Plot PSD button with user-facing `mne.Epochs.plot_psd` parameters
@@ -495,6 +524,12 @@ produce a validation error instead of silently selecting another reference.
 
 ## 12. Real-Time Visualization
 
+The setup page has separate **Live stream** and **Play from file** tabs.
+Connection and MNE Info controls remain visible in the live tab; expand
+**Plotting and preprocessing settings** for signal processing, SNR, and refresh
+options. Collapsing these settings or switching tabs preserves their values.
+The summary above the controls identifies active preprocessing settings.
+
 The real-time page wraps [RealTimeMainWidget](/C:/Users/DW60ZF/Documents/SSPython/ui/widgets/real_time_widget.py), which provides:
 
 - connection settings
@@ -522,6 +557,10 @@ The live visualizer contains grouped views for:
 Real-time settings are persisted through the preferences system.
 
 ## 13. Preferences and Persistent Settings
+
+Choose a category from the persistent category list. Each category scrolls
+independently, and **Save Changes**, **Reload Saved**, and **Reset Settings**
+remain in the footer. Switching categories preserves unsaved edits.
 
 The preferences page is implemented in [preferences_page.py](/C:/Users/DW60ZF/Documents/SSPython/ui/pages/preferences_page.py).
 

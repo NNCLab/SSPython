@@ -6,7 +6,8 @@ class RealTimePage(BasePage):
     """The page for real-time data collection and monitoring."""
 
     def __init__(self, parent=None):
-        super().__init__("Real-time Data Visualization", parent)
+        super().__init__("Real-Time", parent)
+        self.set_page_subtitle("Connect to a live EEG stream or play a recording as an LSL stream.")
         self.set_content_maximum_width(1200)
         self.widget = RealTimeMainWidget(self)
         self.add_content(self.widget)

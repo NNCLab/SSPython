@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import gc
 from pathlib import Path
-from PySide6.QtCore import Qt, Signal, QSize, QUrl
-from PySide6.QtGui import QDesktopServices, QFontMetrics, QPainter
+from PySide6.QtCore import QEvent, QTimer, Qt, Signal, QSize
+from PySide6.QtGui import QFontMetrics, QPainter
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -12,12 +11,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
-    QMenu,
     QProgressBar,
     QPushButton,
-    QSizePolicy,
-    QSplitter,
     QStyle,
     QStyleOptionProgressBar,
     QVBoxLayout,
@@ -30,9 +25,8 @@ from core.pipelines import (
     discover_analysis_datasets,
     discover_datasets,
 )
-from ui.widgets.tools.object_info_widget import ObjectDetailsDialog
-from ui.widgets.tools.stage_io import load_stage_object
-from utils import Worker, themed_svg_icon
+from ui.widgets.layout_helpers import FilenameLabel, dataset_label
+from utils import themed_svg_icon
 
 
 def display_name_for_path(path: Path | None, *, strip_extensions: bool = True) -> str:
@@ -80,6 +74,8 @@ class DatasetProgressBar(QProgressBar):
 
         painter = QPainter(self)
         self.style().drawControl(QStyle.ControlElement.CE_ProgressBar, option, painter, self)
+        if self.property("compact"):
+            return
 
         label = QFontMetrics(self.font()).elidedText(
             self.dataset.display_name,
@@ -107,10 +103,20 @@ class DatasetListItemWidget(QFrame):
         self.progress_bar = DatasetProgressBar(
             dataset, self, display_path=display_path
         )
+        self.progress_bar.setProperty("compact", True)
+        self.progress_bar.setMinimumHeight(3)
+        self.progress_bar.setMaximumHeight(3)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(5)
+        self.title_label = FilenameLabel(dataset_label(dataset, path=display_path))
+        self.title_label.setObjectName("datasetTitle")
+        self.title_label.setToolTip(str(display_path or dataset.source_path))
+        layout.addWidget(self.title_label)
+        status = QLabel("Ready for analysis" if dataset.stage_exists(dataset.pipeline.analysis_ready_stage) else dataset.status_text())
+        status.setObjectName("mutedLabel")
+        layout.addWidget(status)
         layout.addWidget(self.progress_bar)
 
     def set_selected(self, selected: bool):
@@ -121,156 +127,34 @@ class DatasetListItemWidget(QFrame):
         self.update()
 
 
-class DiscreteProgressWidget(QWidget):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.segment_layout = QHBoxLayout(self)
-        self.segment_layout.setContentsMargins(0, 0, 0, 0)
-        self.segment_layout.setSpacing(4)
+class DatasetListWidget(QListWidget):
+    """Keep each complete filename visible as the dataset browser is resized."""
 
-    def set_dataset(self, dataset: DatasetRecord | None):
-        while self.segment_layout.count():
-            item = self.segment_layout.takeAt(0)
-            widget = item.widget()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.viewport().installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if watched is self.viewport() and event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0, self.update_row_heights)
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_row_heights()
+
+    def update_row_heights(self):
+        for index in range(self.count()):
+            item = self.item(index)
+            widget = self.itemWidget(item)
             if widget is not None:
-                widget.deleteLater()
-
-        if dataset is None:
-            return
-
-        for stage in dataset.pipeline.stages:
-            segment = QFrame()
-            segment.setObjectName("progressSegment")
-            status = dataset.stage_status(stage.id)
-            segment.setProperty("state", status)
-            segment.setToolTip(
-                str(dataset.paths[stage.id]) if status == "complete" else f"{stage.label}\n{stage.description}"
-            )
-            segment.setMinimumHeight(8)
-            self.segment_layout.addWidget(segment, 1)
-
-
-class StageStatusRow(QFrame):
-    activated = Signal(str)
-    context_requested = Signal(str, object)
-
-    def __init__(
-        self,
-        dataset: DatasetRecord,
-        stage_id: str,
-        title: str,
-        detail_text: str,
-        detail_tooltip: str,
-        *,
-        optional: bool,
-        state: str,
-        parent: QWidget | None = None,
-    ):
-        super().__init__(parent)
-        self.stage_id = stage_id
-        self.setObjectName("stageStatusRow")
-        self.setProperty("state", state)
-        self.setProperty("interactive", True)
-        self.setToolTip(detail_tooltip)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        row_layout = QVBoxLayout(self)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(4)
-
-        header_row = QHBoxLayout()
-        header_row.setContentsMargins(0, 0, 0, 0)
-        header_row.setSpacing(8)
-
-        bullet = QFrame()
-        bullet.setObjectName("stageDot")
-        bullet.setProperty("state", state)
-        bullet.setFixedSize(8, 8)
-        bullet.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        header_row.addWidget(bullet, 0, Qt.AlignmentFlag.AlignVCenter)
-
-        title_label = QLabel(title)
-        title_label.setObjectName("stageStatusLabel")
-        title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        header_row.addWidget(title_label, 1)
-
-        if optional:
-            optional_tag = QLabel("Optional")
-            optional_tag.setObjectName("optionalTag")
-            optional_tag.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            header_row.addWidget(optional_tag, 0, Qt.AlignmentFlag.AlignRight)
-
-        detail_label = QLabel(detail_text)
-        detail_label.setObjectName("mutedLabel")
-        detail_label.setWordWrap(True)
-        detail_label.setToolTip(detail_tooltip)
-        detail_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-
-        row_layout.addLayout(header_row)
-        row_layout.addWidget(detail_label)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.activated.emit(self.stage_id)
-        super().mousePressEvent(event)
-
-    def contextMenuEvent(self, event):
-        self.context_requested.emit(self.stage_id, event.globalPos())
-        event.accept()
-
-
-class StageStatusList(QFrame):
-    stage_clicked = Signal(str)
-    stage_context_requested = Signal(str, object)
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setObjectName("stageStatusList")
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(0, 0, 0, 0)
-        self.main_layout.setSpacing(6)
-
-    def set_dataset(self, dataset: DatasetRecord | None):
-        while self.main_layout.count():
-            item = self.main_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-
-        if dataset is None:
-            placeholder = QLabel("Select a dataset to inspect its derivatives.")
-            placeholder.setObjectName("mutedLabel")
-            placeholder.setWordWrap(True)
-            self.main_layout.addWidget(placeholder)
-            return
-
-        for stage in dataset.pipeline.stages:
-            status = dataset.stage_status(stage.id)
-            if status == "complete":
-                detail_text = dataset.display_file_name(stage.id)
-                detail_tooltip = str(dataset.paths[stage.id])
-            elif status == "skipped":
-                detail_text = "Skipped"
-                detail_tooltip = stage.description
-            else:
-                detail_text = "Pending"
-                detail_tooltip = stage.description
-
-            row = StageStatusRow(
-                dataset,
-                stage.id,
-                stage.label,
-                detail_text,
-                detail_tooltip,
-                optional=stage.optional,
-                state=status,
-                parent=self,
-            )
-            row.activated.connect(self.stage_clicked)
-            row.context_requested.connect(self.stage_context_requested)
-            self.main_layout.addWidget(row)
-
-        self.main_layout.addStretch()
+                widget.ensurePolished()
+                widget.layout().invalidate()
+                height = widget.layout().totalHeightForWidth(max(1, self.viewport().width() - 4))
+                item_margins = max(0, self.visualItemRect(item).height() - widget.height())
+                size = QSize(0, max(78, height + item_margins))
+                if size != item.sizeHint():
+                    item.setSizeHint(size)
 
 
 class WorkspacePanel(QFrame):
@@ -315,7 +199,7 @@ class WorkspacePanel(QFrame):
         layout.addLayout(controls_row)
 
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("Filter datasets, subject IDs, or runs")
+        self.filter_edit.setPlaceholderText("Find a dataset…")
         layout.addWidget(self.filter_edit)
 
         hbox = QHBoxLayout()
@@ -331,7 +215,7 @@ class WorkspacePanel(QFrame):
         hbox.addWidget(self.count_label)
         layout.addLayout(hbox)
 
-        self.list_widget = QListWidget()
+        self.list_widget = DatasetListWidget()
         self.list_widget.setObjectName("workspaceList")
         layout.addWidget(self.list_widget, 1)
 
@@ -422,7 +306,7 @@ class WorkspacePanel(QFrame):
 
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, dataset)
-            item.setSizeHint(QSize(0, 40))
+            item.setSizeHint(QSize(0, 78))
             self.list_widget.addItem(item)
             self.list_widget.setItemWidget(
                 item, DatasetListItemWidget(dataset, display_path=catalog_path)
@@ -430,6 +314,7 @@ class WorkspacePanel(QFrame):
             visible_count += 1
 
         self.count_label.setText(f"({visible_count} file{'s' if visible_count != 1 else ''})")
+        self.list_widget.update_row_heights()
         self.list_widget.blockSignals(False)
 
         if visible_count == 0:
@@ -459,345 +344,3 @@ class WorkspacePanel(QFrame):
     def _set_current_dataset(self, dataset: DatasetRecord | None):
         self.current_dataset = dataset
         self.dataset_selected.emit(dataset)
-
-
-class DatasetInspectorPanel(QFrame):
-    derivatives_about_to_be_deleted = Signal(object)
-    derivatives_changed = Signal()
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setObjectName("inspectorPanel")
-        self.current_dataset: DatasetRecord | None = None
-        self.collapsed = False
-        self.responsive_collapsed = False
-        self.expanded_width = 300
-        self.collapsed_width = 40
-        self._last_expanded_width = self.expanded_width
-        self._build_ui()
-        self._apply_collapsed_state(animated=False)
-
-    def _build_ui(self):
-        self.root_layout = QVBoxLayout(self)
-        self.root_layout.setContentsMargins(10, 18, 10, 18)
-        self.root_layout.setSpacing(10)
-
-        header_row = QHBoxLayout()
-        header_row.setContentsMargins(0, 0, 0, 0)
-        header_row.setSpacing(8)
-
-        self.title_label = QLabel("Derivatives")
-        self.title_label.setObjectName("panelTitle")
-        header_row.addWidget(self.title_label, 1)
-
-        self.toggle_button = QPushButton("")
-        self.toggle_button.setObjectName("inspectorToggle")
-        self.toggle_button.setSizePolicy(
-            QSizePolicy.Policy.Fixed,
-            QSizePolicy.Policy.Fixed,
-        )
-        self.toggle_button.clicked.connect(self.toggle_collapsed)
-        header_row.addWidget(self.toggle_button)
-        self.root_layout.addLayout(header_row, 0)
-
-        self.content_container = QWidget()
-        content_layout = QVBoxLayout(self.content_container)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(10)
-
-        self.progress_caption = QLabel("Pipeline progress")
-        self.progress_caption.setObjectName("mutedLabel")
-        content_layout.addWidget(self.progress_caption)
-
-        self.progress_widget = DiscreteProgressWidget()
-        content_layout.addWidget(self.progress_widget)
-
-        self.stage_status_list = StageStatusList()
-        self.stage_status_list.stage_clicked.connect(self._open_stage_details)
-        self.stage_status_list.stage_context_requested.connect(self._show_stage_context_menu)
-        content_layout.addWidget(self.stage_status_list, 1)
-
-        self.root_layout.addWidget(self.content_container, 1)
-        self.refresh_icons()
-
-    def refresh_icons(self):
-        self.toggle_button.setIcon(themed_svg_icon("assets/icons/menu.svg", size=20))
-        self.toggle_button.setIconSize(QSize(20, 20))
-        self.toggle_button.setObjectName("inspectorToggle")
-
-    def toggle_collapsed(self):
-        if self.responsive_collapsed:
-            self.responsive_collapsed = False
-            self.collapsed = False
-        else:
-            self.collapsed = not self.collapsed
-        self._apply_collapsed_state(animated=True)
-
-    def set_responsive_collapsed(self, collapsed: bool):
-        """Temporarily compact the inspector without changing the saved choice."""
-        if self.responsive_collapsed == collapsed:
-            return
-        self.responsive_collapsed = collapsed
-        self._apply_collapsed_state(animated=False)
-
-    def _apply_collapsed_state(self, *, animated: bool):
-        effective_collapsed = self.collapsed or self.responsive_collapsed
-        self.content_container.setVisible(not effective_collapsed)
-        self.title_label.setVisible(not effective_collapsed)
-        self.toggle_button.setProperty("collapsed", effective_collapsed)
-        self.toggle_button.setToolTip(
-            "Expand derivative inspector"
-            if effective_collapsed
-            else "Collapse derivative inspector"
-        )
-
-        if effective_collapsed:
-            if self.width() > self.collapsed_width:
-                self._last_expanded_width = min(420, max(220, self.width()))
-            self.root_layout.setContentsMargins(3, 0, 3, 0)
-            self.root_layout.setSpacing(0)
-            self.root_layout.setStretch(0, 1)
-            self.root_layout.setStretch(1, 0)
-            self.toggle_button.setSizePolicy(
-                QSizePolicy.Policy.Expanding,
-                QSizePolicy.Policy.Expanding,
-            )
-            self.setMinimumWidth(self.collapsed_width)
-            self.setMaximumWidth(self.collapsed_width)
-            self._set_splitter_width(self.collapsed_width)
-        else:
-            self.root_layout.setContentsMargins(10, 18, 10, 18)
-            self.root_layout.setSpacing(10)
-            self.root_layout.setStretch(0, 0)
-            self.root_layout.setStretch(1, 1)
-            self.toggle_button.setSizePolicy(
-                QSizePolicy.Policy.Fixed,
-                QSizePolicy.Policy.Fixed,
-            )
-            self.setMinimumWidth(220)
-            self.setMaximumWidth(420)
-            self._set_splitter_width(self._last_expanded_width)
-
-        self.toggle_button.style().unpolish(self.toggle_button)
-        self.toggle_button.style().polish(self.toggle_button)
-
-    def _set_splitter_width(self, target_width: int):
-        splitter = self.parentWidget()
-        if not isinstance(splitter, QSplitter):
-            self.resize(target_width, self.height())
-            return
-
-        panel_index = splitter.indexOf(self)
-        if panel_index < 0:
-            return
-
-        sizes = splitter.sizes()
-        if panel_index >= len(sizes):
-            return
-
-        current_width = sizes[panel_index]
-        target_width = max(0, int(target_width))
-        reclaimed_width = current_width - target_width
-        sizes[panel_index] = target_width
-
-        content_index = panel_index - 1 if panel_index > 0 else panel_index + 1
-        if 0 <= content_index < len(sizes):
-            sizes[content_index] = max(1, sizes[content_index] + reclaimed_width)
-        splitter.setSizes(sizes)
-
-    def set_dataset(self, dataset: DatasetRecord | None):
-        self.current_dataset = dataset
-
-        if dataset is None:
-            self.progress_widget.set_dataset(None)
-            self.stage_status_list.set_dataset(None)
-            return
-        self.progress_widget.set_dataset(dataset)
-        self.stage_status_list.set_dataset(dataset)
-
-    def _open_stage_details(self, stage_id: str):
-        if self.current_dataset is None:
-            return
-
-        stage = self.current_dataset.stage_definition(stage_id)
-        status = self.current_dataset.stage_status(stage_id)
-
-        if status != "complete":
-            dialog = ObjectDetailsDialog(
-                stage.label,
-                None,
-                status_text=status.capitalize(),
-                description=stage.description,
-                parent=self,
-            )
-            dialog.exec()
-            return
-
-        stage_path = self.current_dataset.paths[stage_id]
-        try:
-            worker = Worker(
-                lambda: load_stage_object(stage_id, stage_path, stage.data_kind),
-                parent=self,
-                add_loggers="mne",
-            )
-            mne_object = worker.exec_with_dialog(
-                "Loading derivative",
-                f"Loading {stage.label.lower()}...",
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Unable to load derivative", str(exc))
-            return
-
-        dialog = ObjectDetailsDialog(
-            stage.label,
-            mne_object,
-            file_path=str(stage_path),
-            status_text="Saved",
-            description=stage.description,
-            parent=self,
-        )
-        try:
-            dialog.exec()
-        finally:
-            # A parented Qt dialog can survive after exec() returns. Explicitly
-            # remove its MNE reference so EpochsFIF finalizers close their FIFs.
-            dialog.release_object()
-            dialog.deleteLater()
-            worker._result = None
-            worker.deleteLater()
-            del mne_object
-            gc.collect()
-
-    def _show_stage_context_menu(self, stage_id: str, global_pos):
-        if self.current_dataset is None:
-            return
-
-        stage_path = self.current_dataset.paths.get(stage_id)
-        if stage_path is None or not stage_path.exists():
-            return
-
-        menu = QMenu(self)
-        open_location_action = menu.addAction("Open File Location")
-
-        delete_paths = self._existing_derivative_paths_from_stage(stage_id)
-        delete_action = menu.addAction("Delete This and Subsequent Derivatives")
-        delete_action.setEnabled(bool(delete_paths))
-
-        selected_action = menu.exec(global_pos)
-        if selected_action == open_location_action:
-            self._open_file_location(stage_path)
-        elif selected_action == delete_action:
-            self._confirm_and_delete_derivatives(stage_id)
-
-    def _open_file_location(self, file_path: Path):
-        location = file_path.parent if file_path.is_file() else file_path
-        if not location.exists():
-            QMessageBox.warning(
-                self,
-                "Location not found",
-                f"The file location does not exist:\n{location}",
-            )
-            return
-
-        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(location)))
-        if not opened:
-            QMessageBox.warning(
-                self,
-                "Unable to open location",
-                f"Could not open the file location:\n{location}",
-            )
-
-    def _existing_derivative_paths_from_stage(self, stage_id: str) -> list[Path]:
-        if self.current_dataset is None or stage_id == "raw":
-            return []
-        if self.current_dataset.is_analysis_only:
-            return []
-
-        try:
-            start_index = self.current_dataset.pipeline.stage_index(stage_id)
-        except ValueError:
-            return []
-
-        paths: list[Path] = []
-        for stage in self.current_dataset.pipeline.stages[start_index:]:
-            if stage.id == "raw":
-                continue
-            path = self.current_dataset.paths.get(stage.id)
-            if path is not None and path.exists() and path.is_file():
-                paths.append(path)
-            if stage.id == "filtered_raw":
-                checkpoint = self.current_dataset.paths.get("filter_input_raw")
-                if checkpoint is not None and checkpoint.is_file():
-                    paths.append(checkpoint)
-
-        try:
-            analysis_ready_index = self.current_dataset.pipeline.stage_index(
-                self.current_dataset.pipeline.analysis_ready_stage
-            )
-        except ValueError:
-            analysis_ready_index = -1
-        if start_index <= analysis_ready_index:
-            paths.extend(
-                path
-                for path in self.current_dataset.analysis_paths.values()
-                if path.exists() and path.is_file()
-            )
-        return paths
-
-    def _confirm_and_delete_derivatives(self, stage_id: str):
-        delete_paths = self._existing_derivative_paths_from_stage(stage_id)
-        if not delete_paths:
-            return
-
-        stage = self.current_dataset.stage_definition(stage_id) if self.current_dataset else None
-        stage_label = stage.label if stage else "selected stage"
-        file_word = "file" if len(delete_paths) == 1 else "files"
-        preview = "\n".join(path.name for path in delete_paths[:5])
-        if len(delete_paths) > 5:
-            preview += f"\n...and {len(delete_paths) - 5} more"
-
-        message_box = QMessageBox(self)
-        message_box.setIcon(QMessageBox.Icon.Warning)
-        message_box.setWindowTitle("Delete derivatives?")
-        message_box.setText(
-            f"Delete {len(delete_paths)} derivative {file_word} from {stage_label} onward?"
-        )
-        message_box.setInformativeText(
-            f"{preview}\n\nThis cannot be undone."
-        )
-        message_box.setDetailedText("\n".join(str(path) for path in delete_paths))
-        delete_button = message_box.addButton("Delete", QMessageBox.ButtonRole.DestructiveRole)
-        cancel_button = message_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        message_box.setDefaultButton(cancel_button)
-        message_box.exec()
-
-        if message_box.clickedButton() != delete_button:
-            return
-
-        errors = self._delete_derivative_paths(delete_paths)
-        self.set_dataset(self.current_dataset)
-        self.derivatives_changed.emit()
-
-        if errors:
-            error_text = "\n".join(f"{path}: {error}" for path, error in errors)
-            QMessageBox.warning(
-                self,
-                "Unable to delete some derivatives",
-                error_text,
-            )
-
-    def _delete_derivative_paths(self, delete_paths: list[Path]) -> list[tuple[Path, str]]:
-        # This direct signal gives pages a chance to release cached MNE readers
-        # before Windows enforces its mandatory file locks.
-        self.derivatives_about_to_be_deleted.emit(tuple(delete_paths))
-        gc.collect()
-
-        errors: list[tuple[Path, str]] = []
-        for path in delete_paths:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                errors.append((path, str(exc)))
-        return errors

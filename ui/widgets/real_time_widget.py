@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QScrollArea,
     QSizePolicy,
+    QTabWidget,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QSettings, Slot
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -40,6 +41,7 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 from matplotlib.figure import Figure
 from shiboken6 import isValid
 from .tools.optional_range_widget import OptionalRangeWidget
+from .tools.advanced_settings import AdvancedSettings
 from .real_time_plot_docks import ChannelLayoutDock, EvokedButterflyDock, MEPDock, RawMonitorDock
 from scipy import signal
 from scipy.spatial import distance
@@ -953,6 +955,7 @@ class PlayerWidget(QWidget):
 
     def setup_ui(self):
         layout = QFormLayout(self)
+        layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         layout.setVerticalSpacing(8)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         
@@ -1083,6 +1086,7 @@ class ConnectionWidget(QWidget):
         # --- Connection Group ---
         conn_group_box = QGroupBox("Connection Settings")
         form_layout = QFormLayout(conn_group_box)
+        form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         form_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
@@ -1102,6 +1106,7 @@ class ConnectionWidget(QWidget):
         self.info_edit.setReadOnly(True)
         self.select_info_button = QPushButton("Select Info Source")
         self.find_channels_button = QPushButton("Find Info from Stream")
+        self.find_channels_button.setObjectName("secondaryButton")
         form_layout.addRow("Stream Name:", self.stream_name_input)
         form_layout.addRow("Stream Duration (s):", self.stream_duration_input)
         form_layout.addRow("Epoching (t_start, t_end):", self.tlim_input)
@@ -1415,6 +1420,7 @@ class RealTimeSettingsWidget(QWidget):
         main_layout.addWidget(group_box)
 
         form_layout = QFormLayout(group_box)
+        form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         form_layout.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
         )
@@ -1427,7 +1433,9 @@ class RealTimeSettingsWidget(QWidget):
         self.refresh_rate_input.setRange(1, 60)
         form_layout.addRow("Refresh Rate:", self.refresh_rate_input)
 
-        form_layout.addRow(QLabel("<br><b>Butterfly SNR</b>"))
+        snr_title = QLabel("Butterfly SNR")
+        snr_title.setObjectName("panelSubtitle")
+        form_layout.addRow(snr_title)
 
         self.snr_baseline_input = OptionalRangeWidget(
             ("Start:", "End:"),
@@ -1451,7 +1459,9 @@ class RealTimeSettingsWidget(QWidget):
         form_layout.addRow("Baseline RMS:", self.snr_baseline_input)
         form_layout.addRow("Response RMS:", self.snr_response_input)
 
-        form_layout.addRow(QLabel("<br><b>Real-Time Pre-processing</b>"))
+        processing_title = QLabel("Real-Time Preprocessing")
+        processing_title.setObjectName("panelSubtitle")
+        form_layout.addRow(processing_title)
 
         self.art_rem_input = OptionalRangeWidget(
             ("Start:", "End:"),
@@ -3725,7 +3735,7 @@ class RealTimeMainWidget(QWidget):
         """Sets up the UI for the main widget."""
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        main_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.setMinimumWidth(0)
 
         self.main_container = QWidget()
@@ -3739,6 +3749,8 @@ class RealTimeMainWidget(QWidget):
         self.plot_settings_widget.settingsChanged.connect(self._forward_plot_settings)
         # self.plot_settings_widget.setMaximumWidth(420)
         self.player_widget = PlayerWidget()
+        self.source_tabs = QTabWidget()
+        self.source_tabs.setObjectName("sourceTabs")
 
         live_card = self._build_card("Connect to Live Stream")
         live_layout = live_card.layout()
@@ -3748,6 +3760,15 @@ class RealTimeMainWidget(QWidget):
         live_help.setObjectName("mutedLabel")
         live_help.setWordWrap(True)
         live_layout.addWidget(live_help)
+        self.processing_summary = QLabel()
+        self.processing_summary.setObjectName("mutedLabel")
+        self.processing_summary.setWordWrap(True)
+        live_layout.addWidget(self.processing_summary)
+        self.advanced_settings = AdvancedSettings("Plotting and preprocessing settings")
+        self.advanced_settings.form.setContentsMargins(0, 8, 0, 0)
+        self.advanced_settings.form.addRow(self.plot_settings_widget)
+        self.plot_settings_widget.settingsChanged.connect(self._update_processing_summary)
+        self._update_processing_summary(self.plot_settings_widget.get_settings())
 
         self.config_row = QHBoxLayout()
         self.config_row.setContentsMargins(0, 0, 0, 0)
@@ -3755,7 +3776,7 @@ class RealTimeMainWidget(QWidget):
         self.config_row.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.config_row.addWidget(self.connection_widget, 2)
         self.config_row.addWidget(
-            self.plot_settings_widget,
+            self.advanced_settings,
             1,
             Qt.AlignmentFlag.AlignTop,
         )
@@ -3768,17 +3789,30 @@ class RealTimeMainWidget(QWidget):
 
         launch_row = QHBoxLayout()
         launch_row.setContentsMargins(0, 4, 0, 0)
-        launch_row.addStretch(1)
         launch_row.addWidget(self.launch_button)
         launch_row.addStretch(1)
         live_layout.addLayout(launch_row)
-        layout.addWidget(live_card)
+        self.source_tabs.addTab(live_card, "Live stream")
 
         file_card = self._build_card("Play from File")
         file_card.layout().addWidget(self.player_widget, 0, Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(file_card)
+        self.source_tabs.addTab(file_card, "Play from file")
+        layout.addWidget(self.source_tabs)
         layout.addStretch()
-        main_layout.addWidget(self.main_container, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        main_layout.addWidget(self.main_container)
+
+    def _update_processing_summary(self, params):
+        reference = "Average reference" if params.get("reference") == "average" else "No re-reference"
+        filters = []
+        artifact = params.get("art_rem")
+        if artifact and all(value is not None for value in artifact):
+            filters.append(f"Artifact interpolation {artifact[0] * 1000:g} to {artifact[1] * 1000:g} ms")
+        if params.get("apply_bandpass"):
+            filters.append(f"Bandpass {params.get('bandpass_range')} Hz")
+        if params.get("apply_notch"):
+            filters.append(f"Notch {params.get('notch_freqs')} Hz")
+        amplitude = "µV" if params.get("amplitude_scale") == 1e-6 else "V"
+        self.processing_summary.setText(" · ".join([reference, f"Input {amplitude}", f"Refresh {params.get('refresh_rate')} Hz", *filters]))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

@@ -11,13 +11,12 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
+    QWidget,
 )
 
 from core.mne_compat import (
@@ -47,6 +46,7 @@ from ui.widgets.source_estimate_widget import (
 )
 from ui.widgets.time_frequency_widget import ComputeTFRSettingsDialog, TimeFrequencyDialog
 from ui.widgets.tools.object_info_widget import ObjectInfoWidget
+from ui.widgets.layout_helpers import FlowLayout, dataset_label
 from utils import Worker
 
 from .base_page import BasePage
@@ -124,6 +124,7 @@ class ErpAnalysisPage(BasePage):
         super().__init__("Analysis", parent)
         self.set_content_maximum_width(1360)
         self.main_window = parent
+        self.subtitle_link.activated.connect(self._inspect_input)
         self.current_dataset = None
         self.tep: TMSEEGAnalysis | None = None
         self._needs_reload = False
@@ -135,29 +136,51 @@ class ErpAnalysisPage(BasePage):
         self.context_label.setObjectName("contextCard")
         self.context_label.setWordWrap(True)
         self.add_content(self.context_label)
+        self.select_input_button = QPushButton("Open workspace")
+        self.select_input_button.clicked.connect(self._select_input)
+        empty_actions = FlowLayout()
+        empty_actions.addWidget(self.select_input_button)
+        self.add_content(empty_actions)
 
-        self.epochs_info_widget = ObjectInfoWidget()
+        self.epochs_info_widget = ObjectInfoWidget(compact=True)
+        self.add_content(self.epochs_info_widget)
         self.visualization_group = self._create_visualization_group()
         self.analysis_group = self._create_analysis_group()
 
-        self.visualization_title = QLabel("Visualization")
-        self.visualization_title.setObjectName("sectionTitle")
-        self.add_content(self.visualization_title)
-        self.add_content(self.visualization_group)
-        self.analysis_title = QLabel("Analysis methods")
-        self.analysis_title.setObjectName("sectionTitle")
-        self.add_content(self.analysis_title)
         self.add_content(self.analysis_group)
+        self.add_content(self.visualization_group)
+        self.content_layout.setStretch(self.content_layout.indexOf(self.visualization_group), 1)
+        self.content_layout.setStretch(self.content_layout.count() - 1, 0)
+        self.evoked_plot_widget.canvas.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Ignored,
+        )
 
         self._connect_to_main_window()
         self.update_ui_state()
 
-    def _create_visualization_group(self) -> QGroupBox:
-        group = QGroupBox()
+    def _inspect_input(self):
+        if self.main_window and self.current_dataset and self.current_dataset.stage_exists("preprocessed"):
+            self.main_window.inspect_dataset_stage("preprocessed")
+
+    def _select_input(self):
+        if not self.main_window:
+            return
+        if not self.main_window.current_folder:
+            self.main_window.workspace_panel.select_folder()
+        elif not self.main_window.workspace_panel.datasets:
+            self.main_window.navigate_to_page("Preprocessing")
+        else:
+            self.main_window.focus_workspace()
+
+    def _create_visualization_group(self) -> QWidget:
+        group = QWidget()
+        group.setObjectName("plotSurface")
         layout = QVBoxLayout(group)
-        layout.addWidget(self.epochs_info_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         self.evoked_plot_widget = EvokedPlotWidget()
+        self.evoked_plot_widget.title_label_action.setVisible(False)
         self.evoked_plot_widget.scrolled.connect(
             lambda direction: self.scroll_area.verticalScrollBar().setValue(
                 self.scroll_area.verticalScrollBar().value() - 50
@@ -171,86 +194,39 @@ class ErpAnalysisPage(BasePage):
         self.psd_button = QPushButton("Plot PSD")
         self.topoplot_button.setObjectName("secondaryButton")
         self.psd_button.setObjectName("secondaryButton")
-        action_row = QHBoxLayout()
-        action_row.addStretch(1)
-        action_row.addWidget(self.topoplot_button)
-        action_row.addWidget(self.psd_button)
-        layout.addLayout(action_row)
         return group
 
-    def _create_analysis_group(self) -> QGroupBox:
-        group = QGroupBox()
-        layout = QGridLayout(group)
-        layout.setHorizontalSpacing(24)
-        layout.setVerticalSpacing(18)
-        layout.setColumnStretch(0, 1)
-        layout.setColumnStretch(1, 1)
-        self.excitability_button = QPushButton("Response Amplitude Analysis")
-        self.nf_button = QPushButton("Natural Frequency Analysis")
-        self.tf_button = QPushButton("Compute TFR")
-        self.time_frequency_button = QPushButton("Plot TFR")
-        self.stc_button = QPushButton("Compute STC")
-        self.source_estimate_button = QPushButton("Plot STC")
-
-        self._add_analysis_method(
-            layout,
-            0,
-            0,
-            "Response amplitude",
-            "Measure response strength over a selected time window.",
-            self.excitability_button,
-        )
-        self._add_analysis_method(
-            layout,
-            0,
-            1,
-            "Natural frequency",
-            "Estimate dominant response frequencies across channels.",
-            self.nf_button,
-        )
-        self._add_analysis_method(
-            layout,
-            1,
-            0,
-            "Time-frequency response",
-            "Compute a TFR derivative or open an existing result.",
-            self.tf_button,
-            self.time_frequency_button,
-        )
-        self._add_analysis_method(
-            layout,
-            1,
-            1,
-            "Source estimate",
-            "Compute and inspect a cortical source estimate.",
-            self.stc_button,
-            self.source_estimate_button,
-        )
-        return group
-
-    @staticmethod
-    def _add_analysis_method(layout, row, column, title, description, *buttons):
-        method_layout = QVBoxLayout()
-        method_layout.setContentsMargins(0, 0, 0, 0)
-        method_layout.setSpacing(6)
-
-        title_label = QLabel(title)
-        title_label.setObjectName("analysisMethodTitle")
-        method_layout.addWidget(title_label)
-
-        description_label = QLabel(description)
-        description_label.setObjectName("analysisMethodDescription")
-        description_label.setWordWrap(True)
-        method_layout.addWidget(description_label)
-
-        button_row = QHBoxLayout()
-        button_row.setContentsMargins(0, 2, 0, 0)
-        for button in buttons:
+    def _create_analysis_group(self) -> QWidget:
+        group = QWidget()
+        group.setObjectName("analysisActions")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self.analysis_title = QLabel("Analysis tools")
+        self.analysis_title.setObjectName("analysisMethodTitle")
+        layout.addWidget(self.analysis_title)
+        self.excitability_button = QPushButton("Response amplitude")
+        self.nf_button = QPushButton("Natural frequency")
+        self.tf_button = QPushButton("Compute time-frequency")
+        self.time_frequency_button = QPushButton("Plot time-frequency")
+        self.stc_button = QPushButton("Compute source estimate")
+        self.source_estimate_button = QPushButton("Plot source estimate")
+        button_row = FlowLayout()
+        for button, description in (
+            (self.topoplot_button, "Inspect event responses and topographic maps."),
+            (self.psd_button, "Inspect the power spectral density of preprocessed epochs."),
+            (self.excitability_button, "Measure response amplitude over a selected time window."),
+            (self.nf_button, "Estimate dominant response frequencies across channels."),
+            (self.tf_button, "Compute a time-frequency response (TFR/ITC)."),
+            (self.time_frequency_button, "Open a saved time-frequency result. Compute time-frequency first if no result exists."),
+            (self.stc_button, "Compute a cortical source estimate (STC)."),
+            (self.source_estimate_button, "Open a saved source estimate. Compute a source estimate first if no result exists."),
+        ):
             button.setProperty("analysisAction", True)
+            button.setToolTip(description)
             button_row.addWidget(button)
-        button_row.addStretch(1)
-        method_layout.addLayout(button_row)
-        layout.addLayout(method_layout, row, column)
+        layout.addLayout(button_row)
+        return group
 
     def _connect_to_main_window(self):
         if not self.main_window:
@@ -304,6 +280,7 @@ class ErpAnalysisPage(BasePage):
         self._needs_reload = False
 
     def update_ui_state(self):
+        self.subtitle_link.set_available(bool(self.current_dataset and self.current_dataset.stage_exists("preprocessed")))
         pipeline_name = self.main_window.current_pipeline.name if self.main_window else "Pipeline"
         if not self.current_dataset:
             self.set_page_subtitle("Select a dataset in the workspace panel to inspect preprocessed epochs.")
@@ -320,6 +297,10 @@ class ErpAnalysisPage(BasePage):
         else:
             self.set_page_subtitle(f"{pipeline_name} pipeline · {self.current_dataset.display_name}")
             self.context_label.hide()
+        if self.current_dataset:
+            input_path = self.current_dataset.paths.get("preprocessed", self.current_dataset.source_path)
+            self.set_page_subtitle(f"{dataset_label(self.current_dataset, path=input_path)} · {pipeline_name} pipeline")
+            self.subtitle_label.setToolTip(str(input_path))
 
         self._ensure_loaded()
 
@@ -340,10 +321,13 @@ class ErpAnalysisPage(BasePage):
         self.tf_button.setEnabled(has_data)
         self.stc_button.setEnabled(has_data)
         self.evoked_plot_widget.setVisible(has_data)
-        self.visualization_title.setVisible(has_data)
         self.visualization_group.setVisible(has_data)
         self.analysis_title.setVisible(has_data)
         self.analysis_group.setVisible(has_data)
+        self.select_input_button.setVisible(not has_data)
+        has_workspace = bool(self.main_window and self.main_window.current_folder)
+        has_candidates = bool(self.main_window and self.main_window.workspace_panel.datasets)
+        self.select_input_button.setText("Open workspace" if not has_workspace else "Choose dataset" if has_candidates else "Open Preprocessing")
 
     def release_derivative_resources(self, paths):
         """Drop analysis objects derived from a file that will be deleted."""

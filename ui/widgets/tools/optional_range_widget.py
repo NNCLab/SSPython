@@ -59,6 +59,7 @@ class OptionalRangeWidget(QWidget):
         layout.addWidget(self.high_check)
         layout.addWidget(self.high_input)
         layout.addStretch()
+        layout.setSpacing(6)
 
         # --- Connect Signals ---
         self.low_check.toggled.connect(self.low_input.setEnabled)
@@ -130,33 +131,10 @@ class OptionalRangeWidget(QWidget):
         self.valueChanged.emit(self.value())
 
     def adjust_spinbox_width(self):
-        """
-        Adjusts the minimum width of a QDoubleSpinBox to fit its content.
-        """
-        # 1. Get the text for the min and max values
-        prefix = self.low_input.prefix()
-        suffix = self.low_input.suffix()
-        decimals = self.low_input.decimals()
-
-        # Format the numbers as they would appear in the spin box
-        min_text = f"{prefix} {self.low_input.minimum():.{decimals}f}{suffix} "
-        max_text = f"{prefix} {self.low_input.maximum():.{decimals}f}{suffix} "
-
-        # 2. Get the font metrics from the internal line edit
-        font_metrics = self.low_input.lineEdit().fontMetrics()
-
-        # 3. Calculate the pixel width of both strings
-        min_width = font_metrics.horizontalAdvance(min_text)
-        max_width = font_metrics.horizontalAdvance(max_text)
-
-        # 4. Determine the widest text and add a margin
-        # The margin accounts for the up/down arrows and some internal padding.
-        # 30px is usually a safe value.
-        required_width = max(min_width, max_width) + 30
-
-        # 5. Set the calculated minimum width
-        self.low_input.setMinimumWidth(required_width)
-        self.high_input.setMinimumWidth(required_width)
+        """Fit the actual values, locale decimal separator, suffix, and arrows."""
+        for spinbox in (self.low_input, self.high_input):
+            required_width = spinbox.fontMetrics().horizontalAdvance(spinbox.text()) + 48
+            spinbox.setMinimumWidth(max(112, required_width))
 
 
 if __name__ == "__main__":

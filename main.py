@@ -55,7 +55,9 @@ from ui.widgets.tools.conversion_tool import ConvertToolDialog, MergeToolDialog
 from ui.widgets.tools.create_info_dialog import CreateInfoDialog
 from ui.widgets.tools.export_tool import ExportFilesDialog
 from ui.widgets.tools.qss_helper import QSSEditorDialog
-from ui.widgets.workspace_panel import DatasetInspectorPanel, WorkspacePanel
+from ui.widgets.workspace_panel import WorkspacePanel
+from ui.widgets.dataset_files import DatasetFileController
+from ui.widgets.evoked_plot import EvokedPlotWidget
 from utils import Worker, apply_theme, get_path, themed_svg_icon, toggle_theme as toggle_app_theme
 
 os.environ["MNE_FORCE_EAGER"] = "1"
@@ -140,11 +142,10 @@ class MainWindow(QMainWindow):
     GEOMETRY_SETTING = "ui/main_window/geometry"
     SPLITTER_STATE_SETTING = "ui/main_window/splitter_state"
     SIDEBAR_COLLAPSED_SETTING = "ui/main_window/sidebar_collapsed"
-    INSPECTOR_COLLAPSED_SETTING = "ui/main_window/inspector_collapsed"
 
     NAV_LIST_OBJECT_NAME = "navList"
     SIDEBAR_OBJECT_NAME = "sidebar"
-    SIDEBAR_ICON_SIZE = 32
+    SIDEBAR_ICON_SIZE = 24
     SIDEBAR_ROW_HEIGHT = 52
 
     PAGE_DEFINITIONS = [
@@ -179,12 +180,9 @@ class MainWindow(QMainWindow):
             False,
             value_type=bool,
         )
-        self.inspector_collapsed = self.settings_store.get(
-            self.INSPECTOR_COLLAPSED_SETTING,
-            False,
-            value_type=bool,
-        )
         self._compact_layout_active = False
+        self._sidebar_responsive_collapsed = False
+        self._compact_sidebar_override = False
 
         self.page_lookup: dict[str, QWidget] = {}
 
@@ -228,18 +226,14 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self.stacked_widget)
         self.shell_splitter.addWidget(content_frame)
 
-        self.dataset_inspector_panel = DatasetInspectorPanel(self)
-        self.dataset_inspector_panel.collapsed = self.inspector_collapsed
-        self.dataset_inspector_panel._apply_collapsed_state(animated=False)
-        self.dataset_inspector_panel.derivatives_about_to_be_deleted.connect(
+        self.dataset_files = DatasetFileController(self)
+        self.dataset_files.derivatives_about_to_be_deleted.connect(
             self._release_derivative_resources
         )
-        self.dataset_inspector_panel.derivatives_changed.connect(self.refresh_workspace)
-        self.shell_splitter.addWidget(self.dataset_inspector_panel)
+        self.dataset_files.derivatives_changed.connect(self.refresh_workspace)
         self.shell_splitter.setStretchFactor(0, 0)
         self.shell_splitter.setStretchFactor(1, 1)
-        self.shell_splitter.setStretchFactor(2, 0)
-        self.shell_splitter.setSizes([320, 980, 300])
+        self.shell_splitter.setSizes([270, 1360])
 
         self.nav_list.currentItemChanged.connect(self._change_page)
         self._apply_sidebar_state(animated=False)
@@ -316,7 +310,6 @@ class MainWindow(QMainWindow):
 
         self.view_menu = menu_bar.addMenu("&View")
         self._add_action(self.view_menu, "Toggle Sidebar", self.toggle_sidebar, "Ctrl+B")
-        self._add_action(self.view_menu, "Toggle Derivative Inspector", self.toggle_derivative_inspector, "Ctrl+I")
         self._add_action(self.view_menu, "Toggle Light/Dark Theme", self.toggle_theme)
         self._add_action(
             self.view_menu,
@@ -384,7 +377,6 @@ class MainWindow(QMainWindow):
         self.settings_store.set(self.GEOMETRY_SETTING, self.saveGeometry())
         self.settings_store.set(self.SPLITTER_STATE_SETTING, self.shell_splitter.saveState())
         self.settings_store.set(self.SIDEBAR_COLLAPSED_SETTING, self.sidebar_collapsed)
-        self.settings_store.set(self.INSPECTOR_COLLAPSED_SETTING, self.dataset_inspector_panel.collapsed)
         self.settings_store.set_current_folder(self.current_folder)
         self.settings_store.set("workspace/output_root", self.output_root)
         self.settings_store.set_current_pipeline_id(self.current_pipeline.id)
@@ -404,12 +396,12 @@ class MainWindow(QMainWindow):
 
     def _apply_page_chrome_visibility(self, page_name: str):
         uses_workspace = page_name in {"Home", "Preprocessing", "Analysis"}
-        uses_inspector = page_name in {"Preprocessing", "Analysis"}
         if uses_workspace:
             self.workspace_panel.set_analysis_mode(page_name == "Analysis")
-        show_inspector = uses_inspector and self.current_dataset is not None
         self.workspace_panel.setVisible(uses_workspace)
-        self.dataset_inspector_panel.setVisible(show_inspector)
+
+    def focus_workspace(self):
+        self.workspace_panel.filter_edit.setFocus()
 
     @Slot(str)
     def set_current_folder(self, folder_path: str | None):
@@ -426,6 +418,9 @@ class MainWindow(QMainWindow):
 
         self.current_folder = path
         self.settings_store.set_current_folder(path)
+        recent = self.settings_store.get("workspace/recent_folders", [])
+        recent = recent if isinstance(recent, list) else []
+        self.settings_store.set("workspace/recent_folders", [str(path)] + [entry for entry in recent if entry != str(path)][:5])
         self.settings_store.sync()
         self.current_folder_changed.emit(path)
         self.refresh_workspace()
@@ -433,7 +428,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def set_current_dataset(self, dataset):
         self.current_dataset = dataset
-        self.dataset_inspector_panel.set_dataset(dataset)
+        self.dataset_files.set_dataset(dataset)
         current_item = self.nav_list.currentItem()
         if current_item is not None:
             self._apply_page_chrome_visibility(current_item.text())
@@ -473,11 +468,14 @@ class MainWindow(QMainWindow):
                 release(paths)
 
     def toggle_sidebar(self):
-        self.sidebar_collapsed = not self.sidebar_collapsed
+        effective_collapsed = self.sidebar_collapsed or self._sidebar_responsive_collapsed
+        self.sidebar_collapsed = not effective_collapsed
+        self._compact_sidebar_override = True
+        self._sidebar_responsive_collapsed = False
         self._apply_sidebar_state(animated=True)
 
-    def toggle_derivative_inspector(self):
-        self.dataset_inspector_panel.toggle_collapsed()
+    def inspect_dataset_stage(self, stage_id):
+        self.dataset_files.inspect_stage(stage_id)
 
     def toggle_theme(self):
         toggle_app_theme()
@@ -486,6 +484,11 @@ class MainWindow(QMainWindow):
             target = getattr(page_widget, "widget", page_widget)
             if hasattr(target, "refresh_theme"):
                 target.refresh_theme()
+        current_page = self.stacked_widget.currentWidget()
+        if current_page:
+            for plot in current_page.findChildren(EvokedPlotWidget):
+                if plot.isVisible():
+                    plot.refresh_theme()
 
     def _icon_for_path(self, icon_path: str, *, size: int = 20) -> QIcon:
         if icon_path.lower().endswith(".svg"):
@@ -509,21 +512,19 @@ class MainWindow(QMainWindow):
                 icon.addPixmap(icon.pixmap(icon_size), QIcon.Mode.Selected)
                 item.setIcon(icon)
 
-        if hasattr(self.dataset_inspector_panel, "refresh_icons"):
-            self.dataset_inspector_panel.refresh_icons()
-
     def _apply_sidebar_state(self, *, animated: bool):
-        target_width = self.sidebar_collapsed_width if self.sidebar_collapsed else self.sidebar_expanded_width
+        collapsed = self.sidebar_collapsed or self._sidebar_responsive_collapsed
+        target_width = self.sidebar_collapsed_width if collapsed else self.sidebar_expanded_width
         for widget in (self.nav_list, self.theme_button, self.toggle_sidebar_button):
-            widget.setProperty("collapsed", self.sidebar_collapsed)
+            widget.setProperty("collapsed", collapsed)
             widget.style().unpolish(widget)
             widget.style().polish(widget)
             widget.update()
         self.nav_list.doItemsLayout()
-        self.sidebar_brand.setVisible(not self.sidebar_collapsed)
-        self.sidebar_footer.setVisible(not self.sidebar_collapsed)
-        self.theme_button.setText("" if self.sidebar_collapsed else "Theme")
-        self.toggle_sidebar_button.setToolTip("Expand sidebar" if self.sidebar_collapsed else "Collapse sidebar")
+        self.sidebar_brand.setVisible(not collapsed)
+        self.sidebar_footer.setVisible(not collapsed)
+        self.theme_button.setText("" if collapsed else "Theme")
+        self.toggle_sidebar_button.setToolTip("Expand sidebar" if collapsed else "Collapse sidebar")
 
         if not animated:
             self.sidebar_widget.setMinimumWidth(target_width)
@@ -557,8 +558,11 @@ class MainWindow(QMainWindow):
         if not force and compact_layout == self._compact_layout_active:
             return
         self._compact_layout_active = compact_layout
-        if hasattr(self, "dataset_inspector_panel"):
-            self.dataset_inspector_panel.set_responsive_collapsed(compact_layout)
+        if not compact_layout:
+            self._compact_sidebar_override = False
+        self._sidebar_responsive_collapsed = compact_layout and not self._compact_sidebar_override
+        if hasattr(self, "sidebar_widget"):
+            self._apply_sidebar_state(animated=False)
 
     @Slot()
     def _on_settings_saved(self):

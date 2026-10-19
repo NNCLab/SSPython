@@ -2,14 +2,16 @@ import logging
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QAbstractButton,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
     QSizePolicy,
-    QToolBox,
+    QListWidget,
+    QScrollArea,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -50,30 +52,25 @@ class PreferencesPage(BasePage):
             self.main_window.current_pipeline_changed.connect(self.on_pipeline_changed)
 
     def _build_ui(self):
-        self.summary_card = QFrame()
-        self.summary_card.setObjectName("heroCard")
-        summary_layout = QVBoxLayout(self.summary_card)
-        summary_layout.setContentsMargins(24, 24, 24, 24)
-        summary_layout.setSpacing(8)
-
-        title = QLabel("Application preferences")
-        title.setObjectName("heroTitle")
-        summary_layout.addWidget(title)
-
         self.summary_label = QLabel("")
         self.summary_label.setObjectName("mutedLabel")
         self.summary_label.setWordWrap(True)
-        summary_layout.addWidget(self.summary_label)
-
-        self.add_content(self.summary_card)
-
-        self.tool_box = QToolBox()
-        self.tool_box.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Expanding,
-        )
-        self.add_content(self.tool_box)
-        self.content_layout.setStretch(self.content_layout.indexOf(self.tool_box), 1)
+        self.add_content(self.summary_label)
+        self.settings_panel = QWidget()
+        self.category_layout = QHBoxLayout(self.settings_panel)
+        self.category_layout.setContentsMargins(0, 0, 0, 0)
+        self.category_layout.setSpacing(20)
+        self.category_list = QListWidget()
+        self.category_list.setObjectName("preferencesCategories")
+        self.category_list.setFixedWidth(200)
+        self.category_stack = QStackedWidget()
+        self.category_stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        self.category_layout.addWidget(self.category_list)
+        self.category_layout.addWidget(self.category_stack, 1)
+        self.category_list.currentRowChanged.connect(self.category_stack.setCurrentIndex)
+        self.add_content(self.settings_panel)
+        self.content_layout.setStretch(self.content_layout.indexOf(self.settings_panel), 1)
+        self.content_layout.setStretch(self.content_layout.count() - 1, 0)
 
         footer = QFrame()
         footer.setObjectName("pageFooter")
@@ -127,6 +124,7 @@ class PreferencesPage(BasePage):
         )
 
         self.load_all_settings()
+        self.category_list.setCurrentRow(0)
 
     def _connect_signals(self):
         self.save_button.clicked.connect(self.save_all_settings)
@@ -146,10 +144,26 @@ class PreferencesPage(BasePage):
             layout.addWidget(widget)
             self.settings_widgets.append(widget)
         layout.addStretch(1)
-        self.tool_box.addItem(container, title)
-        for button in self.tool_box.findChildren(QAbstractButton):
-            if button.parentWidget() is self.tool_box:
-                button.setMinimumHeight(38)
+        for form in container.findChildren(QFormLayout):
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        scroll = QScrollArea()
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(container)
+        self.category_stack.addWidget(scroll)
+        self.category_list.addItem(title)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "category_layout"):
+            compact = event.size().width() < 720
+            self.category_layout.setDirection(QHBoxLayout.Direction.TopToBottom if compact else QHBoxLayout.Direction.LeftToRight)
+            if compact:
+                self.category_list.setMinimumWidth(0)
+                self.category_list.setMaximumWidth(16777215)
+            else:
+                self.category_list.setFixedWidth(200)
+            self.category_list.setMaximumHeight(164 if compact else 16777215)
 
     def _active_pipeline_id(self) -> str:
         return self.global_settings_widget.pipeline_combo.currentData()
@@ -166,7 +180,7 @@ class PreferencesPage(BasePage):
         output_root = self.global_settings_widget.output_dir_input.text().strip() or "derivatives"
         self.summary_label.setText(
             f"Editing defaults for the {pipeline_name} pipeline. "
-            f"Derivatives will be saved under the workspace folder in `{output_root}`."
+            f"Derivatives are saved in the workspace’s {output_root} folder."
         )
 
     def load_all_settings(self):

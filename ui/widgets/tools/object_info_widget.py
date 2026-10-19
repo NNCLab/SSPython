@@ -5,7 +5,8 @@ from collections import Counter
 from typing import Optional, Union
 
 import mne
-from PySide6.QtCore import Qt
+from ui.widgets.layout_helpers import FlowLayout, FilenameLabel
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -243,8 +244,9 @@ class EventChip(QFrame):
 
 
 class ObjectInfoWidget(QWidget):
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, parent: Optional[QWidget] = None, *, compact: bool = False):
         super().__init__(parent)
+        self.compact = compact
         self.mne_object: Optional[MNEObject] = None
         self.setObjectName("objectInfoCard")
         self._init_ui()
@@ -258,6 +260,11 @@ class ObjectInfoWidget(QWidget):
         self.header_label.setObjectName("objectInfoTitle")
         self.header_label.hide()
         layout.addWidget(self.header_label)
+        self.summary_label = QLabel()
+        self.summary_label.setObjectName("datasetSummary")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setVisible(self.compact)
+        layout.addWidget(self.summary_label)
 
         self.metrics_widget = QWidget()
         self.metrics_widget.setObjectName("objectInfoMetrics")
@@ -280,7 +287,7 @@ class ObjectInfoWidget(QWidget):
 
         self.event_chips_widget = QWidget()
         self.event_chips_widget.setObjectName("objectInfoEventChips")
-        self.event_chips_layout = QHBoxLayout(self.event_chips_widget)
+        self.event_chips_layout = FlowLayout(self.event_chips_widget, spacing=6)
         self.event_chips_layout.setContentsMargins(0, 0, 0, 0)
         self.event_chips_layout.setSpacing(6)
         events_layout.addWidget(self.event_chips_widget)
@@ -299,7 +306,7 @@ class ObjectInfoWidget(QWidget):
 
         self.mne_object = mne_object
         self.header_label.setText(title or self._object_type_name(mne_object))
-        self.header_label.show()
+        self.header_label.setVisible(not self.compact)
         self._set_metrics(build_summary_metrics(mne_object))
         self._set_event_counts(extract_event_counts(mne_object))
         self.show()
@@ -308,6 +315,7 @@ class ObjectInfoWidget(QWidget):
         self.mne_object = None
         self.header_label.clear()
         self.header_label.hide()
+        self.summary_label.clear()
         self._clear_layout(self.metrics_layout)
         self._clear_layout(self.event_chips_layout)
         self.events_frame.hide()
@@ -320,19 +328,22 @@ class ObjectInfoWidget(QWidget):
 
     def _set_metrics(self, metrics: list[tuple[str, str]]):
         self._clear_layout(self.metrics_layout)
+        self.metrics_widget.setVisible(not self.compact)
+        if self.compact:
+            self.summary_label.setText("   ·   ".join(f"{value} {label.lower()}" for label, value in metrics))
+            return
         for index, (label, value) in enumerate(metrics):
             row, col = divmod(index, 2)
             self.metrics_layout.addWidget(MetricTile(label, value, self), row, col)
 
     def _set_event_counts(self, event_counts: list[tuple[str, int]]):
         self._clear_layout(self.event_chips_layout)
-        if not event_counts:
+        if not event_counts or self.compact:
             self.events_frame.hide()
             return
 
         for label, count in event_counts:
             self.event_chips_layout.addWidget(EventChip(label, count, self))
-        self.event_chips_layout.addStretch()
         self.events_frame.show()
 
     @staticmethod
@@ -355,6 +366,9 @@ class ObjectInfoWidget(QWidget):
 
 
 class ObjectDetailsDialog(QDialog):
+    open_location_requested = Signal()
+    delete_requested = Signal()
+
     def __init__(
         self,
         title: str,
@@ -363,6 +377,7 @@ class ObjectDetailsDialog(QDialog):
         file_path: str = "",
         status_text: str = "",
         description: str = "",
+        allow_delete: bool = False,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -375,7 +390,7 @@ class ObjectDetailsDialog(QDialog):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(12)
 
-        title_label = QLabel(title)
+        title_label = FilenameLabel(title)
         title_label.setObjectName("panelTitle")
         layout.addWidget(title_label)
 
@@ -392,6 +407,7 @@ class ObjectDetailsDialog(QDialog):
 
         if file_path:
             path_label = QLabel(file_path)
+            path_label.setTextFormat(Qt.TextFormat.PlainText)
             path_label.setObjectName("mutedLabel")
             path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             path_label.setWordWrap(True)
@@ -444,6 +460,15 @@ class ObjectDetailsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.accept)
+        if file_path:
+            self.open_location_button = buttons.addButton("Open file location", QDialogButtonBox.ButtonRole.ActionRole)
+            self.open_location_button.setObjectName("secondaryButton")
+            self.open_location_button.clicked.connect(self.open_location_requested)
+        if allow_delete:
+            self.delete_button = buttons.addButton("Delete derivatives…", QDialogButtonBox.ButtonRole.ActionRole)
+            self.delete_button.setObjectName("dangerButton")
+            self.delete_button.setToolTip("Delete this saved step and its dependent files")
+            self.delete_button.clicked.connect(self.delete_requested)
         layout.addWidget(buttons)
 
     def release_object(self):

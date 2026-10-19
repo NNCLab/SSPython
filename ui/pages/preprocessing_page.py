@@ -7,12 +7,10 @@ from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
-    QGroupBox,
-    QHBoxLayout,
+    QBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
-    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -30,39 +28,49 @@ from ui.widgets.preprocessing_widgets import (
     ReReferenceDialog,
 )
 from ui.widgets.run_ica_widget import RunICADialog
-from ui.widgets.tools.object_info_widget import ObjectInfoWidget
 from ui.widgets.tools.stage_io import load_stage_object
 from utils import Worker
 
 from .base_page import BasePage
+from ui.widgets.layout_helpers import InspectionLink, FlowLayout, dataset_label
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
-class WorkflowDescriptionLabel(QLabel):
-    """A wrapping label that keeps its layout height in sync with its width."""
+class WorkflowStage(QFrame):
+    """A flat stage row whose operations stay visible and directly accessible."""
 
-    def __init__(self, text: str, parent=None):
-        super().__init__(text, parent)
-        self.setWordWrap(True)
-        self.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Minimum,
-        )
+    def __init__(self, stage, number, parent=None):
+        super().__init__(parent)
+        self.setObjectName("workflowStage")
+        self.row_layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, self)
+        self.row_layout.setContentsMargins(0, 10, 0, 10)
+        self.row_layout.setSpacing(12)
+        self.heading = QWidget()
+        self.heading.setObjectName("workflowHeading")
+        header = QVBoxLayout(self.heading)
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(3)
+        self.info_link = InspectionLink(f"{number}. {stage.label}")
+        self.title = self.info_link.label
+        self.title.setObjectName("workflowActionTitle")
+        self.title.setWordWrap(True)
+        self.title.setToolTip(stage.description)
+        self.status = QLabel()
+        self.status.setObjectName("stageStateLabel")
+        header.addWidget(self.info_link)
+        header.addWidget(self.status)
+        self.actions_widget = QWidget()
+        self.actions_widget.setObjectName("workflowActions")
+        self.actions_layout = FlowLayout(self.actions_widget)
+        self.row_layout.addWidget(self.heading, 1)
+        self.row_layout.addWidget(self.actions_widget, 3)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        label_width = event.size().width()
-        if label_width <= 0:
-            return
-        required_height = self.heightForWidth(label_width)
-        if required_height < 0:
-            return
-        required_height = max(self.fontMetrics().lineSpacing(), required_height)
-        if self.minimumHeight() != required_height:
-            self.setMinimumHeight(required_height)
-            self.updateGeometry()
+        compact = event.size().width() < 680
+        self.row_layout.setDirection(QBoxLayout.Direction.TopToBottom if compact else QBoxLayout.Direction.LeftToRight)
 
 
 def _annotation_entries(annotations) -> list[tuple[float, float, str, tuple[str, ...]]]:
@@ -107,16 +115,20 @@ class ProcessingPage(BasePage):
         super().__init__("Preprocessing", parent)
         self.set_content_maximum_width(1360)
         self.main_window = parent
+        self.subtitle_link.activated.connect(lambda: self._inspect_stage("raw"))
         self.current_dataset = None
         self.preprocessor: Preprocessor | None = None
         self._needs_reload = False
 
         self.action_buttons: dict[str, QPushButton] = {}
         self._workflow_button_specs = {}
-        self.info_widgets_by_stage: dict[str, ObjectInfoWidget] = {}
         self.plot_widgets_by_stage: dict[str, EvokedPlotWidget] = {}
+        self.preview_panels = {}
+        self.preview_file_labels = {}
+        self.preview_file_links = {}
         self._raw_review_pending = False
         self._raw_review_figure = None
+        self.stage_sections = {}
 
         self._setup_ui()
         self._connect_to_main_window()
@@ -124,12 +136,45 @@ class ProcessingPage(BasePage):
 
     def _setup_ui(self):
         self.raw_evoked_plot_widget = EvokedPlotWidget()
+        self.empty_state = QFrame()
+        self.empty_state.setObjectName("emptyState")
+        empty_layout = QVBoxLayout(self.empty_state)
+        empty_layout.setContentsMargins(24, 24, 24, 24)
+        self.empty_label = QLabel("Open a workspace, then choose a recording to start preprocessing.")
+        self.empty_label.setWordWrap(True)
+        empty_layout.addWidget(self.empty_label)
+        empty_actions = FlowLayout()
+        self.choose_dataset_button = QPushButton("Open workspace")
+        self.choose_dataset_button.clicked.connect(self._choose_dataset)
+        empty_actions.addWidget(self.choose_dataset_button)
+        self.convert_button = QPushButton("Convert EEG data")
+        self.convert_button.setObjectName("secondaryButton")
+        self.convert_button.clicked.connect(lambda: self.main_window and self.main_window._open_convert_tool())
+        empty_actions.addWidget(self.convert_button)
+        empty_layout.addLayout(empty_actions)
+        self.add_content(self.empty_state)
         self.workflow_container = QWidget()
+        self.workflow_container.setObjectName("workflowContainer")
         self.workflow_layout = QVBoxLayout(self.workflow_container)
         self.workflow_layout.setContentsMargins(0, 0, 0, 0)
-        self.workflow_layout.setSpacing(16)
+        self.workflow_layout.setSpacing(6)
         self.add_content(self.workflow_container)
+        self.open_analysis_button = QPushButton("Open Analysis")
+        self.open_analysis_button.clicked.connect(lambda: self.main_window and self.main_window.navigate_to_page("Analysis"))
+        ready_actions = FlowLayout()
+        ready_actions.addWidget(self.open_analysis_button)
+        self.content_layout.insertLayout(self.content_layout.indexOf(self.workflow_container), ready_actions)
         self._build_pipeline_workflow()
+
+    def _choose_dataset(self):
+        if not self.main_window:
+            return
+        if self.current_dataset and self.current_dataset.is_analysis_only:
+            self.main_window.navigate_to_page("Analysis")
+        elif self.main_window.current_folder:
+            self.main_window.focus_workspace()
+        else:
+            self.main_window.workspace_panel.select_folder()
 
     def _current_pipeline(self):
         if self.main_window is not None:
@@ -151,8 +196,11 @@ class ProcessingPage(BasePage):
         self._clear_layout(self.workflow_layout)
         self.action_buttons = {}
         self._workflow_button_specs = {}
-        self.info_widgets_by_stage = {}
         self.plot_widgets_by_stage = {}
+        self.preview_panels = {}
+        self.preview_file_labels = {}
+        self.preview_file_links = {}
+        self.stage_sections = {}
 
         pipeline = self._current_pipeline()
         if pipeline is None:
@@ -164,50 +212,39 @@ class ProcessingPage(BasePage):
             title_widget.setObjectName("sectionTitle")
             self.workflow_layout.addWidget(title_widget)
 
-            group = QGroupBox()
-            group_layout = QVBoxLayout(group)
-
             for panel in section.panels:
-                if panel.info_stage_id is None:
-                    for stage_actions in self._group_actions_by_stage(panel.actions):
-                        group_layout.addWidget(
-                            self._create_workflow_stage_row(stage_actions, step_number)
-                        )
-                        step_number += 1
-                else:
-                    panel_frame = QFrame()
-                    panel_frame.setObjectName("workflowPanel")
-                    row = QHBoxLayout(panel_frame)
-                    row.setContentsMargins(0, 0, 0, 0)
-                    row.setSpacing(12)
-                    info_widget = ObjectInfoWidget()
-                    self.info_widgets_by_stage[panel.info_stage_id] = info_widget
-                    setattr(self, f"{panel.info_stage_id}_info_widget", info_widget)
-                    row.addWidget(info_widget, 1)
-
-                    actions_layout = QVBoxLayout()
-                    actions_layout.setContentsMargins(0, 0, 0, 0)
-                    actions_layout.setSpacing(8)
-                    for stage_actions in self._group_actions_by_stage(panel.actions):
-                        actions_layout.addWidget(
-                            self._create_workflow_stage_row(stage_actions, step_number)
-                        )
-                        step_number += 1
-                    row.addLayout(actions_layout, 1)
-                    group_layout.addWidget(panel_frame)
+                for stage_actions in self._group_actions_by_stage(panel.actions):
+                    self.workflow_layout.addWidget(self._create_workflow_stage_row(stage_actions, step_number))
+                    step_number += 1
 
                 if panel.plot_stage_id is not None:
                     plot_widget = EvokedPlotWidget()
+                    plot_widget.title_label_action.setVisible(False)
                     self._connect_plot_scrolling(plot_widget)
                     plot_widget.setVisible(False)
                     self.plot_widgets_by_stage[panel.plot_stage_id] = plot_widget
                     if panel.plot_stage_id == "preprocessed":
                         self.plot_widget = plot_widget
-                    group_layout.addWidget(plot_widget)
+                    preview = QWidget()
+                    preview_layout = QVBoxLayout(preview)
+                    preview_layout.setContentsMargins(0, 16, 0, 0)
+                    title = QLabel(f"{self._stage_definition(panel.plot_stage_id).label} preview")
+                    title.setObjectName("sectionTitle")
+                    preview_layout.addWidget(title)
+                    filename_link = InspectionLink()
+                    filename_link.activated.connect(lambda stage_id=panel.plot_stage_id: self._inspect_stage(stage_id))
+                    filename_label = filename_link.label
+                    filename_label.setObjectName("mutedLabel")
+                    preview_layout.addWidget(filename_link)
+                    self.preview_file_labels[panel.plot_stage_id] = filename_label
+                    self.preview_file_links[panel.plot_stage_id] = filename_link
+                    preview_layout.addWidget(plot_widget)
+                    preview.hide()
+                    self.preview_panels[panel.plot_stage_id] = preview
 
-            self.workflow_layout.addWidget(group)
+        for preview in self.preview_panels.values():
+            self.workflow_layout.addWidget(preview)
 
-        self.workflow_layout.addStretch()
         self._configure_workflow_buttons()
 
     @staticmethod
@@ -237,43 +274,18 @@ class ProcessingPage(BasePage):
         if not actions:
             raise ValueError("A workflow stage row requires at least one action.")
 
-        primary_action = actions[0]
-        row = QFrame()
-        row.setObjectName("workflowActionRow")
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(10)
-
-        number = QLabel(str(step_number))
-        number.setObjectName("stepNumber")
-        number.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        number.setFixedSize(28, 28)
-        layout.addWidget(number, 0, Qt.AlignmentFlag.AlignTop)
-
-        stage = self._stage_definition(primary_action.stage_id)
-        details = QVBoxLayout()
-        details.setContentsMargins(0, 0, 0, 0)
-        details.setSpacing(2)
-        stage_label = QLabel(stage.label if stage is not None else primary_action.label)
-        stage_label.setObjectName("workflowActionTitle")
-        details.addWidget(stage_label)
-        if stage is not None:
-            description = WorkflowDescriptionLabel(stage.description)
-            description.setObjectName("mutedLabel")
-            details.addWidget(description)
-        layout.addLayout(details, 1)
-
-        buttons_widget = QWidget()
-        buttons_layout = QVBoxLayout(buttons_widget)
-        buttons_layout.setContentsMargins(0, 0, 0, 0)
-        buttons_layout.setSpacing(8)
+        stage = self._stage_definition(actions[0].stage_id)
+        row = WorkflowStage(stage, step_number)
+        row.info_link.activated.connect(lambda: self._inspect_stage(stage.id))
+        self.stage_sections[stage.id] = row
         for action in actions:
             button = self._create_workflow_button(action)
-            button.setMinimumWidth(170)
-            button.setMaximumWidth(260)
-            buttons_layout.addWidget(button)
-        layout.addWidget(buttons_widget, 0, Qt.AlignmentFlag.AlignVCenter)
+            row.actions_layout.addWidget(button)
         return row
+
+    def _inspect_stage(self, stage_id):
+        if self.main_window and self.current_dataset and self.current_dataset.stage_exists(stage_id):
+            self.main_window.inspect_dataset_stage(stage_id)
 
     def _connect_plot_scrolling(self, plot_widget: EvokedPlotWidget):
         plot_widget.scrolled.connect(
@@ -384,9 +396,6 @@ class ProcessingPage(BasePage):
             return
 
         for stage_id in stage_ids:
-            info_widget = self.info_widgets_by_stage.get(stage_id)
-            if info_widget is not None:
-                info_widget.clear_info()
             plot_widget = self.plot_widgets_by_stage.get(stage_id)
             if plot_widget is not None:
                 plot_widget.update_plot(None)
@@ -468,7 +477,7 @@ class ProcessingPage(BasePage):
         except (StopIteration, ValueError):
             return "pending"
 
-    def _stage_object_for_info(self, stage_id: str):
+    def _stage_object_for_plot(self, stage_id: str):
         if not self.preprocessor:
             return None, ""
 
@@ -499,19 +508,16 @@ class ProcessingPage(BasePage):
 
         return None, ""
 
-    def _refresh_info_widgets(self):
-        for stage_id, info_widget in self.info_widgets_by_stage.items():
-            stage_object, label = self._stage_object_for_info(stage_id)
-            if stage_object is None:
-                info_widget.clear_info()
-            else:
-                info_widget.update_info(stage_object, label)
-
     def _refresh_plot_widgets(self):
         for stage_id, plot_widget in self.plot_widgets_by_stage.items():
-            stage_object, _ = self._stage_object_for_info(stage_id)
+            stage_object, _ = self._stage_object_for_plot(stage_id)
             stage = self._stage_definition(stage_id)
             can_plot = stage is not None and stage.data_kind == "epochs"
+            stage_path = self.current_dataset.paths.get(stage_id) if self.current_dataset else None
+            self.preview_file_labels[stage_id].setText(dataset_label(self.current_dataset, path=stage_path) if stage_path else "")
+            self.preview_file_labels[stage_id].setToolTip(str(stage_path) if stage_path else "")
+            self.preview_file_links[stage_id].set_available(self._stage_status(stage_id) == "complete")
+            self.preview_panels[stage_id].setVisible(stage_object is not None and can_plot)
             plot_widget.setVisible(stage_object is not None and can_plot)
             if stage_object is None or not can_plot:
                 plot_widget.update_plot(None)
@@ -523,18 +529,16 @@ class ProcessingPage(BasePage):
 
     def update_ui_state(self):
         pipeline_name = self.main_window.current_pipeline.name if self.main_window else "Pipeline"
-        if self.current_dataset and self.current_dataset.is_analysis_only:
-            self.set_page_subtitle(
-                f"Analysis-only input · {self.current_dataset.display_name}. Open Analysis to use this file."
-            )
-        elif self.current_dataset:
-            self.set_page_subtitle(f"{pipeline_name} pipeline · {self.current_dataset.display_name}")
+        if self.current_dataset:
+            context = "Analysis-only input · Open Analysis to use this file" if self.current_dataset.is_analysis_only else f"{pipeline_name} pipeline"
+            self.set_page_subtitle(f"{dataset_label(self.current_dataset)} · {context}")
+            self.subtitle_label.setToolTip(str(self.current_dataset.source_path))
         else:
             self.set_page_subtitle("Select a dataset in the workspace panel to start preprocessing.")
 
-        self._ensure_preprocessor_loaded()
+        self.subtitle_link.set_available(bool(self.current_dataset and not self.current_dataset.is_analysis_only and self.current_dataset.stage_exists("raw")))
 
-        self._refresh_info_widgets()
+        self._ensure_preprocessor_loaded()
 
         button_availability = {
             button: self._is_action_available(action)
@@ -542,8 +546,32 @@ class ProcessingPage(BasePage):
         }
         for button, is_enabled in button_availability.items():
             button.setEnabled(is_enabled)
+            action = self._workflow_button_specs[button]
+            if not is_enabled and self.current_dataset:
+                required = self._stage_definition(action.requires_stage_id)
+                button.setToolTip(f"Requires {required.label.lower() if required else 'an input dataset'}. {action.label} becomes available when that input is saved.")
         self._refresh_workflow_button_states(button_availability)
-
+        has_input = self.preprocessor is not None
+        self.workflow_container.setVisible(has_input)
+        self.empty_state.setVisible(not has_input)
+        analysis_only = bool(self.current_dataset and self.current_dataset.is_analysis_only)
+        self.empty_label.setText("This file contains preprocessed epochs. Open Analysis to inspect it." if analysis_only else "Open a workspace, then choose a recording to start preprocessing.")
+        has_workspace = bool(self.main_window and self.main_window.current_folder)
+        self.choose_dataset_button.setText("Open Analysis" if analysis_only else "Choose dataset" if has_workspace else "Open workspace")
+        ready = bool(self.current_dataset and self.current_dataset.stage_exists("preprocessed"))
+        self.open_analysis_button.setVisible(ready and not analysis_only)
+        for stage_id, section in self.stage_sections.items():
+            status = self._stage_status(stage_id)
+            stage = self._stage_definition(stage_id)
+            section.info_link.set_available(status == "complete")
+            stage_path = getattr(self.current_dataset, "paths", {}).get(stage_id)
+            section.title.setToolTip(str(stage_path) if stage_path and status == "complete" else stage.description)
+            available = any(button_availability[b] for b, action in self._workflow_button_specs.items() if action.stage_id == stage_id)
+            label = "Saved" if status == "complete" else "Skipped" if status == "skipped" else "Available" if available else "Needs input"
+            section.status.setText(f"Optional · {label}" if stage.optional else label)
+            section.status.setProperty("state", status)
+            section.status.style().unpolish(section.status)
+            section.status.style().polish(section.status)
         self._refresh_plot_widgets()
 
     @Slot()
