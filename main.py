@@ -144,7 +144,7 @@ class MainWindow(QMainWindow):
 
     NAV_LIST_OBJECT_NAME = "navList"
     SIDEBAR_OBJECT_NAME = "sidebar"
-    SIDEBAR_ICON_SIZE = 32
+    SIDEBAR_ICON_SIZE = 24
     SIDEBAR_ROW_HEIGHT = 52
 
     PAGE_DEFINITIONS = [
