@@ -30,6 +30,8 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from utils import get_path, Worker
@@ -545,7 +547,9 @@ class DetailPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.canvas = MplCanvas(self, dpi=120)
+        self.toolbar = NavigationToolbar2QT(self.canvas)
         layout.addWidget(self.canvas)
+        layout.addWidget(self.toolbar)
         gs = GridSpec(
             4,
             3,
