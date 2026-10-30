@@ -415,6 +415,7 @@ It is enabled when a dataset has reached the `preprocessed` stage or when a matc
 
 - Response Amplitude Analysis
 - Natural Frequency Analysis
+- PCIst Analysis with interactive threshold and transition-matrix inspection
 - Compute and plot Time-Frequency (TFR/ITC)
 - Compute and plot Source Estimates (STC)
 
@@ -429,6 +430,26 @@ and `zlogratio` baseline correction modes, plus no correction. Mean subtraction
 is the default. Correction is applied to mean trial power per channel before
 the ROI is combined, affecting both the frequency estimate and its plot. The
 baseline interval remains necessary for statistics even with correction off.
+
+**PCIst Analysis** averages the selected event's trials over the selected good EEG
+channels, then runs `core/external/pci_st.py`. Its controls expose baseline and
+response windows (ms), variance retained, minimum SNR, SVD component count, noise
+weight `k`, threshold steps, maximum threshold factor, embedding dimensions and
+delay, average reference, baseline correction, and resampling. Optional baseline
+correction follows the original implementation: subtract the mean of all original
+epoch samples before −50 ms, independently of the analysis baseline window.
+
+The result shows PCIst, the retained components, and each component's contribution.
+Select a component and move the threshold slider or click its threshold curves to
+update the baseline and response transition matrices. Distance matrices use a shared
+colour scale. **Optimal threshold ε*** returns to the threshold maximizing that
+component's weighted response-minus-baseline difference. Curves multiply the original
+NST densities by the response sample count so their positive ΔNST peak equals the
+component contribution; negative differences remain visible and contribute zero.
+The second tab shows the evoked response, selected PC, and contributions. Input
+changes require **Calculate PCIst** again and mark the displayed result as previous.
+The plot toolbars support zooming and saving figures. PCIst follows Comolatti et al.
+(2019), doi:10.1016/j.brs.2019.05.013.
 
 When computing averaged TFR/ITC for all events, the saved file also retains each
 event's average so **Plot TFR** can switch between them. Earlier pooled averages

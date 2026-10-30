@@ -47,8 +47,8 @@ def calc_PCIst(signal_evk, times, full_return=False, **par):
     signal_evk, times = preprocess_signal(
         signal_evk, times, (par["baseline_window"][0], par["response_window"][1]), **par
     )
-    signal_svd, var_exp, eigenvalues, snrs = dimensionality_reduction(
-        signal_evk, times, **par
+    signal_svd, var_exp, eigenvalues, snrs, component_indices = dimensionality_reduction(
+        signal_evk, times, return_indices=True, **par
     )
     STQ = state_transition_quantification(signal_svd, times, **par)
 
@@ -64,13 +64,15 @@ def calc_PCIst(signal_evk, times, full_return=False, **par):
             "eigenvalues": eigenvalues,
             "var_exp": var_exp,
             "snrs": snrs,
+            "component_indices": component_indices,
         }
     return PCI
 
 
 ## DIMENSIONALITY REDUCTION
 def dimensionality_reduction(
-    signal, times, response_window, max_var=99, min_snr=1.1, n_components=None, **kwargs
+    signal, times, response_window, max_var=99, min_snr=1.1, n_components=None,
+    return_indices=False, **kwargs
 ):
     """Returns principal components of signal according to SVD of the response.
 
@@ -107,7 +109,9 @@ def dimensionality_reduction(
         n_components = signal.shape[0]
 
     Vk, eigenvalues = get_svd(signal, times, response_window, n_components)
-    var_exp = 100 * eigenvalues**2 / np.sum(eigenvalues**2)
+    total_variance = np.sum(eigenvalues**2)
+    var_exp = (100 * eigenvalues**2 / total_variance
+               if total_variance > 0 else np.zeros_like(eigenvalues))
 
     signal_svd = apply_svd(signal, Vk)
 
@@ -127,12 +131,11 @@ def dimensionality_reduction(
     #     base_power = np.mean(np.square(signal_svd[c, base_ini_ix:base_end_ix]))
     #     snrs[c] = np.sqrt(np.divide(resp_power, base_power))
     snrs = calc_snr(signal_svd, times, kwargs["baseline_window"], response_window)
-    signal_svd = signal_svd[snrs > min_snr, :]
-    snrs = snrs[snrs > min_snr]
-
-    Nc = signal_svd.shape[0]
-
-    return signal_svd, var_exp[:Nc], eigenvalues, snrs
+    keep = snrs > min_snr
+    signal_svd = signal_svd[keep, :]
+    component_indices = np.flatnonzero(keep)
+    result = signal_svd, var_exp[:max_dim][keep], eigenvalues, snrs[keep]
+    return (*result, component_indices) if return_indices else result
 
 
 def calc_snr(signal_svd, times, baseline_window, response_window):
@@ -144,7 +147,10 @@ def calc_snr(signal_svd, times, baseline_window, response_window):
 
     resp_power = np.mean(np.square(signal_svd[:, resp_ini_ix:resp_end_ix]), axis=1)
     base_power = np.mean(np.square(signal_svd[:, base_ini_ix:base_end_ix]), axis=1)
-    snrs = np.sqrt(resp_power / base_power)
+    ratio = np.divide(resp_power, base_power, out=np.zeros_like(resp_power),
+                      where=base_power > 0)
+    ratio[(base_power == 0) & (resp_power > 0)] = np.inf
+    snrs = np.sqrt(ratio)
     return snrs
 
 
@@ -216,10 +222,6 @@ def state_transition_quantification(
     """
 
     n_dims = signal.shape[0]
-    if n_dims == 0:
-        print("No components --> PCIst=0")
-        return {"dNST": np.array([]), "n_dims": 0}
-
     # EMBEDDING
     if embed:
         cut = (L - 1) * tau
@@ -250,9 +252,6 @@ def state_transition_quantification(
     # Distance matrix
     D_base = np.zeros((n_dims, n_baseline, n_baseline))
     D_resp = np.zeros((n_dims, n_response, n_response))
-    # Transition matrix
-    T_base = np.zeros((n_steps, n_dims, n_baseline, n_baseline))
-    T_resp = np.zeros((n_steps, n_dims, n_response, n_response))
     # Number of state transitions
     NST_base = np.zeros((n_steps, n_dims))
     NST_resp = np.zeros((n_steps, n_dims))
@@ -269,11 +268,12 @@ def state_transition_quantification(
         thresholds[:, i] = np.linspace(min_thr, max_thr, n_steps)
     for i in range(n_steps):
         for j in range(n_dims):
-            T_base[i, j, :, :] = distance2transition(D_base[j, :, :], thresholds[i, j])
-            T_resp[i, j, :, :] = distance2transition(D_resp[j, :, :], thresholds[i, j])
-
-            NST_base[i, j] = np.sum(T_base[i, j, :, :]) / n_baseline**2
-            NST_resp[i, j] = np.sum(T_resp[i, j, :, :]) / n_response**2
+            # Keep only the densities while scanning thresholds. Storing every
+            # transition matrix costs n_steps times the already dense distances.
+            T_base_at_threshold = distance2transition(D_base[j], thresholds[i, j])
+            T_resp_at_threshold = distance2transition(D_resp[j], thresholds[i, j])
+            NST_base[i, j] = np.sum(T_base_at_threshold) / n_baseline**2
+            NST_resp[i, j] = np.sum(T_resp_at_threshold) / n_response**2
 
     # PCIST
     NST_diff = NST_resp - k * NST_base
@@ -282,13 +282,11 @@ def state_transition_quantification(
     dNST = np.array([NST_diff[ix, i] for ix, i in zip(ixs, range(n_dims))]) * n_response
     dNST = [x if x > 0 else 0 for x in dNST]
 
-    temp = np.zeros((n_dims, n_response, n_response))
-    temp2 = np.zeros((n_dims, n_baseline, n_baseline))
+    T_resp = np.zeros((n_dims, n_response, n_response))
+    T_base = np.zeros((n_dims, n_baseline, n_baseline))
     for i in range(n_dims):
-        temp[i, :, :] = T_resp[ixs[i], i, :, :]
-        temp2[i, :, :] = T_base[ixs[i], i, :, :]
-    T_resp = temp
-    T_base = temp2
+        T_resp[i] = distance2transition(D_resp[i], max_thresholds[i])
+        T_base[i] = distance2transition(D_base[i], max_thresholds[i])
 
     return {
         "dNST": dNST,
@@ -374,6 +372,8 @@ def diff_matrix(A, symmetric=False):
 
 def calc_maxdim(eigenvalues, max_var):
     """Get number of dimensions that accumulates at least `max_var`% of total variance"""
+    if not np.any(eigenvalues):
+        return 0
     if max_var == 100:
         return len(eigenvalues)
     eigenvalues = np.sort(eigenvalues)[::-1]  # Sort in descending order

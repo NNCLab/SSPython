@@ -38,6 +38,7 @@ from ui.widgets.evoked_plot import EvokedPlotWidget
 from ui.widgets.psd_plot import PSDPlotSettingsDialog
 from ui.widgets.tep_analysis.excitability import ExcitabilityApp
 from ui.widgets.tep_analysis.natural_frequency import NaturalFrequencyApp
+from ui.widgets.tep_analysis.pcist import PCIstDialog
 from ui.widgets.source_estimate_widget import (
     ComputeSTCSettingsDialog,
     STCSourceConfig,
@@ -187,6 +188,7 @@ class ErpAnalysisPage(BasePage):
         layout.setColumnStretch(1, 1)
         self.excitability_button = QPushButton("Response Amplitude Analysis")
         self.nf_button = QPushButton("Natural Frequency Analysis")
+        self.pcist_button = QPushButton("PCIst Analysis")
         self.tf_button = QPushButton("Compute TFR")
         self.time_frequency_button = QPushButton("Plot TFR")
         self.stc_button = QPushButton("Compute STC")
@@ -226,6 +228,15 @@ class ErpAnalysisPage(BasePage):
             self.stc_button,
             self.source_estimate_button,
         )
+        self._add_analysis_method(
+            layout,
+            2,
+            0,
+            "Perturbational complexity (PCIst)",
+            "Calculate PCIst and explore component thresholds and state transitions.",
+            self.pcist_button,
+        )
+        self.pcist_button.clicked.connect(self.run_pcist)
         return group
 
     @staticmethod
@@ -337,6 +348,7 @@ class ErpAnalysisPage(BasePage):
         self.source_estimate_button.setEnabled(has_data and self._has_source_estimate_derivative())
         self.excitability_button.setEnabled(has_data)
         self.nf_button.setEnabled(has_data)
+        self.pcist_button.setEnabled(has_data)
         self.tf_button.setEnabled(has_data)
         self.stc_button.setEnabled(has_data)
         self.evoked_plot_widget.setVisible(has_data)
@@ -420,6 +432,12 @@ class ErpAnalysisPage(BasePage):
         if not self.tep:
             return
         dialog = NaturalFrequencyApp(self.tep.epochs, parent=self)
+        dialog.exec()
+
+    def run_pcist(self):
+        if self.tep is None or self.tep.epochs is None:
+            return
+        dialog = PCIstDialog(self.tep.epochs, parent=self)
         dialog.exec()
 
     def plot_psd(self):
