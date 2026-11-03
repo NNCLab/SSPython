@@ -35,7 +35,6 @@ class PipelinePanel:
     id: str
     info_stage_id: str | None
     actions: tuple[PipelineAction, ...] = ()
-    plot_stage_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -266,7 +265,6 @@ STANDARD_WORKFLOW_SECTIONS = (
                         requires_stage_id="epochs",
                     ),
                 ),
-                plot_stage_id="preprocessed",
             ),
         ),
     ),

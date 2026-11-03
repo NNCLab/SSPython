@@ -5,15 +5,16 @@ from collections import Counter
 from typing import Optional, Union
 
 import mne
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
-    QPlainTextEdit,
+    QLineEdit,
     QScrollArea,
     QSizePolicy,
     QSplitter,
@@ -22,6 +23,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from ui.widgets.layout_helpers import FilenameLabel
+
 
 MNEObject = Union[mne.io.Raw, mne.Epochs, mne.preprocessing.ICA]
 
@@ -73,9 +77,8 @@ def _window_text(start: Optional[float], stop: Optional[float], *, scale: float 
 
 
 def _description_entries(mne_object: MNEObject) -> list[dict]:
-    description = None
-    if hasattr(mne_object, "info"):
-        description = mne_object.info.get("description")
+    info = getattr(mne_object, "info", None)
+    description = info.get("description") if info is not None else None
 
     if not description:
         return []
@@ -355,6 +358,9 @@ class ObjectInfoWidget(QWidget):
 
 
 class ObjectDetailsDialog(QDialog):
+    open_location_requested = Signal()
+    delete_requested = Signal()
+
     def __init__(
         self,
         title: str,
@@ -363,43 +369,65 @@ class ObjectDetailsDialog(QDialog):
         file_path: str = "",
         status_text: str = "",
         description: str = "",
+        allow_delete: bool = False,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(1040, 700)
-        self.setMinimumSize(820, 520)
-        self.setObjectName("appDialog")
+        self.resize(940, 540 if mne_object is not None else 200)
+        self.setMinimumSize(640, 380 if mne_object is not None else 0)
+        self.setObjectName("fileInfoDialog")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(24, 20, 24, 18)
+        layout.setSpacing(16)
 
-        title_label = QLabel(title)
-        title_label.setObjectName("panelTitle")
-        layout.addWidget(title_label)
+        header_widget = QWidget()
+        header_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        header = QVBoxLayout(header_widget)
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
+        heading = QHBoxLayout()
+        heading.setSpacing(12)
+        title_label = FilenameLabel(title)
+        title_label.setObjectName("fileInfoTitle")
+        heading.addWidget(title_label, 1)
 
         if status_text:
             status_label = QLabel(status_text)
-            status_label.setObjectName("statusTag")
-            layout.addWidget(status_label, 0, Qt.AlignmentFlag.AlignLeft)
+            status_label.setTextFormat(Qt.TextFormat.PlainText)
+            status_label.setObjectName("fileInfoStatus")
+            heading.addWidget(status_label, 0, Qt.AlignmentFlag.AlignTop)
+        header.addLayout(heading)
 
         if description:
             description_label = QLabel(description)
-            description_label.setObjectName("mutedLabel")
+            description_label.setTextFormat(Qt.TextFormat.PlainText)
+            description_label.setObjectName("fileInfoDescription")
             description_label.setWordWrap(True)
-            layout.addWidget(description_label)
+            header.addWidget(description_label)
 
         if file_path:
-            path_label = QLabel(file_path)
-            path_label.setObjectName("mutedLabel")
-            path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            path_label.setWordWrap(True)
-            layout.addWidget(path_label)
+            # Keep long paths on one quiet line, with native selection/copy support.
+            self.path_field = QLineEdit(file_path)
+            self.path_field.setObjectName("fileInfoPath")
+            self.path_field.setReadOnly(True)
+            self.path_field.setFrame(False)
+            self.path_field.setCursorPosition(0)
+            self.path_field.setToolTip(file_path)
+            self.path_field.setAccessibleName("File path")
+            header.addWidget(self.path_field)
+        layout.addWidget(header_widget)
 
         if mne_object is not None:
-            self.summary_widget = ObjectInfoWidget(self)
-            self.summary_widget.update_info(mne_object, "Summary")
+            # Local import: the compact summary shares the extraction helpers above.
+            from ui.widgets.tools.compact_object_info import CompactObjectInfoWidget
+
+            self.summary_widget = CompactObjectInfoWidget(self)
+            self.summary_widget.update_info(mne_object)
+            self.summary_widget.events_label.hide()  # Listed once in the details below.
+            self.summary_widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            self.summary_widget.layout().setContentsMargins(0, 0, 0, 12)
             layout.addWidget(self.summary_widget)
 
             detail_sections = build_detail_sections(mne_object)
@@ -411,17 +439,14 @@ class ObjectDetailsDialog(QDialog):
                 ),
                 None,
             )
-            information_sections = [
-                (section_title, content)
-                for section_title, content in detail_sections
-                if section_title != "Processing Log"
-            ]
+            information_sections = self._information_sections(detail_sections, mne_object)
 
             self.details_scroll = self._build_sections_scroll(information_sections)
             if processing_log is not None:
                 self.details_splitter = QSplitter(Qt.Orientation.Horizontal)
-                self.details_splitter.setObjectName("objectInfoDetailsSplitter")
+                self.details_splitter.setObjectName("fileInfoDetailsSplitter")
                 self.details_splitter.setChildrenCollapsible(False)
+                self.details_splitter.setHandleWidth(18)
                 self.details_splitter.addWidget(self.details_scroll)
 
                 self.processing_log_section = self._build_section(
@@ -433,18 +458,88 @@ class ObjectDetailsDialog(QDialog):
                     QSizePolicy.Policy.Expanding,
                 )
                 self.details_splitter.addWidget(self.processing_log_section)
-                self.details_splitter.setStretchFactor(0, 2)
-                self.details_splitter.setStretchFactor(1, 3)
-                self.details_splitter.setSizes([400, 600])
+                self.details_splitter.setStretchFactor(0, 1)
+                self.details_splitter.setStretchFactor(1, 1)
+                self.details_splitter.setSizes([420, 460])
                 layout.addWidget(self.details_splitter, 1)
             else:
                 layout.addWidget(self.details_scroll, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.setObjectName("fileInfoFooter")
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         buttons.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.accept)
+        if file_path:
+            self.open_location_button = buttons.addButton(
+                "Open derivatives folder", QDialogButtonBox.ButtonRole.ActionRole
+            )
+            self.open_location_button.setObjectName("secondaryButton")
+            self.open_location_button.clicked.connect(self.open_location_requested)
+        if allow_delete:
+            self.delete_button = buttons.addButton(
+                "Delete this and subsequent files…", QDialogButtonBox.ButtonRole.ActionRole
+            )
+            self.delete_button.setObjectName("dangerButton")
+            self.delete_button.setToolTip("Delete this saved step and its dependent files")
+            self.delete_button.clicked.connect(self.delete_requested)
         layout.addWidget(buttons)
+        if not hasattr(self, "details_splitter"):
+            # Short files should not open into a large, mostly empty window.
+            self.ensurePolished()
+            content_width = self.width() - 48
+            widgets = [header_widget, buttons]
+            if mne_object is not None:
+                widgets.extend([self.summary_widget, self.details_scroll.widget()])
+            content_height = sum(
+                widget.heightForWidth(content_width)
+                if widget.hasHeightForWidth()
+                else widget.sizeHint().height()
+                for widget in widgets
+            )
+            height = content_height + 38 + (len(widgets) - 1) * layout.spacing()
+            self.resize(self.width(), min(540, max(self.minimumHeight(), height)))
+
+    @staticmethod
+    def _information_sections(
+        sections: list[tuple[str, object]], mne_object: MNEObject
+    ) -> list[tuple[str, object]]:
+        """Leave summary values in one place while retaining the detailed data."""
+        if isinstance(mne_object, mne.preprocessing.ICA):
+            summary_keys = {"Method", "Components"}
+        elif isinstance(mne_object, (mne.io.Raw, mne.io.RawArray)):
+            summary_keys = {"Channels", "Sampling Frequency", "Duration"}
+        else:
+            summary_keys = {"Epochs", "Sampling Frequency", "Window"}
+
+        information = []
+        for title, content in sections:
+            if title == "Processing Log":
+                continue
+            if title == "Metadata":
+                content = {key: value for key, value in content.items() if key not in summary_keys}
+                content = {
+                    "Excluded components" if key == "Excluded" else key: value
+                    for key, value in content.items()
+                }
+                information.insert(0, ("Details", content))
+            else:
+                section_title = {"Event Counts": "Events", "Channel Names": "Channels"}.get(title, title)
+                information.append((section_title, content))
+        return information
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        splitter = getattr(self, "details_splitter", None)
+        if splitter is not None:
+            orientation = Qt.Orientation.Vertical if self.width() < 800 else Qt.Orientation.Horizontal
+            if splitter.orientation() != orientation:
+                splitter.setOrientation(orientation)
+                if orientation == Qt.Orientation.Vertical:
+                    body_height = max(260, self.height() - 220)
+                    splitter.setSizes([int(body_height * 0.65), int(body_height * 0.35)])
+                else:
+                    splitter.setSizes([420, 460])
 
     def release_object(self):
         """Drop the dialog's reference to a file-backed MNE object."""
@@ -457,14 +552,15 @@ class ObjectDetailsDialog(QDialog):
         sections: list[tuple[str, object]],
     ) -> QScrollArea:
         sections_scroll = QScrollArea()
-        sections_scroll.setObjectName("objectInfoDetailsScroll")
+        sections_scroll.setObjectName("fileInfoDetailsScroll")
         sections_scroll.setWidgetResizable(True)
         sections_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
 
         sections_widget = QWidget()
+        sections_widget.setObjectName("fileInfoDetailsContent")
         sections_layout = QVBoxLayout(sections_widget)
         sections_layout.setContentsMargins(0, 0, 0, 0)
-        sections_layout.setSpacing(10)
+        sections_layout.setSpacing(18)
 
         for section_title, content in sections:
             sections_layout.addWidget(self._build_section(section_title, content))
@@ -474,30 +570,32 @@ class ObjectDetailsDialog(QDialog):
         return sections_scroll
 
     def _build_section(self, title: str, content: object) -> QWidget:
-        section = QFrame()
-        section.setObjectName("objectInfoDetailSection")
+        section = QWidget()
+        section.setObjectName("fileInfoHistorySection" if title == "Processing Log" else "fileInfoSection")
         layout = QVBoxLayout(section)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(0, 0, 4, 0)
         layout.setSpacing(8)
 
-        title_label = QLabel(title)
-        title_label.setObjectName("objectInfoSectionTitle")
+        title_label = QLabel("Processing history" if title == "Processing Log" else title)
+        title_label.setObjectName("fileInfoSectionTitle")
         layout.addWidget(title_label)
 
         if isinstance(content, dict):
             grid = QGridLayout()
             grid.setContentsMargins(0, 0, 0, 0)
             grid.setHorizontalSpacing(12)
-            grid.setVerticalSpacing(6)
+            grid.setVerticalSpacing(5)
+            grid.setColumnMinimumWidth(0, 110)
+            grid.setColumnStretch(1, 1)
             for row, (key, value) in enumerate(content.items()):
                 key_label = QLabel(str(key))
-                key_label.setObjectName("objectInfoDetailKey")
-                value_label = QLabel(_format_value(value))
-                value_label.setObjectName("objectInfoDetailValue")
-                value_label.setWordWrap(True)
-                value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                key_label.setTextFormat(Qt.TextFormat.PlainText)
+                key_label.setObjectName("fileInfoDetailKey")
+                key_label.setWordWrap(True)
+                key_label.setMaximumWidth(160)
+                value_label = self._value_label(value)
                 grid.addWidget(key_label, row, 0, Qt.AlignmentFlag.AlignTop)
-                grid.addWidget(value_label, row, 1)
+                grid.addWidget(value_label, row, 1, Qt.AlignmentFlag.AlignTop)
             layout.addLayout(grid)
             return section
 
@@ -509,24 +607,32 @@ class ObjectDetailsDialog(QDialog):
         if isinstance(content, list):
             text_content = json.dumps(content, indent=2)
 
-        editor = QPlainTextEdit()
-        editor.setReadOnly(True)
-        editor.setObjectName("objectInfoDetailEditor")
-        editor.setPlainText(_format_value(text_content))
-        editor.setMinimumHeight(140)
-        layout.addWidget(editor)
+        layout.addWidget(self._value_label(text_content))
         return section
+
+    @staticmethod
+    def _value_label(value) -> QLabel:
+        label = QLabel(_format_value(value))
+        label.setObjectName("fileInfoDetailValue")
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        return label
 
     def _build_log_tree(self, entries: list[dict]) -> QTreeWidget:
         tree = QTreeWidget()
-        tree.setObjectName("objectInfoLogTree")
+        tree.setObjectName("fileInfoHistoryTree")
         tree.setColumnCount(2)
-        tree.setHeaderLabels(["Operation", "Value"])
+        tree.setHeaderLabels(["Operation", "Details"])
         tree.setRootIsDecorated(True)
         tree.setAlternatingRowColors(False)
         tree.setUniformRowHeights(False)
         tree.setWordWrap(True)
-        tree.setMinimumHeight(220)
+        tree.setMinimumSize(0, 100)
+        tree.setIndentation(14)
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        tree.setColumnWidth(0, 180)
         tree.header().setStretchLastSection(True)
 
         for index, entry in enumerate(entries, start=1):
@@ -537,7 +643,6 @@ class ObjectDetailsDialog(QDialog):
             tree.addTopLevelItem(top_item)
             self._append_tree_children(top_item, payload, skip_keys={"date"})
 
-        tree.expandAll()
         return tree
 
     def _append_tree_children(

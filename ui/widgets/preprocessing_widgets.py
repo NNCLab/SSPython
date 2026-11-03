@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from .evoked_plot import EvokedPlotDialog
 import mne
 from core.processing import Preprocessor
+from ui.widgets.tools.processing_confirmation import confirm_processing_update
 from utils import parse_numeric, to_display_string, Worker
 from .tools.optional_range_widget import OptionalRangeWidget
 from .tools.baseline_control import BaselineControl
@@ -392,16 +393,16 @@ class ArtifactRemovalDialog(BaseProcessingDialog):
             QMessageBox.critical(self, "Invalid Input", str(e))
             return
 
-        if self.preprocessor.has("continuous_ica") or self.preprocessor.has("epochs"):
-            reply = QMessageBox.question(
-                self,
-                "Warning",
-                "Downstream data already exists. Overwrite?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.No:
-                return
+        checkpoint = self.preprocessor.paths.get("filter_input_raw")
+        if not confirm_processing_update(
+            self,
+            self.preprocessor,
+            "filtered_raw",
+            title="Run artifact removal?",
+            message="Artifact removal will update the continuous recording.",
+            extra_replaced_paths=(checkpoint,) if checkpoint is not None else (),
+        ):
+            return
 
         worker = Worker(
             lambda: self.preprocessor.run_artifact_removal(**params),
@@ -478,16 +479,20 @@ class FilterContinuousDialog(BaseProcessingDialog):
             QMessageBox.critical(self, "Invalid Input", str(e))
             return
 
-        if self.preprocessor.has("continuous_ica") or self.preprocessor.has("epochs"):
-            reply = QMessageBox.question(
-                self,
-                "Warning",
-                "Dependent ICA or epochs data already exists. Overwrite?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.No:
-                return
+        checkpoint = (
+            self.preprocessor.paths.get("filter_input_raw")
+            if not self.preprocessor.has("filtered_raw")
+            else None
+        )
+        if not confirm_processing_update(
+            self,
+            self.preprocessor,
+            "filtered_raw",
+            title="Filter and resample recording?",
+            message="Filtering and resampling will update the continuous recording.",
+            extra_replaced_paths=(checkpoint,) if checkpoint is not None else (),
+        ):
+            return
         worker = Worker(
             lambda: self.preprocessor.filter_continuous(**params), parent=self.parent()
         )
@@ -886,16 +891,14 @@ class EpochingDialog(BaseProcessingDialog):
             QMessageBox.critical(self, "Invalid Input", str(e))
             return
 
-        if self.preprocessor.has("epochs"):
-            reply = QMessageBox.question(
-                self,
-                "Warning",
-                "Epochs data already exists. Overwrite?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.No:
-                return
+        if not confirm_processing_update(
+            self,
+            self.preprocessor,
+            "epochs",
+            title="Create epochs?",
+            message="Epoching will save a new epochs file.",
+        ):
+            return
 
         worker = Worker(
             lambda: self.preprocessor.run_epoching(**params), parent=self.parent()
@@ -1010,14 +1013,14 @@ class ReReferenceDialog(BaseProcessingDialog):
             QMessageBox.critical(self, "Invalid Input", str(e))
             return
 
-        reply = QMessageBox.question(
+        if not confirm_processing_update(
             self,
-            "Overwrite Data?",
-            "Re-referencing will overwrite current epochs data. Are you sure you want to continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.No:
+            self.preprocessor,
+            "epochs",
+            title="Re-reference epochs?",
+            message="Re-referencing will overwrite the current epochs file.",
+            always_ask=True,
+        ):
             return
         worker = Worker(
             lambda: self.preprocessor.run_rereferencing(**params), parent=self.parent()
@@ -1281,16 +1284,14 @@ class ApplyPreprocessingDialog(BaseProcessingDialog):
             QMessageBox.critical(self, "Invalid Input", str(error))
             return
 
-        if self.preprocessor.has("preprocessed"):
-            reply = QMessageBox.question(
-                self,
-                "Overwrite Data?",
-                "Preprocessed data already exists. Do you want to overwrite it?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.No:
-                return
+        if not confirm_processing_update(
+            self,
+            self.preprocessor,
+            "preprocessed",
+            title="Apply final preprocessing?",
+            message="Final preprocessing will save the preprocessed epochs file.",
+        ):
+            return
 
         if not self.preprocessor.epochs.preload:
             Worker(
@@ -1309,28 +1310,3 @@ class ApplyPreprocessingDialog(BaseProcessingDialog):
             return
         self.finished.emit()
         self.accept()
-
-
-# Example Usage
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-
-    # Set up QSettings
-    QApplication.setOrganizationName("SSPython")
-    QApplication.setApplicationName("SSPy")
-    main_settings = QSettings()
-
-    raw_path = Path("/Users/brunoandrynascimentocouto/Desktop/Test Dataset")
-    raw_files = sorted(list(raw_path.rglob("*raw.fif")))
-    raw_file = raw_files[0]
-    preprocessor = Preprocessor(raw_file, raw_path / "derivatives")
-
-    dialog = ArtifactRemovalDialog(preprocessor)
-    dialog.exec()
-
-    dialog = EpochingDialog(preprocessor)
-    dialog.exec()
-
-    preprocessor.epochs.average().plot()
-    app.close()
-    sys.exit(app.exec())

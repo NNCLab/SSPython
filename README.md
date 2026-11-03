@@ -8,7 +8,7 @@ The pipeline system is structured so future custom pipelines can define differen
 
 The software is currently in a pre-release stage. Validate all outputs before using them for publication, regulatory work, or clinical interpretation.
 
-> Figure Placeholder 1. Main application window showing the navigation sidebar, workspace panel, central analysis page, and derivative inspector.
+> Figure Placeholder 1. Main application window showing the navigation sidebar, workspace panel, and central analysis page.
 
 ## Table of Contents
 
@@ -270,12 +270,11 @@ If the merge selection is incompatible, conversion or concatenation will fail wi
 
 ## 9. Main Interface Overview
 
-The main UI is composed of four primary regions:
+The main UI is composed of three primary regions:
 
 - navigation sidebar
 - workspace panel
 - central page area
-- derivative inspector
 
 ### Navigation Sidebar
 
@@ -297,9 +296,13 @@ The workspace panel:
 - shows per-dataset progress
 - emits the currently selected dataset to the active analysis page
 
-### Derivative Inspector
+### Derivative Files
 
-The derivative inspector shows the current dataset's stage-by-stage status and allows stage objects to be inspected.
+On Preprocessing, click a saved stage's header to open its file information dialog, which provides actions for opening the derivatives folder or deleting that derivative and its subsequent files. Analysis provides an **Open derivatives folder** button and a **File information** button for the selected saved file.
+
+Deletion lists the affected files for confirmation and includes downstream analysis outputs. Source recordings and imported analysis-only inputs cannot be deleted through these actions.
+
+Processing reruns and saved review changes also require confirmation before deleting dependent results, including when the selected step was previously skipped. The prompt lists affected files and defaults to **No**. Cancelling leaves the saved results intact.
 
 ## 10. Preprocessing Workflow
 
@@ -311,7 +314,7 @@ It organizes work into three sections:
 - Epoching and ICA
 - Preprocessed Output
 
-> Figure Placeholder 3. Preprocessing page showing workflow stages, object summaries, and the evoked preview widget for the current dataset.
+> Figure Placeholder 3. Preprocessing page showing workflow stages and compact file summaries for the current dataset.
 
 ### Available Actions
 

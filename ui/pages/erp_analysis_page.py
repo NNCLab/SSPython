@@ -35,6 +35,7 @@ from core.analysis_events import (
 )
 from ui.widgets.event_selection import EventSelector
 from ui.widgets.evoked_plot import EvokedPlotWidget
+from ui.widgets.layout_helpers import FlowLayout
 from ui.widgets.psd_plot import PSDPlotSettingsDialog
 from ui.widgets.tep_analysis.excitability import ExcitabilityApp
 from ui.widgets.tep_analysis.natural_frequency import NaturalFrequencyApp
@@ -48,6 +49,7 @@ from ui.widgets.source_estimate_widget import (
 )
 from ui.widgets.time_frequency_widget import ComputeTFRSettingsDialog, TimeFrequencyDialog
 from ui.widgets.tools.object_info_widget import ObjectInfoWidget
+from ui.widgets.tools.processing_confirmation import confirm_file_changes
 from utils import Worker
 
 from .base_page import BasePage
@@ -136,6 +138,21 @@ class ErpAnalysisPage(BasePage):
         self.context_label.setObjectName("contextCard")
         self.context_label.setWordWrap(True)
         self.add_content(self.context_label)
+
+        dataset_actions = FlowLayout()
+        self.open_derivatives_button = QPushButton("Open derivatives folder")
+        self.open_derivatives_button.setObjectName("secondaryButton")
+        self.open_derivatives_button.clicked.connect(
+            lambda: self.main_window and self.main_window.dataset_files.open_derivatives_folder()
+        )
+        dataset_actions.addWidget(self.open_derivatives_button)
+        self.file_info_button = QPushButton("File information…")
+        self.file_info_button.setObjectName("secondaryButton")
+        self.file_info_button.clicked.connect(
+            lambda: self.main_window and self.main_window.inspect_dataset_stage("preprocessed")
+        )
+        dataset_actions.addWidget(self.file_info_button)
+        self.add_content(dataset_actions)
 
         self.epochs_info_widget = ObjectInfoWidget()
         self.visualization_group = self._create_visualization_group()
@@ -316,6 +333,13 @@ class ErpAnalysisPage(BasePage):
 
     def update_ui_state(self):
         pipeline_name = self.main_window.current_pipeline.name if self.main_window else "Pipeline"
+        dataset_files = self.main_window.dataset_files if self.main_window else None
+        derivative_folder = dataset_files.derivatives_folder() if dataset_files else None
+        self.open_derivatives_button.setEnabled(derivative_folder is not None)
+        self.open_derivatives_button.setToolTip(str(derivative_folder) if derivative_folder else "")
+        self.file_info_button.setEnabled(
+            bool(self.current_dataset and self.current_dataset.stage_exists("preprocessed"))
+        )
         if not self.current_dataset:
             self.set_page_subtitle("Select a dataset in the workspace panel to inspect preprocessed epochs.")
             self.context_label.setText("Select a dataset that has reached the preprocessed stage.")
@@ -519,6 +543,32 @@ class ErpAnalysisPage(BasePage):
         statistics_params = dialog.get_statistics_params()
         event_code = dialog.event_selector.currentData()
         analysis = self.tep
+
+        deleted_keys = ["tfr_mask", "itc_mask"]
+        replaced_keys = ["tfr"]
+        if statistics_params is None:
+            deleted_keys.append("tfr_statistics")
+        else:
+            replaced_keys.append("tfr_statistics")
+        if compute_params.get("return_itc", False):
+            replaced_keys.append("itc")
+        else:
+            deleted_keys.append("itc")
+
+        def existing_paths(keys):
+            return [
+                path for key in keys
+                if (path := analysis.paths.get(key)) is not None and path.is_file()
+            ]
+
+        if not confirm_file_changes(
+            self,
+            title="Run time-frequency analysis?",
+            message="Recomputing time-frequency analysis replaces saved results and removes incompatible outputs.",
+            deleted_paths=existing_paths(deleted_keys),
+            replaced_paths=existing_paths(replaced_keys),
+        ):
+            return
 
         def compute_and_save():
             result = compute_event_tfrs(analysis.epochs, event_code=event_code, **compute_params)

@@ -3,21 +3,21 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractButton,
     QBoxLayout,
+    QGroupBox,
     QLabel,
     QSizePolicy,
     QSplitter,
+    QVBoxLayout,
     QWidget,
 )
 
 from main import MainWindow
-from ui.pages.preprocessing_page import ProcessingPage, WorkflowDescriptionLabel
+from ui.pages.preprocessing_page import ProcessingPage
 from ui.widgets.real_time_widget import RealTimeMainWidget
-from ui.widgets.workspace_panel import DatasetInspectorPanel
 
 
 class TestResponsiveLayout(unittest.TestCase):
@@ -25,71 +25,30 @@ class TestResponsiveLayout(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_main_shell_uses_resizable_splitter_and_contextual_panels(self):
+    def test_main_shell_keeps_contextual_workspace_without_an_inspector(self):
         window = MainWindow()
+        self.addCleanup(window.close)
         self.assertIsInstance(window.shell_splitter, QSplitter)
+        self.assertEqual(window.shell_splitter.count(), 2)
         self.assertEqual(window.shell_splitter.indexOf(window.workspace_panel), 0)
-        self.assertEqual(window.shell_splitter.indexOf(window.dataset_inspector_panel), 2)
+        self.assertEqual(window.shell_splitter.widget(1).objectName(), "contentFrame")
+        self.assertIsNone(window.findChild(QWidget, "inspectorPanel"))
+        self.assertNotIn(
+            "Toggle Derivative Inspector",
+            [action.text() for action in window.view_menu.actions()],
+        )
 
-        window.navigate_to_page("Preferences")
-        self.app.processEvents()
-        self.assertTrue(window.workspace_panel.isHidden())
-        self.assertTrue(window.dataset_inspector_panel.isHidden())
-
-        window.current_dataset = object()
-        window.navigate_to_page("Home")
-        self.app.processEvents()
-        self.assertFalse(window.workspace_panel.isHidden())
-        self.assertTrue(window.dataset_inspector_panel.isHidden())
-
-        window.navigate_to_page("Preprocessing")
-        self.app.processEvents()
-        self.assertFalse(window.workspace_panel.isHidden())
-        self.assertFalse(window.dataset_inspector_panel.isHidden())
-
-        window.navigate_to_page("Real-Time")
-        self.app.processEvents()
-        self.assertTrue(window.workspace_panel.isHidden())
-        self.assertTrue(window.dataset_inspector_panel.isHidden())
-        window.close()
-
-    def test_inspector_can_be_temporarily_compacted(self):
-        panel = DatasetInspectorPanel()
-        panel.set_responsive_collapsed(True)
-
-        self.assertEqual(panel.minimumWidth(), panel.collapsed_width)
-        self.assertEqual(panel.maximumWidth(), panel.collapsed_width)
-        self.assertTrue(panel.content_container.isHidden())
-
-        panel.set_responsive_collapsed(False)
-        self.assertEqual(panel.minimumWidth(), 220)
-        self.assertEqual(panel.maximumWidth(), 420)
-        self.assertFalse(panel.content_container.isHidden())
-        panel.close()
-
-    def test_collapsed_inspector_returns_its_width_to_the_content(self):
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        content = QWidget()
-        panel = DatasetInspectorPanel()
-        splitter.addWidget(content)
-        splitter.addWidget(panel)
-        splitter.resize(1000, 500)
-        splitter.setSizes([700, 300])
-        splitter.show()
-        self.app.processEvents()
-
-        content_width_before = content.width()
-        panel.set_responsive_collapsed(True)
-        self.app.processEvents()
-
-        self.assertEqual(panel.width(), panel.collapsed_width)
-        self.assertGreater(content.width(), content_width_before)
-        self.assertGreaterEqual(panel.toggle_button.height(), panel.height() - 2)
-
-        panel.set_responsive_collapsed(False)
-        self.app.processEvents()
-        self.assertGreaterEqual(panel.width(), 220)
-        splitter.close()
+        for page_name, uses_workspace in (
+            ("Preferences", False),
+            ("Home", True),
+            ("Preprocessing", True),
+            ("Analysis", True),
+            ("Real-Time", False),
+        ):
+            window.navigate_to_page(page_name)
+            self.app.processEvents()
+            self.assertEqual(window.workspace_panel.isHidden(), not uses_workspace)
+            self.assertEqual(window.shell_splitter.count(), 2)
 
     def test_real_time_configuration_stacks_in_compact_layout(self):
         widget = RealTimeMainWidget()
@@ -152,18 +111,34 @@ class TestResponsiveLayout(unittest.TestCase):
             )
         window.close()
 
-    def test_preprocessing_descriptions_expand_to_their_wrapped_height(self):
+    def test_preprocessing_stage_actions_wrap_in_compact_layout(self):
         page = ProcessingPage()
-        page.resize(520, 700)
-        page.show()
-        self.app.processEvents()
+        stage = page.stage_sections["epochs"]
+        stage.setParent(None)
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(stage)
+        layout.addStretch()
+        self.addCleanup(host.close)
+        self.addCleanup(page.close)
 
-        descriptions = page.findChildren(WorkflowDescriptionLabel)
-        self.assertTrue(descriptions)
-        for description in descriptions:
-            required_height = description.heightForWidth(description.width())
-            self.assertGreaterEqual(description.height(), required_height)
-        page.close()
+        for width, direction in (
+            (1000, QBoxLayout.Direction.LeftToRight),
+            (460, QBoxLayout.Direction.TopToBottom),
+            (1000, QBoxLayout.Direction.LeftToRight),
+        ):
+            host.resize(width, 500)
+            host.show()
+            self.app.processEvents()
+            self.app.processEvents()
+            self.assertEqual(stage.row_layout.direction(), direction)
+            buttons = stage.actions_widget.findChildren(QAbstractButton)
+            self.assertEqual(len(buttons), 4)
+            for index, button in enumerate(buttons):
+                self.assertTrue(stage.actions_widget.rect().contains(button.geometry()))
+                for other in buttons[index + 1:]:
+                    self.assertFalse(button.geometry().intersects(other.geometry()))
 
     def test_preprocessing_renders_each_stage_heading_once(self):
         page = ProcessingPage()
@@ -176,15 +151,16 @@ class TestResponsiveLayout(unittest.TestCase):
         self.assertEqual(
             stage_titles,
             [
-                "Raw Import",
-                "Continuous Cleanup",
-                "Continuous ICA",
-                "Epoch Extraction",
-                "Epoch ICA",
-                "Preprocessed Output",
+                "1. Raw Import",
+                "2. Continuous Cleanup",
+                "3. Continuous ICA",
+                "4. Epoch Extraction",
+                "5. Epoch ICA",
+                "6. Preprocessed Output",
             ],
         )
         self.assertEqual(len(page.action_buttons), 12)
+        self.assertFalse(page.workflow_container.findChildren(QGroupBox))
         page.close()
 
 

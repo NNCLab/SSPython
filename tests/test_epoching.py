@@ -239,6 +239,8 @@ class TestRestingStateEpochingUI(unittest.TestCase):
     def test_dialog_passes_custom_labels_and_uses_latest_raw(self):
         preprocessor = Mock()
         preprocessor.has.side_effect = lambda stage: stage == "raw"
+        preprocessor.paths = {}
+        preprocessor.existing_downstream_files.return_value = []
         preprocessor.raw = resting_raw()
         preprocessor._get_last_continuous.return_value = resting_raw([4.0])
         dialog = EpochingDialog(preprocessor)

@@ -1,10 +1,15 @@
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from PySide6.QtWidgets import QMessageBox
+import mne
+import numpy as np
+from PySide6.QtWidgets import QApplication, QMessageBox
 
+from core.pipelines import discover_datasets, get_pipeline
+from core.processing import Preprocessor
 from ui.pages.preprocessing_page import ProcessingPage, raw_inspection_decimation
 
 
@@ -14,6 +19,61 @@ class _ImmediateWorker:
 
     def exec_with_dialog(self, *_args):
         return self.operation()
+
+
+class TestStageInformation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        raw_path = root / "sub-01_task-tms_raw.fif"
+        raw = mne.io.RawArray(
+            np.zeros((2, 1000)),
+            mne.create_info(["C3", "C4"], 100, "eeg"),
+            verbose=False,
+        )
+        raw.set_annotations(mne.Annotations([1.0], [0], ["Go"]))
+        raw.save(raw_path, verbose=False)
+        dataset = discover_datasets(root, get_pipeline("standard"), "derivatives")[0]
+        self.page = ProcessingPage()
+        self.addCleanup(self.page.close)
+        self.page.current_dataset = dataset
+        self.page.preprocessor = Preprocessor(raw_path, dataset.derivative_root)
+        self.addCleanup(
+            self.page.preprocessor.release_cached_stages,
+            dataset.pipeline.stage_ids(),
+            verbose=False,
+        )
+        self.page._needs_reload = False
+        self.page.update_ui_state()
+
+    def test_selected_recording_shows_compact_file_details(self):
+        summary = self.page.info_widgets_by_stage["raw"]
+        self.assertFalse(summary.isHidden())
+        metrics = [label.toolTip() for label in summary.metric_labels]
+        self.assertIn("Channels: 2", metrics)
+        self.assertIn("Sampling: 100.00 Hz", metrics)
+        self.assertEqual(summary.events_label.text(), "Events · Go: 1")
+        self.assertTrue(self.page.info_widgets_by_stage["epochs"].isHidden())
+
+        self.page.current_dataset = None
+        self.page.update_ui_state()
+
+        self.assertTrue(summary.isHidden())
+        self.assertEqual(summary.metric_labels, [])
+        self.assertEqual(summary.events_label.text(), "")
+
+    def test_releasing_stage_resources_clears_its_summary(self):
+        self.page.release_derivative_resources([self.page.current_dataset.raw_path])
+
+        summary = self.page.info_widgets_by_stage["raw"]
+        self.assertTrue(summary.isHidden())
+        self.assertEqual(summary.metric_labels, [])
+        self.assertTrue(self.page._needs_reload)
 
 
 class TestICASaving(unittest.TestCase):

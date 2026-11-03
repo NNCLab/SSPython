@@ -25,6 +25,7 @@ import logging
 
 from core.app_settings import get_settings_store
 from .tools.advanced_settings import AdvancedSettings
+from .tools.processing_confirmation import confirm_processing_update
 
 logger = logging.getLogger(__name__)
 
@@ -240,28 +241,15 @@ class RunICADialog(QDialog):
 
     def run_ica(self):
         ica_params = self.settings_widget.get_params()
+        if not confirm_processing_update(
+            self,
+            self.preprocessor,
+            f"{self.mode}_ica",
+            title="Run ICA and update saved results?",
+            message=f"Run {self.mode} ICA with the selected settings?",
+        ):
+            return
         self.settings_widget.save_settings()
-
-        if self.preprocessor.has(f"{self.mode}_ica"):
-            stage_id = f"{self.mode}_ica"
-            downstream_files = self.preprocessor.existing_downstream_files(stage_id)
-            downstream_warning = ""
-            if downstream_files:
-                file_names = "\n".join(f" - {path.name}" for _, path in downstream_files)
-                downstream_warning = (
-                    "\n\nOverwriting this ICA will also delete these dependent files:\n"
-                    f"{file_names}"
-                )
-            reply = QMessageBox.question(
-                self,
-                "Overwrite ICA?",
-                f"{self.mode.split('-')[0].capitalize()} ICA data already exists. "
-                f"Do you want to overwrite it?{downstream_warning}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.No:
-                return
 
         logger.info(f"Running {self.mode} ICA with parameters: {ica_params}")
         if self.mode == "continuous":

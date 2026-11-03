@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import mne
 import numpy as np
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from statsmodels.stats.multitest import fdrcorrection
 
 from core.analysis_events import compute_event_tfrs, tfr_event_metadata
@@ -336,6 +336,10 @@ class TestEventTFRStatistics(unittest.TestCase):
                 patch("ui.pages.erp_analysis_page.ComputeTFRSettingsDialog", return_value=dialog),
                 patch.object(dialog, "exec", return_value=QDialog.DialogCode.Accepted),
                 patch("ui.pages.erp_analysis_page.Worker", ImmediateWorker),
+                patch(
+                    "ui.widgets.tools.processing_confirmation.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
                 patch.object(page, "update_ui_state"),
                 patch.object(page, "open_time_frequency_widget"),
             ):

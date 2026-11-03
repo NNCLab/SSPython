@@ -142,6 +142,7 @@ class TestRunICAStageLookup(unittest.TestCase):
     def test_continuous_mode_uses_pipeline_stage_identifier(self):
         preprocessor = Mock()
         preprocessor.has.return_value = True
+        preprocessor.paths = {"continuous_ica": Path("subject_desc-continuousica_ica.fif")}
         preprocessor.existing_downstream_files.return_value = [
             ("epochs", Path("subject_desc-epoched_epo.fif")),
         ]

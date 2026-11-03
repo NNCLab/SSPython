@@ -38,7 +38,7 @@ QLabel, QCheckBox, QRadioButton {
     background: transparent;
 }
 
-#sidebar, #workspacePanel, #inspectorPanel {
+#sidebar, #workspacePanel {
     background: rgba(255, 255, 255, 184);
 }
 
@@ -50,12 +50,6 @@ QLabel, QCheckBox, QRadioButton {
     border-right: 1px solid #d7e0e3;
     min-width: 240px;
     max-width: 440px;
-}
-
-#inspectorPanel {
-    border-left: 1px solid #d7e0e3;
-    min-width: 40px;
-    max-width: 420px;
 }
 
 QSplitter#shellSplitter::handle {
@@ -91,7 +85,7 @@ QSplitter#shellSplitter::handle:hover {
     color: #142228;
 }
 
-#datasetTitle, #inspectorTitle, #pipelineCardTitle, #stageStatusLabel {
+#datasetTitle, #pipelineCardTitle {
     font-size: 11pt;
     font-weight: 600;
     color: #132228;
@@ -106,7 +100,7 @@ QSplitter#shellSplitter::handle:hover {
     line-height: 1.4;
 }
 
-#heroCard, #contextCard, #inspectorCard, #pipelineCard, #pageHeader {
+#heroCard, #contextCard, #pipelineCard, #pageHeader {
     background: #ffffff;
     border: 1px solid #d7e0e3;
     border-radius: 10px;
@@ -132,7 +126,7 @@ QSplitter#shellSplitter::handle:hover {
     background: #f2f8f9;
 }
 
-#pipelineBadge, #statusTag, #optionalTag {
+#pipelineBadge, #statusTag {
     background: #edf4f6;
     color: #235f6c;
     border: 1px solid #c4d9df;
@@ -142,13 +136,7 @@ QSplitter#shellSplitter::handle:hover {
     font-weight: 600;
 }
 
-#optionalTag {
-    background: #f5f6f7;
-    color: #6a7780;
-    border-color: #d7dfe3;
-}
-
-#sidebarToggle, #inspectorToggle {
+#sidebarToggle {
     background: transparent;
     border: none;
     border-radius: 0;
@@ -159,7 +147,7 @@ QSplitter#shellSplitter::handle:hover {
     font-weight: 600;
 }
 
-#sidebarToggle:hover, #inspectorToggle:hover {
+#sidebarToggle:hover {
     background: #eef4f6;
 }
 
@@ -173,12 +161,6 @@ QSplitter#shellSplitter::handle:hover {
 #sidebarToggle[collapsed="true"] {
     min-width: 60px;
     max-width: 60px;
-}
-
-#inspectorToggle[collapsed="true"] {
-    min-height: 0;
-    padding: 0;
-    border-radius: 0;
 }
 
 #navList {
@@ -261,12 +243,6 @@ QSplitter#shellSplitter::handle:hover {
     border: none;
 }
 
-#stageStatusList {
-    background: #ffffff;
-    border: 1px solid #d7e0e3;
-    border-radius: 8px;
-}
-
 QPushButton {
     background: #1d6775;
     color: #f7fbfc;
@@ -328,7 +304,7 @@ QPushButton[analysisAction="true"] {
 }
 
 QPushButton[workflowButton="true"] {
-    min-height: 38px;
+    min-height: 20px;
     padding: 9px 12px;
 }
 
@@ -392,16 +368,6 @@ QPushButton[workflowButton="true"][stepState="locked"] {
     background: #eef2f3;
     color: #8a969d;
     border-color: #d9e1e4;
-}
-
-QPushButton[workflowButton="true"][optionalStep="true"][stepState="available"] {
-    border-left: 3px solid #d29a42;
-    padding-left: 10px;
-}
-
-QPushButton[workflowButton="true"][optionalStep="true"][stepState="complete"] {
-    border-left: 3px solid #c48b2f;
-    padding-left: 10px;
 }
 
 QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
@@ -674,82 +640,131 @@ QProgressBar#datasetProgress[selected="true"]::chunk {
     font-weight: 600;
 }
 
-#objectInfoDetailSection {
-    background: #ffffff;
-    border: 1px solid #d7e0e3;
-    border-radius: 8px;
+/* File information */
+#fileInfoDialog #fileInfoTitle {
+    font-size: 14pt;
+    font-weight: 600;
+    color: #16242a;
 }
-
-#objectInfoDetailKey {
-    color: #687780;
+#fileInfoDialog #fileInfoStatus {
+    color: #226879;
+    font-size: 9pt;
+    padding-top: 5px;
+}
+#fileInfoDescription, QLineEdit#fileInfoPath {
+    color: #546a75;
+    font-size: 9.2pt;
+}
+QLineEdit#fileInfoPath {
+    background: transparent;
+    border: none;
+    padding: 0;
+    selection-background-color: #dcecf0;
+    selection-color: #16242a;
+}
+#fileInfoDialog #stageSummary {
+    border: none;
+    border-bottom: 1px solid #d7e0e3;
+}
+#fileInfoDialog #stageSummaryMetric {
+    color: #16242a;
+    font-size: 10pt;
+}
+#fileInfoDetailsScroll, #fileInfoDetailsContent, #fileInfoSection,
+#fileInfoHistorySection, #fileInfoDetailsSplitter, #fileInfoFooter {
+    background: transparent;
+    border: none;
+}
+#fileInfoSectionTitle {
+    color: #16242a;
+    font-size: 10pt;
     font-weight: 600;
 }
-
-#objectInfoDetailValue {
-    color: #16242a;
+#fileInfoDetailKey {
+    color: #546a75;
+    font-size: 9.5pt;
 }
-
-QPlainTextEdit#objectInfoDetailEditor {
-    background: #ffffff;
-    border: 1px solid #cfd8dc;
-    border-radius: 6px;
+#fileInfoDetailValue {
     color: #16242a;
-    padding: 8px;
+    font-size: 9.5pt;
 }
-
-QTreeWidget#objectInfoLogTree {
-    background: #ffffff;
-    border: 1px solid #cfd8dc;
-    border-radius: 6px;
+QTreeWidget#fileInfoHistoryTree {
+    background: transparent;
+    color: #16242a;
+    border: none;
     outline: none;
-    padding: 4px;
+    padding: 0;
+    font-size: 9.5pt;
+    selection-background-color: #dcecf0;
 }
-
-QTreeWidget#objectInfoLogTree::item {
+QTreeWidget#fileInfoHistoryTree::item {
     padding: 4px 0;
 }
-
-#progressSegment {
-    min-height: 8px;
-    background: #eef2f3;
-    border: 1px solid #d5dee2;
-    border-radius: 3px;
-}
-
-#progressSegment[state="complete"] {
-    background: #2b7b89;
-    border-color: #2b7b89;
-}
-
-#progressSegment[state="skipped"] {
-    background: #d7e4e8;
-    border-color: #c2d2d8;
-}
-
-#stageStatusRow {
+#fileInfoHistoryTree QHeaderView::section {
     background: transparent;
+    color: #546a75;
+    border: none;
+    border-bottom: 1px solid #d7e0e3;
+    padding: 0 0 7px 0;
+    font-size: 9pt;
+    font-weight: 400;
+}
+QSplitter#fileInfoDetailsSplitter::handle {
+    background: transparent;
+}
+QSplitter#fileInfoDetailsSplitter::handle:hover {
+    background: #d7e0e3;
+}
+
+#preprocessingHeader, #workflowContainer, #workflowStage, #workflowHeading, #workflowActions {
+    background: transparent;
+    border: none;
+    margin: 0;
+    padding: 0;
+}
+
+#stageSummary, #stageSummaryMetrics {
+    background: transparent;
+    border: none;
+}
+#workflowStageDescription, #stageSummaryMetric, #stageSummaryEvents {
+    color: #546a75;
+    font-size: 9.2pt;
+}
+
+#workflowStage { border-bottom: 1px solid #d6e0e4; }
+#stageStateLabel { color: #546a75; }
+#stageStateLabel[state="complete"] { color: #226879; }
+#emptyState {
+    background: #ffffff;
+    border: 1px solid #d7e0e3;
+    border-radius: 10px;
+}
+
+#fileInfoLink { background: transparent; border: none; }
+QToolButton#fileInfoButton {
+    background: transparent;
+    color: #226879;
     border: 1px solid transparent;
-    border-bottom: 1px solid #e4eaed;
-    border-radius: 6px;
-    padding: 8px;
-}
-
-#stageStatusRow[interactive="true"]:hover {
-    background: #f5f8f9;
-    border-color: #d7e0e3;
-}
-
-#stageDot {
     border-radius: 4px;
-    background: #cfdade;
+    padding: 0;
 }
-
-#stageDot[state="complete"] {
-    background: #2b7b89;
+QToolButton#fileInfoButton:hover, QToolButton#fileInfoButton:focus {
+    background: #dcecf0;
+    border-color: #468394;
 }
+QLabel[inspectable="true"]:hover { color: #226879; text-decoration: underline; }
 
-#stageDot[state="skipped"] {
-    background: #c49547;
+#datasetListItem { background: transparent; border-radius: 6px; }
+#datasetListItem[selected="true"] { background: #dcecf0; }
+QProgressBar#datasetProgress[compact="true"] {
+    border: none;
+    border-radius: 1px;
+    background: #d6e0e4;
+}
+QProgressBar#datasetProgress[compact="true"]::chunk {
+    background: #468394;
+    border-radius: 1px;
 }
 
 QMenuBar {
