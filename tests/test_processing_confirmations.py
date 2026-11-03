@@ -71,6 +71,7 @@ class TestProcessingConfirmations(unittest.TestCase):
                 dialog.preprocessor.existing_downstream_files.assert_called_once_with(stage_id)
                 worker.assert_not_called()
                 getattr(dialog.preprocessor, operation).assert_not_called()
+                dialog.settings_widget.save_settings.assert_not_called()
                 dialog.accept.assert_not_called()
                 self.assertEqual(path.read_text(encoding="utf-8"), "saved result")
 
@@ -99,6 +100,7 @@ class TestProcessingConfirmations(unittest.TestCase):
                     dialog_class.run_process(dialog)
 
                 self.assertEqual(events, ["confirmed", "processed"])
+                dialog.settings_widget.save_settings.assert_not_called()
                 self.assertFalse(path.exists())
                 dialog.accept.assert_called_once_with()
 
@@ -115,6 +117,7 @@ class TestProcessingConfirmations(unittest.TestCase):
 
                 confirm.assert_not_called()
                 getattr(dialog.preprocessor, operation).assert_called_once_with(**params)
+                dialog.settings_widget.save_settings.assert_not_called()
                 dialog.accept.assert_called_once_with()
 
     def test_orphaned_filter_checkpoint_requires_confirmation_before_replacement(self):
@@ -151,6 +154,7 @@ class TestProcessingConfirmations(unittest.TestCase):
                 confirm.assert_not_called()
                 worker.assert_not_called()
                 getattr(dialog.preprocessor, operation).assert_not_called()
+                dialog.settings_widget.save_settings.assert_not_called()
 
 
 if __name__ == "__main__":

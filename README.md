@@ -6,7 +6,7 @@ The current application ships one built-in `Standard` pipeline. It provides the 
 
 The pipeline system is structured so future custom pipelines can define different workflow sections and actions without duplicating the standard workflow.
 
-The software is currently in a pre-release stage. Validate all outputs before using them for publication, regulatory work, or clinical interpretation.
+The software is currently in a pre-release stage. Validate all outputs before using them for publication, regulatory work, or neurophisiological interpretation.
 
 > Figure Placeholder 1. Main application window showing the navigation sidebar, workspace panel, and central analysis page.
 
@@ -350,10 +350,11 @@ are shown. Disable both cutoff checkboxes to bypass the high-pass/low-pass filte
 
 Existing settings keep their previous behavior: a third-order Butterworth IIR
 bandpass with zero-phase filtering and FIR notch filtering. Each pipeline and
-processing step keeps separate defaults. **Apply** uses the current filter settings
-for this run; **Save as defaults** explicitly saves them for future runs.
-**Restore defaults** restores the built-in values in the dialog without replacing
-saved defaults. The same editors are available under Preferences.
+processing step keeps separate suggestions. Expert users define these under
+**Preferences**. Processing dialogs load those suggestions; edits and **Apply**
+affect only the current run, including artifact removal and ICA.
+Each new dialog loads the saved suggestions. Processing and plotting dialogs never
+save changes back to Preferences.
 
 Other infrequently changed settings are available under **Advanced settings**:
 
@@ -551,10 +552,14 @@ The preferences page is implemented in [preferences_page.py](/C:/Users/DW60ZF/Do
 
 It exposes four main categories:
 
-- Workspace and Appearance
-- Preprocessing Defaults
-- ICA Defaults
-- Real-Time
+- General: workspace, appearance, and plotting suggestions, including PSD
+- Preprocessing: artifact-removal, filtering, and epoching suggestions
+- ICA: fitting, plotting, and label-exclusion suggestions
+- Real-time: connection and plotting suggestions
+
+Preferences define suggestions for future runs. Editing, applying, or cancelling a
+processing or plotting dialog leaves those saved suggestions unchanged. Saving
+Preferences validates every category before writing changes.
 
 ### Global Settings
 

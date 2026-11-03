@@ -5,6 +5,8 @@ from typing import Any, Iterable
 
 from PySide6.QtCore import QSettings
 
+SETTINGS_ORGANIZATION = "SSPython"
+SETTINGS_APPLICATION = "SSPython"
 SETTINGS_SCHEMA_VERSION = 3
 
 DEFAULT_THEME = "dark"
@@ -84,7 +86,14 @@ class SettingsStore:
     }
 
     def __init__(self, settings: QSettings | None = None):
-        self.settings = settings or QSettings()
+        # MNE viewers can change the identity of the existing QApplication.
+        # Always use SSPython's identity, including for dialogs opened afterward.
+        self.settings = settings if settings is not None else QSettings(
+            QSettings.defaultFormat(),
+            QSettings.Scope.UserScope,
+            SETTINGS_ORGANIZATION,
+            SETTINGS_APPLICATION,
+        )
         self.migrate()
 
     def migrate(self):

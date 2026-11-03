@@ -8,7 +8,6 @@ from PySide6.QtCore import (
     QEasingCurve,
     QParallelAnimationGroup,
     QPropertyAnimation,
-    QSettings,
     QSize,
     QTimer,
     Qt,
@@ -37,7 +36,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.app_settings import get_settings_store
+from core.app_settings import (
+    SETTINGS_APPLICATION,
+    SETTINGS_ORGANIZATION,
+    get_settings_store,
+)
 from core.exporting import (
     evoked_export_targets,
     export_evoked_files,
@@ -61,8 +64,8 @@ from utils import Worker, apply_theme, get_path, themed_svg_icon, toggle_theme a
 
 os.environ["MNE_FORCE_EAGER"] = "1"
 
-APP_NAME = "SSPython"
-ORGANIZATION_NAME = "SSPython"
+APP_NAME = SETTINGS_APPLICATION
+ORGANIZATION_NAME = SETTINGS_ORGANIZATION
 APP_VERSION = __version__
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -162,8 +165,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
 
-        self.settings = QSettings()
-        self.settings_store = get_settings_store(self.settings)
+        self.settings_store = get_settings_store()
+        self.settings = self.settings_store.settings
 
         self.current_folder = self.settings_store.current_folder()
         if self.current_folder and not self.current_folder.exists():

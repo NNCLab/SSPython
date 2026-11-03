@@ -109,6 +109,7 @@ class TestRunICAConfirmation(unittest.TestCase):
                 operation.assert_called_once_with()
                 self.assertTrue(all(not path.exists() for path in saved_paths))
                 self.assertEqual(dialog.preprocessor.paths[f"{mode}_ica"].read_bytes(), b"new ICA")
+                dialog.settings_widget.save_settings.assert_not_called()
                 dialog.accept.assert_called_once_with()
 
     def test_first_run_without_saved_outputs_needs_no_deletion_prompt(self):
@@ -124,6 +125,7 @@ class TestRunICAConfirmation(unittest.TestCase):
 
                 question.assert_not_called()
                 operation.assert_called_once_with()
+                dialog.settings_widget.save_settings.assert_not_called()
 
     def test_existing_ica_still_requires_overwrite_confirmation_without_downstream_files(self):
         with tempfile.TemporaryDirectory() as directory:

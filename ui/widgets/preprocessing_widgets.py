@@ -140,6 +140,11 @@ class BaseProcessingDialog(QDialog):
         self.settings_widget = settings_widget
 
         layout = QVBoxLayout(self)
+        suggestions_label = QLabel(
+            "Suggestions from Preferences. Changes apply to this run only."
+        )
+        suggestions_label.setWordWrap(True)
+        layout.addWidget(suggestions_label)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -159,24 +164,14 @@ class BaseProcessingDialog(QDialog):
         self.apply_button = QPushButton("Apply")
         self.apply_button.setDefault(True)
         self.cancel_button = QPushButton("Cancel")
-        self.reset_button = QPushButton("Restore defaults")
-        self.save_defaults_button = QPushButton("Save as defaults")
 
         hbox.addStretch()
-        hbox.addWidget(self.reset_button)
-        hbox.addWidget(self.save_defaults_button)
         hbox.addWidget(self.cancel_button)
         hbox.addWidget(self.apply_button)
         layout.addLayout(hbox)
 
         self.apply_button.clicked.connect(self.run_process)
         self.cancel_button.clicked.connect(self.reject)
-        if hasattr(self.settings_widget, "restore_defaults"):
-            self.reset_button.clicked.connect(self.settings_widget.restore_defaults)
-        else:
-            self.reset_button.hide()
-        self.save_defaults_button.clicked.connect(self._save_defaults)
-
         self._apply_compact_size()
 
     def _apply_compact_size(
@@ -200,12 +195,6 @@ class BaseProcessingDialog(QDialog):
     def run_process(self):
         """To be implemented by subclasses to perform the actual processing logic."""
         raise NotImplementedError("Subclasses must implement run_process()")
-
-    def _save_defaults(self):
-        try:
-            self.settings_widget.save_settings()
-        except ValueError as error:
-            QMessageBox.critical(self, "Invalid Input", str(error))
 
 
 class BaseSettingsWidget(QWidget):
@@ -387,7 +376,6 @@ class ArtifactRemovalDialog(BaseProcessingDialog):
     def run_process(self):
         try:
             params = self.settings_widget.get_params()
-            self.settings_widget.save_settings()
             logger.info(f"Running artifact removal with parameters: {params}")
         except ValueError as e:
             QMessageBox.critical(self, "Invalid Input", str(e))
@@ -1008,7 +996,6 @@ class ReReferenceDialog(BaseProcessingDialog):
     def run_process(self):
         try:
             params = self.settings_widget.get_params()
-            self.settings_widget.save_settings()
         except ValueError as e:
             QMessageBox.critical(self, "Invalid Input", str(e))
             return
@@ -1271,10 +1258,6 @@ class ApplyPreprocessingDialog(BaseProcessingDialog):
     def load_settings(self):
         """Delegates loading settings directly to the widget."""
         self.settings_widget.load_settings()
-
-    def save_settings(self):
-        """Delegates saving settings directly to the widget."""
-        self.settings_widget.save_settings()
 
     def run_process(self):
         """Validates input and starts the background worker."""

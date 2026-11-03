@@ -165,20 +165,27 @@ class GlobalSettingsWidget(QWidget):
         self.output_dir_input.setText(output_root)
         self.n_jobs_input.setText(str(n_jobs))
 
-    def save_settings(self):
-        self.plot_settings_widget.save_settings()
-
+    def get_params(self) -> dict[str, Any]:
         output_root = self.output_dir_input.text().strip() or DEFAULT_OUTPUT_ROOT
         try:
             n_jobs = int(self.n_jobs_input.text())
         except (TypeError, ValueError) as exc:
             raise ValueError("Parallel Jobs (n_jobs) must be an integer.") from exc
+        return {
+            "pipeline_id": self.pipeline_combo.currentData(),
+            "theme": self.theme_combo.currentText(),
+            "output_root": output_root,
+            "n_jobs": n_jobs,
+        }
 
-        self.settings_store.set("workspace/current_pipeline", self.pipeline_combo.currentData())
-        self.settings_store.set("appearance/theme", self.theme_combo.currentText())
-        self.settings_store.set("workspace/output_root", output_root)
-        self.settings_store.set("workspace/n_jobs", n_jobs)
-        self.settings_store.set("global_settings/output_dir", output_root)
+    def save_settings(self):
+        params = self.get_params()
+        self.plot_settings_widget.save_settings()
+        self.settings_store.set("workspace/current_pipeline", params["pipeline_id"])
+        self.settings_store.set("appearance/theme", params["theme"])
+        self.settings_store.set("workspace/output_root", params["output_root"])
+        self.settings_store.set("workspace/n_jobs", params["n_jobs"])
+        self.settings_store.set("global_settings/output_dir", params["output_root"])
         self.settings_store.sync()
 
     def clear_settings(self):

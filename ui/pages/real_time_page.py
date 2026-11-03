@@ -14,3 +14,8 @@ class RealTimePage(BasePage):
         self.content_layout.setSpacing(28)
         self.widget = RealTimeMainWidget(self)
         self.add_content(self.widget)
+
+    def on_settings_updated(self):
+        # Reload setup suggestions; loading plot controls suppresses live updates.
+        self.widget.connection_widget.load_settings()
+        self.widget.plot_settings_widget.load_settings()

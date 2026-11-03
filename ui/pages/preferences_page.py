@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 from utils import apply_theme
 
 from .base_page import BasePage
+from ..widgets.auto_label import ICALabelingSettingsWidget
 from ..widgets.ica_widget import ICAPlottingSettingsWidget
 from ..widgets.preprocessing_widgets import (
     ArtifactRemovalSettingsWidget,
@@ -26,6 +27,7 @@ from ..widgets.preprocessing_widgets import (
     EpochingSettingsWidget,
     PreprocessingSettingsWidget,
 )
+from ..widgets.psd_plot import PSDPlotSettingsWidget
 from ..widgets.real_time_widget import ConnectionWidget, RealTimeSettingsWidget
 from ..widgets.run_ica_widget import ICASettingsWidget
 from ..widgets.tools.global_preferences import GlobalSettingsWidget
@@ -97,6 +99,7 @@ class PreferencesPage(BasePage):
     def _populate_categories(self):
         self.global_settings_widget = GlobalSettingsWidget()
         self.global_settings_widget.pipeline_combo.currentIndexChanged.connect(self._sync_pipeline_preview)
+        self.psd_plot_widget = PSDPlotSettingsWidget()
 
         self.artifact_widget = ArtifactRemovalSettingsWidget()
         self.continuous_filter_widget = FilterContinuousWidget()
@@ -105,13 +108,14 @@ class PreferencesPage(BasePage):
         self.ica_continuous_widget = ICASettingsWidget("continuous")
         self.ica_epochs_widget = ICASettingsWidget("epochs")
         self.ica_plotting_widget = ICAPlottingSettingsWidget()
+        self.ica_labeling_widget = ICALabelingSettingsWidget()
         self.ica_continuous_widget.findChild(QGroupBox).setTitle("Continuous ICA")
         self.ica_epochs_widget.findChild(QGroupBox).setTitle("Epoch ICA")
         self.ica_plotting_widget.findChild(QGroupBox).setTitle("ICA plotting")
         self.connection_widget = ConnectionWidget()
         self.real_time_plot_widget = RealTimeSettingsWidget()
 
-        self.add_settings_category("General", self.global_settings_widget)
+        self.add_settings_category("General", self.global_settings_widget, self.psd_plot_widget)
         self.add_settings_category(
             "Preprocessing",
             self.artifact_widget,
@@ -124,6 +128,7 @@ class PreferencesPage(BasePage):
             self.ica_continuous_widget,
             self.ica_epochs_widget,
             self.ica_plotting_widget,
+            self.ica_labeling_widget,
         )
         self.add_settings_category(
             "Real-time",
@@ -227,6 +232,14 @@ class PreferencesPage(BasePage):
 
     def save_all_settings(self):
         try:
+            # Validate every form before any form writes its suggestions.
+            for widget in self.settings_widgets:
+                if hasattr(widget, "validate_settings"):
+                    widget.validate_settings()
+                elif hasattr(widget, "get_params"):
+                    widget.get_params()
+                elif hasattr(widget, "get_settings"):
+                    widget.get_settings()
             for widget in self.settings_widgets:
                 if hasattr(widget, "save_settings"):
                     widget.save_settings()

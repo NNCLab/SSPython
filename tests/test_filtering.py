@@ -282,8 +282,10 @@ class TestAdvancedSettingsUI(unittest.TestCase):
             worker.return_value._error = None
             dialog.run_process()
         self.assertEqual(self.store.get(dialog.settings_widget.get_settings_path()), original_defaults)
-        dialog._save_defaults()
-        self.assertEqual(self.store.get(dialog.settings_widget.get_settings_path())["filter_config"]["iir_order"], 6)
+        self.assertFalse(hasattr(dialog, "save_defaults_button"))
+        self.assertFalse(hasattr(dialog, "reset_button"))
+        self.assertEqual(dialog.settings_widget.get_params()["filter_config"]["iir_order"], 6)
+        self.assertEqual(self.store.get(dialog.settings_widget.get_settings_path()), original_defaults)
         dialog.close()
 
 

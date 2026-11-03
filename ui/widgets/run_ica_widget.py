@@ -90,15 +90,14 @@ class ICASettingsWidget(QWidget):
         if self.max_components is not None:
             self.n_components_input.setRange(1, self.max_components)
         else:
-            self.n_components_input.setVisible(False)
+            self.n_components_input.setRange(1, 2_147_483_647)
 
         self.auto_n_components_checkbox.toggled.connect(
             self.n_components_input.setDisabled
         )
 
         form_layout.addRow(self.auto_n_components_checkbox)
-        if self.max_components is not None:
-            form_layout.addRow(QLabel("Number of Components:"), self.n_components_input)
+        form_layout.addRow(QLabel("Number of Components:"), self.n_components_input)
         group.setLayout(form_layout)
         self.advanced_settings = AdvancedSettings()
         self.advanced_settings.form.addRow("Random State:", self.random_state_input)
@@ -110,7 +109,6 @@ class ICASettingsWidget(QWidget):
     def load_settings(self):
         """Loads ICA parameters from a QSettings object into the UI."""
         defaults = {
-            "auto_n_components": True,
             "random_state": None,
             "max_iter": 1000,
             "method": "fastica",
@@ -123,9 +121,13 @@ class ICASettingsWidget(QWidget):
         params = defaults.copy()
         params.update(saved_params)
 
-        self.auto_n_components_checkbox.setChecked(params.get("auto_n_components"))
-        if self.max_components is not None:
-            self.n_components_input.setValue(self.max_components)
+        n_components = params.get("n_components")
+        self.auto_n_components_checkbox.setChecked(
+            params.get("auto_n_components", n_components is None)
+        )
+        self.n_components_input.setValue(
+            n_components if n_components is not None else self.max_components or 1
+        )
         self.random_state_input.setText(to_display_string(params.get("random_state")))
         self.max_iter_input.setValue(params.get("max_iter"))
         self.ica_method_input.setCurrentText(params.get("method"))
@@ -146,6 +148,7 @@ class ICASettingsWidget(QWidget):
         """Parses UI controls to get ICA parameters."""
 
         self.max_iter_input.interpretText()
+        self.n_components_input.interpretText()
 
         if self.auto_n_components_checkbox.isChecked():
             n_components = None
@@ -192,6 +195,12 @@ class RunICADialog(QDialog):
         layout = QVBoxLayout(self)
         self.setLayout(layout)
 
+        suggestions_label = QLabel(
+            "Suggestions from Preferences. Changes apply to this run only."
+        )
+        suggestions_label.setWordWrap(True)
+        layout.addWidget(suggestions_label)
+
         # Create and add the settings widget
         if mode == "continuous":
             raw = self.preprocessor._get_last_continuous()
@@ -224,10 +233,8 @@ class RunICADialog(QDialog):
         self.apply_button = QPushButton("Run")
         self.apply_button.setDefault(True)
         self.cancel_button = QPushButton("Cancel")
-        self.reset_button = QPushButton("Reset Defaults")
 
         hbox.addStretch()
-        hbox.addWidget(self.reset_button)
         hbox.addWidget(self.cancel_button)
         hbox.addWidget(self.apply_button)
         layout.addLayout(hbox)
@@ -235,9 +242,6 @@ class RunICADialog(QDialog):
         # Connect signals
         self.apply_button.clicked.connect(self.run_ica)
         self.cancel_button.clicked.connect(self.reject)
-        self.reset_button.clicked.connect(
-            self.settings_widget.load_settings
-        )
 
     def run_ica(self):
         ica_params = self.settings_widget.get_params()
@@ -249,8 +253,6 @@ class RunICADialog(QDialog):
             message=f"Run {self.mode} ICA with the selected settings?",
         ):
             return
-        self.settings_widget.save_settings()
-
         logger.info(f"Running {self.mode} ICA with parameters: {ica_params}")
         if self.mode == "continuous":
             worker = Worker(

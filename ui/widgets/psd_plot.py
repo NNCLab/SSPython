@@ -45,12 +45,12 @@ class PSDPlotSettingsWidget(QWidget):
 
     def _nyquist_frequency(self) -> float:
         if self.epochs is None:
-            return 50.0
+            return math.inf
         return float(self.epochs.info["sfreq"]) / 2.0
 
     def _epoch_time_bounds(self) -> tuple[float, float]:
         if self.epochs is None or len(self.epochs.times) == 0:
-            return (0.0, 0.0)
+            return (-math.inf, math.inf)
         return (float(self.epochs.times[0]), float(self.epochs.times[-1]))
 
     def _default_params(self) -> dict[str, Any]:
@@ -235,10 +235,16 @@ class PSDPlotSettingsWidget(QWidget):
         }
 
     def save_settings(self):
+        self.validate_settings()
         params = self.get_settings()
         self.settings_store.set(self.SETTINGS_PATH, params)
         self.settings_store.set("plot_settings/psd_plot_params", params)
         self.settings_store.sync()
+
+    def validate_settings(self):
+        error = self.validation_error()
+        if error:
+            raise ValueError(f"PSD: {error}")
 
     def _parse_picks(self, value: str):
         cleaned_value = value.strip()
@@ -328,7 +334,6 @@ class PSDPlotSettingsDialog(QDialog):
         if error:
             QMessageBox.warning(self, "Invalid PSD Parameters", error)
             return
-        self.settings_widget.save_settings()
         super().accept()
 
     def get_plot_params(self) -> dict[str, Any]:

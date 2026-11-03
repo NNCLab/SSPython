@@ -183,11 +183,6 @@ class ICAPlottingDialog(QDialog):
 
         layout.addWidget(buttons)
 
-    def accept(self):
-        """Saves settings when the user clicks 'OK'."""
-        self.settings_widget.save_settings()
-        super().accept()
-
     def get_settings(self):
         """Returns the current settings from the widget."""
         return self.settings_widget.get_settings()

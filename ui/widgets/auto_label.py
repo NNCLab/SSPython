@@ -19,8 +19,10 @@ from PySide6.QtWidgets import (
     QProgressDialog,
 )
 from utils import Worker
-from PySide6.QtCore import Qt, Signal, QSettings, QCoreApplication
+from PySide6.QtCore import Qt, Signal, QCoreApplication
 import numpy as np
+
+from core.app_settings import get_settings_store
 
 # Define the labels that can be automatically excluded
 EXCLUDABLE_LABELS = [
@@ -44,13 +46,52 @@ LABEL_EMOJIS = {
 }
 
 
+class ICALabelingSettingsWidget(QWidget):
+    """Saved suggestions for which ICLabel classes to exclude."""
+
+    GROUP_SETTINGS = "ica_label"
+    SETTINGS_PATH = f"{GROUP_SETTINGS}/exclude"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.settings_store = get_settings_store()
+        self.label_checkboxes = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        group_box = QGroupBox("ICA label exclusion suggestions")
+        group_layout = QVBoxLayout(group_box)
+        for label in EXCLUDABLE_LABELS:
+            emoji = LABEL_EMOJIS.get(label, "")
+            checkbox = QCheckBox(f"{emoji} {label.replace('_', ' ').title()}".strip())
+            group_layout.addWidget(checkbox)
+            self.label_checkboxes[label] = checkbox
+        layout.addWidget(group_box)
+        self.load_settings()
+
+    def load_settings(self):
+        for label, checkbox in self.label_checkboxes.items():
+            checkbox.setChecked(self.settings_store.get(
+                f"{self.SETTINGS_PATH}/{label}", True, value_type=bool,
+            ))
+
+    def get_settings(self) -> dict[str, bool]:
+        return {
+            label: checkbox.isChecked()
+            for label, checkbox in self.label_checkboxes.items()
+        }
+
+    def save_settings(self):
+        for label, selected in self.get_settings().items():
+            self.settings_store.set(f"{self.SETTINGS_PATH}/{label}", selected)
+        self.settings_store.sync()
+
+
 class ICALabelingDialog(QDialog):
     """
     A dialog to show ICLabel results and allow the user to select components for exclusion.
     """
 
-    # Define a group name for QSettings to avoid key collisions
-    GROUP_SETTINGS = "ica_label"
+    GROUP_SETTINGS = ICALabelingSettingsWidget.GROUP_SETTINGS
 
     def __init__(self, ica, epochs, parent=None):
         super().__init__(parent)
@@ -61,11 +102,13 @@ class ICALabelingDialog(QDialog):
         self.ica = ica
         self.epochs = epochs
         self.ic_labels = None
-        self.settings = QSettings()
-        self.label_checkboxes = {}
-
         # --- Layout ---
         self.layout = QVBoxLayout(self)
+        suggestions_label = QLabel(
+            "Suggestions from Preferences. Changes apply to this run only."
+        )
+        suggestions_label.setWordWrap(True)
+        self.layout.addWidget(suggestions_label)
 
         # --- Label Selection GroupBox ---
         self._create_label_selection_box()
@@ -100,27 +143,14 @@ class ICALabelingDialog(QDialog):
 
     def _create_label_selection_box(self):
         """Creates the GroupBox with checkboxes for each excludable label."""
-        group_box = QGroupBox("Select Labels to Exclude by Default")
-        group_layout = QHBoxLayout()
-
-        for label in EXCLUDABLE_LABELS:
-            # --- CHANGE 2: Prepend emoji to the checkbox label ---
-            emoji = LABEL_EMOJIS.get(label, "")
-            checkbox_text = f"{emoji} {label.replace('_', ' ').title()}".strip()
-            checkbox = QCheckBox(checkbox_text)
-
-            # --- FIX: Use the group name when reading settings to match how it's saved ---
-            settings_key = f"{self.GROUP_SETTINGS}/exclude/{label}"
-            is_checked = self.settings.value(settings_key, True, type=bool)
-
-            checkbox.setChecked(is_checked)
-            # Use a lambda to pass the specific label that triggered the change
+        self.label_settings_widget = ICALabelingSettingsWidget(self)
+        self.label_settings_widget.findChild(QGroupBox).setTitle(
+            "Labels to exclude for this run"
+        )
+        self.label_checkboxes = self.label_settings_widget.label_checkboxes
+        for checkbox in self.label_checkboxes.values():
             checkbox.toggled.connect(self._update_component_checkboxes)
-            group_layout.addWidget(checkbox)
-            self.label_checkboxes[label] = checkbox
-
-        group_box.setLayout(group_layout)
-        self.layout.addWidget(group_box)
+        self.layout.addWidget(self.label_settings_widget)
 
     def run_and_populate(self):
         """Runs the mne_icalabel algorithm and fills the results table."""
@@ -206,14 +236,6 @@ class ICALabelingDialog(QDialog):
                     component_index = int(component_name[3:])
                     exclude_idx.append(component_index)
         return exclude_idx
-
-    def accept(self):
-        """Saves the label exclusion settings before closing the dialog."""
-        for label, checkbox in self.label_checkboxes.items():
-            # Use the group name when saving settings for consistency
-            settings_key = f"{self.GROUP_SETTINGS}/exclude/{label}"
-            self.settings.setValue(settings_key, checkbox.isChecked())
-        super().accept()
 
 
 class ICALabelingWidget(QWidget):

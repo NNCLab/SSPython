@@ -3513,7 +3513,6 @@ class RealTimeERP(QMainWindow):
 
         if accepted:
             new_params = dialog.get_settings()
-            dialog.settings_widget.save_settings()
             self.apply_live_settings(new_params)
         else:
             self.apply_live_settings(previous_params)
@@ -3860,8 +3859,6 @@ class RealTimeMainWidget(QWidget):
             )
             return
 
-        self.connection_widget.save_settings()
-        self.plot_settings_widget.save_settings()
         params.update(self.plot_settings_widget.get_settings())
         if self.rt_erp_widget:
             self.rt_erp_widget.close()
