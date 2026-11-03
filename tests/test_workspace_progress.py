@@ -89,7 +89,11 @@ class TestWorkspaceProgress(unittest.TestCase):
                 panel.list_widget.itemWidget(panel.list_widget.item(index))
                 for index in range(panel.list_widget.count())
             ]
-            self.assertLess(widgets[0].height(), widgets[1].height())
+            self.assertLess(
+                widgets[0].progress_bar.value(), widgets[1].progress_bar.value()
+            )
+            # Both rows contain a single-line title and the same compact progress bar.
+            self.assertEqual(widgets[0].height(), widgets[1].height())
             for widget in widgets:
                 self.assertEqual(
                     widget.height(),
