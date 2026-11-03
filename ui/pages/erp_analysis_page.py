@@ -5,19 +5,19 @@ from pathlib import Path
 
 import mne
 
-from PySide6.QtCore import Slot
+from PySide6.QtCore import QEvent, Slot
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
+    QWidget,
 )
 
 from core.mne_compat import (
@@ -48,7 +48,7 @@ from ui.widgets.source_estimate_widget import (
     prepare_stc_source_model,
 )
 from ui.widgets.time_frequency_widget import ComputeTFRSettingsDialog, TimeFrequencyDialog
-from ui.widgets.tools.object_info_widget import ObjectInfoWidget
+from ui.widgets.tools.compact_object_info import CompactObjectInfoWidget
 from ui.widgets.tools.processing_confirmation import confirm_file_changes
 from utils import Worker
 
@@ -126,6 +126,9 @@ class ErpAnalysisPage(BasePage):
     def __init__(self, parent=None):
         super().__init__("Analysis", parent)
         self.set_content_maximum_width(1360)
+        self.header_frame.setObjectName("flatPageHeader")
+        self.header_frame.layout().setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(24)
         self.main_window = parent
         self.current_dataset = None
         self.tep: TMSEEGAnalysis | None = None
@@ -135,9 +138,15 @@ class ErpAnalysisPage(BasePage):
         self.source_estimate_brain = None
 
         self.context_label = QLabel("Select a dataset that has reached the preprocessed stage.")
-        self.context_label.setObjectName("contextCard")
+        self.context_label.setObjectName("mutedLabel")
         self.context_label.setWordWrap(True)
-        self.add_content(self.context_label)
+
+        context_section = QWidget()
+        context_section.setObjectName("flatSection")
+        context_layout = QVBoxLayout(context_section)
+        context_layout.setContentsMargins(0, 0, 0, 0)
+        context_layout.setSpacing(10)
+        context_layout.addWidget(self.context_label)
 
         dataset_actions = FlowLayout()
         self.open_derivatives_button = QPushButton("Open derivatives folder")
@@ -152,16 +161,22 @@ class ErpAnalysisPage(BasePage):
             lambda: self.main_window and self.main_window.inspect_dataset_stage("preprocessed")
         )
         dataset_actions.addWidget(self.file_info_button)
-        self.add_content(dataset_actions)
+        context_layout.addLayout(dataset_actions)
+        self.add_content(context_section)
 
-        self.epochs_info_widget = ObjectInfoWidget()
+        self.epochs_info_widget = CompactObjectInfoWidget()
         self.visualization_group = self._create_visualization_group()
         self.analysis_group = self._create_analysis_group()
+        self.analysis_group.installEventFilter(self)
 
         self.visualization_title = QLabel("Visualization")
         self.visualization_title.setObjectName("sectionTitle")
         self.add_content(self.visualization_title)
         self.add_content(self.visualization_group)
+        self.methods_divider = QFrame()
+        self.methods_divider.setObjectName("sectionDivider")
+        self.methods_divider.setFixedHeight(1)
+        self.add_content(self.methods_divider)
         self.analysis_title = QLabel("Analysis methods")
         self.analysis_title.setObjectName("sectionTitle")
         self.add_content(self.analysis_title)
@@ -170,12 +185,16 @@ class ErpAnalysisPage(BasePage):
         self._connect_to_main_window()
         self.update_ui_state()
 
-    def _create_visualization_group(self) -> QGroupBox:
-        group = QGroupBox()
+    def _create_visualization_group(self) -> QWidget:
+        group = QWidget()
+        group.setObjectName("flatSection")
         layout = QVBoxLayout(group)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
         layout.addWidget(self.epochs_info_widget)
 
         self.evoked_plot_widget = EvokedPlotWidget()
+        self.evoked_plot_widget.layout().setContentsMargins(0, 0, 0, 0)
         self.evoked_plot_widget.scrolled.connect(
             lambda direction: self.scroll_area.verticalScrollBar().setValue(
                 self.scroll_area.verticalScrollBar().value() - 50
@@ -189,20 +208,23 @@ class ErpAnalysisPage(BasePage):
         self.psd_button = QPushButton("Plot PSD")
         self.topoplot_button.setObjectName("secondaryButton")
         self.psd_button.setObjectName("secondaryButton")
-        action_row = QHBoxLayout()
-        action_row.addStretch(1)
+        action_row = FlowLayout()
         action_row.addWidget(self.topoplot_button)
         action_row.addWidget(self.psd_button)
         layout.addLayout(action_row)
         return group
 
-    def _create_analysis_group(self) -> QGroupBox:
-        group = QGroupBox()
+    def _create_analysis_group(self) -> QWidget:
+        group = QWidget()
+        group.setObjectName("flatSection")
         layout = QGridLayout(group)
-        layout.setHorizontalSpacing(24)
-        layout.setVerticalSpacing(18)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(32)
+        layout.setVerticalSpacing(28)
         layout.setColumnStretch(0, 1)
         layout.setColumnStretch(1, 1)
+        self._analysis_method_layouts = []
+        self._analysis_columns = 2
         self.excitability_button = QPushButton("Response Amplitude Analysis")
         self.nf_button = QPushButton("Natural Frequency Analysis")
         self.pcist_button = QPushButton("PCIst Analysis")
@@ -256,14 +278,14 @@ class ErpAnalysisPage(BasePage):
         self.pcist_button.clicked.connect(self.run_pcist)
         return group
 
-    @staticmethod
-    def _add_analysis_method(layout, row, column, title, description, *buttons):
+    def _add_analysis_method(self, layout, row, column, title, description, *buttons):
         method_layout = QVBoxLayout()
         method_layout.setContentsMargins(0, 0, 0, 0)
         method_layout.setSpacing(6)
 
         title_label = QLabel(title)
         title_label.setObjectName("analysisMethodTitle")
+        title_label.setWordWrap(True)
         method_layout.addWidget(title_label)
 
         description_label = QLabel(description)
@@ -271,14 +293,32 @@ class ErpAnalysisPage(BasePage):
         description_label.setWordWrap(True)
         method_layout.addWidget(description_label)
 
-        button_row = QHBoxLayout()
+        button_row = FlowLayout()
         button_row.setContentsMargins(0, 2, 0, 0)
         for button in buttons:
             button.setProperty("analysisAction", True)
             button_row.addWidget(button)
-        button_row.addStretch(1)
         method_layout.addLayout(button_row)
         layout.addLayout(method_layout, row, column)
+        self._analysis_method_layouts.append(method_layout)
+
+    def eventFilter(self, watched, event):
+        if watched is self.analysis_group and event.type() == QEvent.Type.Resize:
+            self._set_analysis_columns(1 if event.size().width() < 900 else 2)
+        return super().eventFilter(watched, event)
+
+    def _set_analysis_columns(self, columns: int):
+        if self._analysis_columns == columns:
+            return
+        self._analysis_columns = columns
+        layout = self.analysis_group.layout()
+        for method_layout in self._analysis_method_layouts:
+            layout.removeItem(method_layout)
+        for index, method_layout in enumerate(self._analysis_method_layouts):
+            row, column = divmod(index, columns)
+            layout.addLayout(method_layout, row, column)
+        layout.setColumnStretch(1, 1 if columns == 2 else 0)
+        self.analysis_group.updateGeometry()
 
     def _connect_to_main_window(self):
         if not self.main_window:
@@ -378,6 +418,7 @@ class ErpAnalysisPage(BasePage):
         self.evoked_plot_widget.setVisible(has_data)
         self.visualization_title.setVisible(has_data)
         self.visualization_group.setVisible(has_data)
+        self.methods_divider.setVisible(has_data)
         self.analysis_title.setVisible(has_data)
         self.analysis_group.setVisible(has_data)
 

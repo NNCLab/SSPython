@@ -953,11 +953,14 @@ class PlayerWidget(QWidget):
 
     def setup_ui(self):
         layout = QFormLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         layout.setVerticalSpacing(8)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         
         # File selection
         file_layout = QHBoxLayout()
+        file_layout.setSpacing(8)
         self.file_path_input = QLineEdit()
         self.file_path_input.setPlaceholderText("Select a .fif file to stream...")
         self.browse_button = QPushButton("Browse...")
@@ -977,6 +980,7 @@ class PlayerWidget(QWidget):
 
         # Control buttons
         button_layout = QHBoxLayout()
+        button_layout.setSpacing(8)
         self.start_button = QPushButton("Start Streaming")
         self.stop_button = QPushButton("Stop Streaming")
         self.stop_button.setEnabled(False)
@@ -1063,26 +1067,30 @@ class ConnectionWidget(QWidget):
 
     SETTINGS_PATH = "real_time/connection"
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, framed: bool = True):
         super().__init__(parent)
         self.settings_store = get_settings_store()
         self.ch_names = []
         self.realtime_info: mne.Info | None = None
         self.info_source_path: str | None = None
         self.info_label: str | None = None
-        self.setup_ui()
+        self.setup_ui(framed=framed)
         self.load_settings()
 
-    def setup_ui(self):
+    def setup_ui(self, *, framed: bool = True):
         """Initializes the user interface for the connection settings."""
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(10)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
-        # --- Connection Group ---
-        conn_group_box = QGroupBox("Connection Settings")
-        form_layout = QFormLayout(conn_group_box)
+        connection_form = QGroupBox("Connection Settings") if framed else QWidget()
+        form_layout = QFormLayout(connection_form)
+        if not framed:
+            self.setObjectName("realTimeSection")
+            connection_form.setObjectName("realTimeSection")
+            form_layout.setContentsMargins(0, 0, 0, 0)
+            form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         form_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
@@ -1106,17 +1114,29 @@ class ConnectionWidget(QWidget):
         form_layout.addRow("Stream Duration (s):", self.stream_duration_input)
         form_layout.addRow("Epoching (t_start, t_end):", self.tlim_input)
         form_layout.addRow("MNE Info:", self.info_edit)
-        form_layout.addRow(self.select_info_button)
-        form_layout.addRow(self.find_channels_button)
-        main_layout.addWidget(conn_group_box)
+        if framed:
+            form_layout.addRow(self.select_info_button)
+            form_layout.addRow(self.find_channels_button)
+        else:
+            info_actions = QHBoxLayout()
+            info_actions.setSpacing(8)
+            info_actions.addWidget(self.select_info_button)
+            info_actions.addWidget(self.find_channels_button)
+            form_layout.addRow(info_actions)
+            self.select_info_button.setObjectName("secondaryButton")
+            self.find_channels_button.setObjectName("secondaryButton")
+        main_layout.addWidget(connection_form)
 
-        info_group_box = QGroupBox("Info Summary")
-        info_layout = QVBoxLayout(info_group_box)
         self.info_summary_label = QLabel("No MNE info loaded.")
         self.info_summary_label.setObjectName("mutedLabel")
         self.info_summary_label.setWordWrap(True)
-        info_layout.addWidget(self.info_summary_label)
-        main_layout.addWidget(info_group_box)
+        if framed:
+            info_group_box = QGroupBox("Info Summary")
+            info_layout = QVBoxLayout(info_group_box)
+            info_layout.addWidget(self.info_summary_label)
+            main_layout.addWidget(info_group_box)
+        else:
+            main_layout.addWidget(self.info_summary_label)
         
         # --- Connections ---
         self.select_info_button.clicked.connect(self.select_info_source)
@@ -1396,25 +1416,31 @@ class RealTimeSettingsWidget(QWidget):
     SETTINGS_PATH = "real_time/plotting"
     settingsChanged = Signal(dict)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, framed: bool = True):
         super().__init__(parent)
         self.settings_store = get_settings_store()
         self._suppress_settings_changed = False
-        self.setup_ui()
+        self.setup_ui(framed=framed)
         self.load_settings()
 
-    def setup_ui(self):
+    def setup_ui(self, *, framed: bool = True):
         """Initializes the user interface for the plot settings."""
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(8)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        vertical_policy = QSizePolicy.Policy.Maximum if framed else QSizePolicy.Policy.Preferred
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, vertical_policy)
 
-        group_box = QGroupBox("Real-Time Plot Settings")
-        group_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        main_layout.addWidget(group_box)
+        settings_form = QGroupBox("Real-Time Plot Settings") if framed else QWidget()
+        settings_form.setSizePolicy(QSizePolicy.Policy.Preferred, vertical_policy)
+        main_layout.addWidget(settings_form)
 
-        form_layout = QFormLayout(group_box)
+        form_layout = QFormLayout(settings_form)
+        if not framed:
+            self.setObjectName("realTimeSection")
+            settings_form.setObjectName("realTimeSection")
+            form_layout.setContentsMargins(0, 0, 0, 0)
+            form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         form_layout.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
         )
@@ -3723,66 +3749,60 @@ class RealTimeMainWidget(QWidget):
 
     def setup_ui(self):
         """Sets up the UI for the main widget."""
+        self.setObjectName("realTimeSetup")
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
         self.setMinimumWidth(0)
 
         self.main_container = QWidget()
+        self.main_container.setObjectName("realTimeSection")
         self.main_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(self.main_container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        layout.setSpacing(24)
 
-        self.connection_widget = ConnectionWidget()
-        self.plot_settings_widget = RealTimeSettingsWidget()
+        self.connection_widget = ConnectionWidget(framed=False)
+        self.plot_settings_widget = RealTimeSettingsWidget(framed=False)
         self.plot_settings_widget.settingsChanged.connect(self._forward_plot_settings)
-        # self.plot_settings_widget.setMaximumWidth(420)
         self.player_widget = PlayerWidget()
+        self.player_widget.setObjectName("realTimeSection")
+        self.player_widget.browse_button.setObjectName("secondaryButton")
+        self.player_widget.stop_button.setObjectName("secondaryButton")
 
-        live_card = self._build_card("Connect to Live Stream")
-        live_layout = live_card.layout()
-        live_help = QLabel(
-            "Select an MNE info source, then launch the live visualizer."
-        )
-        live_help.setObjectName("mutedLabel")
-        live_help.setWordWrap(True)
-        live_layout.addWidget(live_help)
-
-        self.config_row = QHBoxLayout()
-        self.config_row.setContentsMargins(0, 0, 0, 0)
-        self.config_row.setSpacing(12)
-        self.config_row.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.config_row.addWidget(self.connection_widget, 2)
-        self.config_row.addWidget(
-            self.plot_settings_widget,
-            1,
-            Qt.AlignmentFlag.AlignTop,
-        )
-        live_layout.addLayout(self.config_row)
+        live_section = self._build_section("Live stream")
+        live_section.layout().addWidget(self.connection_widget)
 
         self.launch_button = QPushButton("Launch Live Visualizer")
         self.launch_button.setDefault(True)
         self.launch_button.setMinimumWidth(260)
         self.launch_button.clicked.connect(self.launch_visualizer)
 
-        launch_row = QHBoxLayout()
-        launch_row.setContentsMargins(0, 4, 0, 0)
-        launch_row.addStretch(1)
-        launch_row.addWidget(self.launch_button)
-        launch_row.addStretch(1)
-        live_layout.addLayout(launch_row)
-        layout.addWidget(live_card)
+        live_section.layout().addSpacing(4)
+        live_section.layout().addWidget(self.launch_button, 0, Qt.AlignmentFlag.AlignLeft)
 
-        file_card = self._build_card("Play from File")
-        file_card.layout().addWidget(self.player_widget, 0, Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(file_card)
-        layout.addStretch()
-        main_layout.addWidget(self.main_container, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        self.plot_section = self._build_section("Plot settings")
+        self.plot_section.layout().addWidget(self.plot_settings_widget)
+
+        self.config_row = QHBoxLayout()
+        self.config_row.setContentsMargins(0, 0, 0, 0)
+        self.config_row.setSpacing(32)
+        self.config_row.addWidget(live_section, 1, Qt.AlignmentFlag.AlignTop)
+        self.config_row.addWidget(self.plot_section, 1, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(self.config_row)
+
+        divider = QFrame()
+        divider.setObjectName("realTimeDivider")
+        divider.setFixedHeight(1)
+        layout.addWidget(divider)
+
+        file_section = self._build_section("Play from file")
+        file_section.layout().addWidget(self.player_widget)
+        layout.addWidget(file_section)
+        main_layout.addWidget(self.main_container)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.set_compact_layout(event.size().width() < 980)
+        self.set_compact_layout(event.size().width() < 1120)
 
     def set_compact_layout(self, compact: bool):
         if not hasattr(self, "config_row"):
@@ -3794,26 +3814,20 @@ class RealTimeMainWidget(QWidget):
         )
         if self.config_row.direction() != direction:
             self.config_row.setDirection(direction)
-            self.config_row.setStretch(0, 2 if not compact else 0)
+            self.config_row.setStretch(0, 1 if not compact else 0)
             self.config_row.setStretch(1, 1 if not compact else 0)
-            self.plot_settings_widget.setSizePolicy(
-                QSizePolicy.Policy.Expanding
-                if compact
-                else QSizePolicy.Policy.Preferred,
-                QSizePolicy.Policy.Maximum,
-            )
 
-    def _build_card(self, title: str) -> QFrame:
-        card = QFrame()
-        card.setObjectName("pipelineCard")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 16, 16, 16)
-        card_layout.setSpacing(10)
+    def _build_section(self, title: str) -> QWidget:
+        section = QWidget()
+        section.setObjectName("realTimeSection")
+        section_layout = QVBoxLayout(section)
+        section_layout.setContentsMargins(0, 0, 0, 0)
+        section_layout.setSpacing(16)
 
         title_label = QLabel(title)
-        title_label.setObjectName("panelTitle")
-        card_layout.addWidget(title_label)
-        return card
+        title_label.setObjectName("panelSubtitle")
+        section_layout.addWidget(title_label)
+        return section
 
     def refresh_theme(self):
         if self.rt_erp_widget is not None:

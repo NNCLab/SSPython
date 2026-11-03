@@ -3,14 +3,18 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractButton,
     QBoxLayout,
     QGroupBox,
     QLabel,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -65,51 +69,90 @@ class TestResponsiveLayout(unittest.TestCase):
         )
         widget.close()
 
-    def test_preferences_toolbox_headers_have_room_for_padded_text(self):
+    def test_preferences_tabs_navigate_between_settings_categories(self):
         window = MainWindow()
-        page = window.page_lookup["Preferences"]
-        headers = [
-            button
-            for button in page.tool_box.findChildren(QAbstractButton)
-            if button.parentWidget() is page.tool_box
-        ]
-
-        self.assertEqual(len(headers), page.tool_box.count())
-        for header in headers:
-            self.assertGreaterEqual(
-                header.minimumHeight(),
-                header.fontMetrics().height() + 12,
-            )
-        window.close()
-
-    def test_preferences_categories_fill_the_remaining_page_height(self):
-        window = MainWindow()
+        self.addCleanup(window.close)
         window.resize(1200, 900)
         window.show()
         window.navigate_to_page("Preferences")
         self.app.processEvents()
         page = window.page_lookup["Preferences"]
 
-        tool_box_index = page.content_layout.indexOf(page.tool_box)
-        self.assertEqual(page.content_layout.stretch(tool_box_index), 1)
+        self.assertIsInstance(page.tabs, QTabWidget)
+        categories = (
+            ("General", page.global_settings_widget),
+            ("Preprocessing", page.artifact_widget),
+            ("ICA", page.ica_continuous_widget),
+            ("Real-time", page.connection_widget),
+        )
         self.assertEqual(
-            page.tool_box.sizePolicy().verticalPolicy(),
+            [page.tabs.tabText(index) for index in range(page.tabs.count())],
+            [title for title, _ in categories],
+        )
+        for index, (_, settings_widget) in enumerate(categories):
+            QTest.mouseClick(
+                page.tabs.tabBar(),
+                Qt.MouseButton.LeftButton,
+                pos=page.tabs.tabBar().tabRect(index).center(),
+            )
+            self.app.processEvents()
+            self.assertEqual(page.tabs.currentIndex(), index)
+            self.assertTrue(settings_widget.isVisibleTo(page.tabs))
+            for other_index, (_, other_widget) in enumerate(categories):
+                if other_index != index:
+                    self.assertFalse(other_widget.isVisibleTo(page.tabs))
+
+    def test_preferences_tabs_fill_remaining_height_and_scroll_independently(self):
+        window = MainWindow()
+        self.addCleanup(window.close)
+        window.resize(1200, 700)
+        window.show()
+        window.navigate_to_page("Preferences")
+        self.app.processEvents()
+        page = window.page_lookup["Preferences"]
+
+        tabs_index = page.content_layout.indexOf(page.tabs)
+        self.assertEqual(page.content_layout.stretch(tabs_index), 1)
+        self.assertEqual(
+            page.tabs.sizePolicy().verticalPolicy(),
             QSizePolicy.Policy.Expanding,
         )
 
         bottom_margin = page.content_layout.contentsMargins().bottom()
-        for category_index in range(page.tool_box.count()):
-            page.tool_box.setCurrentIndex(category_index)
+        for category_index in range(page.tabs.count()):
+            page.tabs.setCurrentIndex(category_index)
             self.app.processEvents()
 
             expected_bottom = page.content_container.height() - bottom_margin
-            actual_bottom = page.tool_box.geometry().bottom() + 1
+            actual_bottom = page.tabs.geometry().bottom() + 1
             self.assertLessEqual(abs(actual_bottom - expected_bottom), 1)
+            category = page.tabs.currentWidget()
+            self.assertIsInstance(category, QScrollArea)
+            self.assertTrue(category.widgetResizable())
             self.assertEqual(
-                page.tool_box.currentWidget().sizePolicy().verticalPolicy(),
+                category.widget().sizePolicy().verticalPolicy(),
                 QSizePolicy.Policy.Expanding,
             )
-        window.close()
+            self.assertGreaterEqual(category.widget().height(), category.viewport().height())
+            self.assertEqual(page.scroll_area.verticalScrollBar().maximum(), 0)
+
+        page.tabs.setCurrentIndex(1)
+        self.app.processEvents()
+        preprocessing_scroll = page.tabs.currentWidget().verticalScrollBar()
+        self.assertGreater(preprocessing_scroll.maximum(), 0)
+        preprocessing_scroll.setValue(preprocessing_scroll.maximum())
+        saved_position = preprocessing_scroll.value()
+
+        page.tabs.setCurrentIndex(0)
+        self.app.processEvents()
+        general_scroll = page.tabs.currentWidget().verticalScrollBar()
+        self.assertIsNot(general_scroll, preprocessing_scroll)
+        general_scroll.setValue(0)
+
+        page.tabs.setCurrentIndex(1)
+        self.app.processEvents()
+        self.assertEqual(preprocessing_scroll.value(), saved_position)
+        self.assertEqual(general_scroll.value(), 0)
 
     def test_preprocessing_stage_actions_wrap_in_compact_layout(self):
         page = ProcessingPage()

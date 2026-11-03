@@ -106,6 +106,71 @@ QSplitter#shellSplitter::handle:hover {
     border-radius: 10px;
 }
 
+#realTimeSetup, #realTimeSection, #realTimeHeader, #flatPageHeader, #flatSection {
+    background: transparent;
+    border: none;
+}
+
+#realTimeDivider, #sectionDivider {
+    background: #d7e0e3;
+    border: none;
+}
+
+#preferencesFooter {
+    background: transparent;
+    border-top: 1px solid #d7e0e3;
+}
+
+QTabWidget#preferencesCategories::pane {
+    background: transparent;
+    border: none;
+    border-top: 1px solid #d7e0e3;
+    border-radius: 0;
+    margin-top: 0;
+}
+
+#preferencesTabScroll, #preferencesTabViewport {
+    background: transparent;
+    border: none;
+}
+
+QTabBar#preferencesTabBar::tab {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    padding: 10px 16px;
+    margin: 0;
+    min-width: 0;
+    color: #64747c;
+    font-weight: 600;
+}
+
+QTabBar#preferencesTabBar::tab:selected {
+    background: transparent;
+    border-bottom-color: #2f7e8d;
+    color: #16242a;
+}
+
+QTabBar#preferencesTabBar::tab:hover:!selected {
+    background: #edf4f6;
+    color: #16242a;
+}
+
+#preferencesCategories QGroupBox {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    margin-top: 20px;
+    padding: 0;
+}
+
+#preferencesCategories QGroupBox::title {
+    left: 0;
+    padding: 0;
+    font-size: 11pt;
+}
+
 #sectionTitle {
     color: #142228;
     font-size: 15pt;

@@ -1,15 +1,17 @@
 import logging
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt
 from PySide6.QtWidgets import (
-    QAbstractButton,
+    QBoxLayout,
+    QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
-    QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
-    QToolBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -37,6 +39,9 @@ class PreferencesPage(BasePage):
     def __init__(self, settings_store, parent: QWidget | None = None):
         super().__init__("Preferences", parent)
         self.set_content_maximum_width(1120)
+        self.header_frame.setObjectName("flatPageHeader")
+        self.header_frame.layout().setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(24)
         self.settings_store = settings_store
         self.main_window = parent
         self.settings_widgets: list[QWidget] = []
@@ -50,46 +55,43 @@ class PreferencesPage(BasePage):
             self.main_window.current_pipeline_changed.connect(self.on_pipeline_changed)
 
     def _build_ui(self):
-        self.summary_card = QFrame()
-        self.summary_card.setObjectName("heroCard")
-        summary_layout = QVBoxLayout(self.summary_card)
-        summary_layout.setContentsMargins(24, 24, 24, 24)
-        summary_layout.setSpacing(8)
+        self.summary_label = self.subtitle_label
+        self.summary_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.summary_label.show()
 
-        title = QLabel("Application preferences")
-        title.setObjectName("heroTitle")
-        summary_layout.addWidget(title)
-
-        self.summary_label = QLabel("")
-        self.summary_label.setObjectName("mutedLabel")
-        self.summary_label.setWordWrap(True)
-        summary_layout.addWidget(self.summary_label)
-
-        self.add_content(self.summary_card)
-
-        self.tool_box = QToolBox()
-        self.tool_box.setSizePolicy(
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("preferencesCategories")
+        self.tabs.setDocumentMode(True)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setElideMode(Qt.TextElideMode.ElideNone)
+        self.tabs.tabBar().setObjectName("preferencesTabBar")
+        self.tabs.tabBar().setAccessibleName("Preference categories")
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setDrawBase(False)
+        self.tabs.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
-        self.add_content(self.tool_box)
-        self.content_layout.setStretch(self.content_layout.indexOf(self.tool_box), 1)
+        self.add_content(self.tabs)
+        self.content_layout.setStretch(self.content_layout.indexOf(self.tabs), 1)
 
         footer = QFrame()
-        footer.setObjectName("pageFooter")
-        button_row = QHBoxLayout(footer)
-        button_row.setContentsMargins(24, 12, 24, 12)
+        footer.setObjectName("preferencesFooter")
+        self.button_row = QHBoxLayout(footer)
+        self.button_row.setContentsMargins(24, 12, 24, 12)
+        self.button_row.setSpacing(8)
         self.clear_all_button = QPushButton("Reset Settings")
         self.clear_all_button.setObjectName("dangerButton")
         self.revert_button = QPushButton("Reload Saved")
         self.revert_button.setObjectName("secondaryButton")
         self.save_button = QPushButton("Save Changes")
         self.save_button.setDefault(True)
+        self.save_button.setMinimumWidth(136)
 
-        button_row.addWidget(self.clear_all_button)
-        button_row.addStretch()
-        button_row.addWidget(self.revert_button)
-        button_row.addWidget(self.save_button)
+        self.button_row.addWidget(self.clear_all_button)
+        self.button_row.addStretch()
+        self.button_row.addWidget(self.revert_button)
+        self.button_row.addWidget(self.save_button)
         self.set_footer(footer)
 
     def _populate_categories(self):
@@ -103,25 +105,28 @@ class PreferencesPage(BasePage):
         self.ica_continuous_widget = ICASettingsWidget("continuous")
         self.ica_epochs_widget = ICASettingsWidget("epochs")
         self.ica_plotting_widget = ICAPlottingSettingsWidget()
+        self.ica_continuous_widget.findChild(QGroupBox).setTitle("Continuous ICA")
+        self.ica_epochs_widget.findChild(QGroupBox).setTitle("Epoch ICA")
+        self.ica_plotting_widget.findChild(QGroupBox).setTitle("ICA plotting")
         self.connection_widget = ConnectionWidget()
         self.real_time_plot_widget = RealTimeSettingsWidget()
 
-        self.add_settings_category("Workspace and Appearance", self.global_settings_widget)
+        self.add_settings_category("General", self.global_settings_widget)
         self.add_settings_category(
-            "Preprocessing Defaults",
+            "Preprocessing",
             self.artifact_widget,
             self.continuous_filter_widget,
             self.epoching_widget,
             self.apply_widget,
         )
         self.add_settings_category(
-            "ICA Defaults",
+            "ICA",
             self.ica_continuous_widget,
             self.ica_epochs_widget,
             self.ica_plotting_widget,
         )
         self.add_settings_category(
-            "Real-Time",
+            "Real-time",
             self.connection_widget,
             self.real_time_plot_widget,
         )
@@ -134,22 +139,68 @@ class PreferencesPage(BasePage):
         self.clear_all_button.clicked.connect(self.clear_all_settings)
 
     def add_settings_category(self, title: str, *widgets: QWidget):
-        container = QFrame()
+        container = QWidget()
+        container.setObjectName("flatSection")
         container.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 16, 0, 24)
+        layout.setSpacing(24)
         for widget in widgets:
+            self._prepare_settings_widget(widget)
             layout.addWidget(widget)
             self.settings_widgets.append(widget)
         layout.addStretch(1)
-        self.tool_box.addItem(container, title)
-        for button in self.tool_box.findChildren(QAbstractButton):
-            if button.parentWidget() is self.tool_box:
-                button.setMinimumHeight(38)
+
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName("preferencesTabScroll")
+        scroll_area.viewport().setObjectName("preferencesTabViewport")
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setWidget(container)
+        self.tabs.addTab(scroll_area, title)
+
+    @staticmethod
+    def _prepare_settings_widget(widget: QWidget):
+        """Flatten embedded forms while retaining their shared dialog presentation."""
+        widget.setObjectName("flatSection")
+        policy = widget.sizePolicy()
+        policy.setVerticalPolicy(QSizePolicy.Policy.Preferred)
+        widget.setSizePolicy(policy)
+        widget.layout().setContentsMargins(0, 0, 0, 0)
+        for group in widget.findChildren(QGroupBox):
+            if group.layout() is not None:
+                group.layout().setContentsMargins(0, 12, 0, 0)
+        for form in widget.findChildren(QFormLayout):
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+            form.setHorizontalSpacing(20)
+            form.setVerticalSpacing(10)
+            # Wrapped forms need room to grow beyond their unwrapped size hint.
+            host = form.parentWidget()
+            policy = host.sizePolicy()
+            policy.setVerticalPolicy(QSizePolicy.Policy.Preferred)
+            host.setSizePolicy(policy)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "button_row"):
+            compact = event.size().width() < 560
+            self.button_row.setDirection(
+                QBoxLayout.Direction.TopToBottom
+                if compact
+                else QBoxLayout.Direction.LeftToRight
+            )
+            wrap_policy = (
+                QFormLayout.RowWrapPolicy.WrapAllRows
+                if compact
+                else QFormLayout.RowWrapPolicy.WrapLongRows
+            )
+            for form in self.tabs.findChildren(QFormLayout):
+                if form.rowWrapPolicy() != wrap_policy:
+                    form.setRowWrapPolicy(wrap_policy)
 
     def _active_pipeline_id(self) -> str:
         return self.global_settings_widget.pipeline_combo.currentData()
@@ -165,8 +216,7 @@ class PreferencesPage(BasePage):
         pipeline_name = self.global_settings_widget.pipeline_combo.currentText()
         output_root = self.global_settings_widget.output_dir_input.text().strip() or "derivatives"
         self.summary_label.setText(
-            f"Editing defaults for the {pipeline_name} pipeline. "
-            f"Derivatives will be saved under the workspace folder in `{output_root}`."
+            f"Defaults for the {pipeline_name} pipeline · Output folder: {output_root}"
         )
 
     def load_all_settings(self):
