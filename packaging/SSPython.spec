@@ -10,6 +10,10 @@ PROJECT_ROOT = Path(SPECPATH).parent
 HOOKS_DIR = PROJECT_ROOT / "packaging" / "hooks"
 BUILD_WITH_CONSOLE = os.environ.get("SSPYTHON_BUILD_CONSOLE") == "1"
 
+# SSPython uses PySide6, including when Qt adapters are imported by the
+# collect_submodules helpers below.
+os.environ["QT_API"] = "pyside6"
+
 
 def without_tests(module_name: str) -> bool:
     parts = set(module_name.split("."))
@@ -61,6 +65,9 @@ analysis = Analysis(
     runtime_hooks=[],
     excludes=[
         "IPython",
+        "PyQt5",
+        "PyQt6",
+        "PySide2",
         "jupyter",
         "jupyterlab",
         "notebook",

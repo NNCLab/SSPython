@@ -667,9 +667,24 @@ Setup installer. Run the complete release pipeline from the repository root:
 .\packaging\build_windows.cmd
 ```
 
-The script creates an isolated `.venv-build` environment, runs the unit tests,
-builds and smoke-tests `dist\SSPython\SSPython.exe`, and creates
-`dist\installer\SSPython-<version>-Setup.exe`.
+The script requires `uv` and creates `.venv-build` on the first run, then reuses
+and synchronizes it on subsequent runs with
+`uv sync --frozen --no-dev --group build`. It uses this separate build environment
+even if `.venv` already exists or is activated. No manual environment creation or
+activation is needed. Keeping release dependencies separate from development
+tools makes the build reproducible and leaves `.venv` untouched.
+
+It runs the unit tests, builds and smoke-tests `dist\SSPython\SSPython.exe`, and
+creates `dist\installer\SSPython-<version>-Setup.exe`.
+
+The application and frozen bundle use PySide6. The spec excludes PyQt5, PyQt6,
+and PySide2 because PyInstaller supports only one Qt binding per application.
+For Picard ICA, the dependency is `python-picard` (imported as `picard`); the
+unrelated `picard` distribution is the MusicBrainz tagger and pulls in PyQt6.
+Deleting the build environment cannot fix an incorrect locked dependency: the
+next build installs it again. After dependency changes, update `uv.lock` with
+`uv lock` before running the build; the build's `--frozen` option uses the existing
+lockfile.
 
 Useful development options:
 
